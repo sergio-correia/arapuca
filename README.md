@@ -285,15 +285,15 @@ Library (host process)
 │
 ├─ Spawn subprocess ──────────────────────────────┐
 │   ├─ [Linux]  unshare --net (if netns)          │
-│   ├─ [Linux]  arapuca binary wrapper          │
+│   ├─ [Linux]  arapuca binary wrapper            │
 │   │           ├─ Apply Landlock (fs allowlist)  │
 │   │           ├─ Apply seccomp (syscall filter) │
 │   │           ├─ Apply rlimits                  │
 │   │           ├─ Set PR_SET_PDEATHSIG           │
-│   │           ├─ Strip ARAPUCA_* env          │
+│   │           ├─ Strip ARAPUCA_* env            │
 │   │           └─ execve(target)                 │
 │   ├─ [macOS]  sandbox-exec -f profile.sb        │
-│   │           └─ [arapuca wrapper for rlimits]│
+│   │           └─ [arapuca wrapper for rlimits]  │
 │   │               └─ execve(target)             │
 │   └─ setsid (both platforms)                    │
 │                                                 │
