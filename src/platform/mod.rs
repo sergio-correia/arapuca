@@ -4,7 +4,8 @@
 //! the available isolation primitives (Landlock, seccomp, cgroups, netns
 //! on Linux; sandbox-exec on macOS; degraded fallback elsewhere).
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::process::{Command, Stdio};
 
 use crate::{Config, process::Process};
 
@@ -49,6 +50,38 @@ pub trait Sandbox: Send + Sync {
 
     /// Reports whether cgroups v2 resource limits are available.
     fn cgroups_available(&self) -> bool;
+}
+
+/// Duplicate an optional FD with CLOEXEC and wire it to a Command's
+/// stdin, stdout, or stderr. If `fd` is `None`, inherits from parent.
+///
+/// FDs 0, 1, 2 are valid inputs — `F_DUPFD_CLOEXEC` creates a new FD
+/// without disturbing the parent's original.
+pub(crate) fn setup_stdio(
+    command: &mut Command,
+    fd: Option<RawFd>,
+    stream: &str,
+    setter: fn(&mut Command, Stdio) -> &mut Command,
+) -> crate::Result<()> {
+    match fd {
+        Some(fd) => {
+            // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new fd
+            // we own, with CLOEXEC set atomically.
+            let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+            if duped == -1 {
+                return Err(crate::Error::Process(format!(
+                    "dup {stream} fd: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // SAFETY: duped is a valid fd we own (verified != -1 above).
+            setter(command, unsafe { Stdio::from_raw_fd(duped) });
+        }
+        None => {
+            setter(command, Stdio::inherit());
+        }
+    }
+    Ok(())
 }
 
 /// Create the appropriate sandbox for the current platform.

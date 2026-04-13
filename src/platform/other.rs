@@ -4,9 +4,9 @@
 //! no seccomp, no cgroups, no network namespace. Suitable for development
 //! and testing only. Production workloads should use Linux.
 
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use crate::platform::Sandbox;
 use crate::{Config, Error, process::Process};
@@ -37,59 +37,10 @@ impl Sandbox for Other {
             command.env(k, v);
         }
 
-        // stdin/stdout/stderr redirection. Dup with CLOEXEC so Rust
-        // doesn't take caller's FD and concurrent forks can't leak it.
-        match cfg.stdin {
-            Some(fd) => {
-                // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new
-                // fd we own, with CLOEXEC set atomically.
-                let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-                if duped == -1 {
-                    return Err(Error::Process(format!(
-                        "dup stdin fd: {}",
-                        std::io::Error::last_os_error()
-                    )));
-                }
-                command.stdin(unsafe { Stdio::from_raw_fd(duped) });
-            }
-            None => {
-                command.stdin(Stdio::inherit());
-            }
-        }
-        match cfg.stdout {
-            Some(fd) => {
-                // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new
-                // fd we own, with CLOEXEC set atomically.
-                let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-                if duped == -1 {
-                    return Err(Error::Process(format!(
-                        "dup stdout fd: {}",
-                        std::io::Error::last_os_error()
-                    )));
-                }
-                command.stdout(unsafe { Stdio::from_raw_fd(duped) });
-            }
-            None => {
-                command.stdout(Stdio::inherit());
-            }
-        }
-        match cfg.stderr {
-            Some(fd) => {
-                // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new
-                // fd we own, with CLOEXEC set atomically.
-                let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-                if duped == -1 {
-                    return Err(Error::Process(format!(
-                        "dup stderr fd: {}",
-                        std::io::Error::last_os_error()
-                    )));
-                }
-                command.stderr(unsafe { Stdio::from_raw_fd(duped) });
-            }
-            None => {
-                command.stderr(Stdio::inherit());
-            }
-        }
+        // stdin/stdout/stderr redirection.
+        super::setup_stdio(&mut command, cfg.stdin, "stdin", Command::stdin)?;
+        super::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
+        super::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
 
         // Extra FD inheritance.
         let fds_to_inherit: Vec<RawFd> = extra_fds.to_vec();
