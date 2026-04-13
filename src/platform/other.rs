@@ -37,10 +37,13 @@ impl Sandbox for Other {
             command.env(k, v);
         }
 
-        // stdout/stderr redirection. Dup so Rust doesn't take caller's FD.
+        // stdout/stderr redirection. Dup with CLOEXEC so Rust doesn't
+        // take caller's FD and concurrent forks can't leak it.
         match cfg.stdout {
             Some(fd) => {
-                let duped = unsafe { libc::dup(fd) };
+                // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new
+                // fd we own, with CLOEXEC set atomically.
+                let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
                 if duped == -1 {
                     return Err(Error::Process(format!(
                         "dup stdout fd: {}",
@@ -55,7 +58,9 @@ impl Sandbox for Other {
         }
         match cfg.stderr {
             Some(fd) => {
-                let duped = unsafe { libc::dup(fd) };
+                // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new
+                // fd we own, with CLOEXEC set atomically.
+                let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
                 if duped == -1 {
                     return Err(Error::Process(format!(
                         "dup stderr fd: {}",

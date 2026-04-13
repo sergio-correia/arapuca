@@ -119,12 +119,14 @@ impl Sandbox for Linux {
             command.env(k, v);
         }
 
-        // Set stdout/stderr. Dup the FD so Rust doesn't take
-        // ownership of the caller's FD (from_raw_fd consumes it).
+        // Set stdout/stderr. Dup the FD with CLOEXEC so Rust doesn't
+        // take ownership of the caller's FD (from_raw_fd consumes it)
+        // and a concurrent fork can't leak the duped FD.
         match cfg.stdout {
             Some(fd) => {
-                // SAFETY: dup() on a valid fd returns a new fd we own.
-                let duped = unsafe { libc::dup(fd) };
+                // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new
+                // fd we own, with CLOEXEC set atomically.
+                let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
                 if duped == -1 {
                     return Err(Error::Process(format!(
                         "dup stdout fd: {}",
@@ -139,7 +141,9 @@ impl Sandbox for Linux {
         }
         match cfg.stderr {
             Some(fd) => {
-                let duped = unsafe { libc::dup(fd) };
+                // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new
+                // fd we own, with CLOEXEC set atomically.
+                let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
                 if duped == -1 {
                     return Err(Error::Process(format!(
                         "dup stderr fd: {}",
