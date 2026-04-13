@@ -13,7 +13,7 @@
 
 mod darwin_profile;
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -291,9 +291,60 @@ impl Sandbox for Darwin {
             command.env(k, v);
         }
 
-        command.stdin(Stdio::inherit());
-        command.stdout(Stdio::inherit());
-        command.stderr(Stdio::inherit());
+        // Set stdin/stdout/stderr. Dup the FD with CLOEXEC so Rust
+        // doesn't take ownership of the caller's FD (from_raw_fd
+        // consumes it) and a concurrent fork can't leak the duped FD.
+        match cfg.stdin {
+            Some(fd) => {
+                // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new
+                // fd we own, with CLOEXEC set atomically.
+                let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+                if duped == -1 {
+                    return Err(Error::Process(format!(
+                        "dup stdin fd: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                command.stdin(unsafe { Stdio::from_raw_fd(duped) });
+            }
+            None => {
+                command.stdin(Stdio::inherit());
+            }
+        }
+        match cfg.stdout {
+            Some(fd) => {
+                // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new
+                // fd we own, with CLOEXEC set atomically.
+                let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+                if duped == -1 {
+                    return Err(Error::Process(format!(
+                        "dup stdout fd: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                command.stdout(unsafe { Stdio::from_raw_fd(duped) });
+            }
+            None => {
+                command.stdout(Stdio::inherit());
+            }
+        }
+        match cfg.stderr {
+            Some(fd) => {
+                // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new
+                // fd we own, with CLOEXEC set atomically.
+                let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+                if duped == -1 {
+                    return Err(Error::Process(format!(
+                        "dup stderr fd: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                command.stderr(unsafe { Stdio::from_raw_fd(duped) });
+            }
+            None => {
+                command.stderr(Stdio::inherit());
+            }
+        }
 
         // Setsid: detach from host's terminal session (same as Linux).
         // SAFETY: setsid is a simple setter with no pointer arguments.
