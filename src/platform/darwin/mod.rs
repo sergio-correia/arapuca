@@ -291,6 +291,7 @@ impl Sandbox for Darwin {
             command.env(k, v);
         }
 
+        command.stdin(Stdio::inherit());
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
 

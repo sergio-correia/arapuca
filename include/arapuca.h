@@ -51,8 +51,7 @@ struct arapuca_ArapucaProfile *arapuca_profile_new(void);
  * # Safety
  * `profile` and `path` must be valid pointers.
  */
-int32_t arapuca_profile_add_read_path(struct arapuca_ArapucaProfile *profile,
-                                        const char *path);
+int32_t arapuca_profile_add_read_path(struct arapuca_ArapucaProfile *profile, const char *path);
 
 /**
  * Add a read-write path to the profile. Returns 0 on success, -1 on error.
@@ -60,8 +59,7 @@ int32_t arapuca_profile_add_read_path(struct arapuca_ArapucaProfile *profile,
  * # Safety
  * `profile` and `path` must be valid pointers.
  */
-int32_t arapuca_profile_add_write_path(struct arapuca_ArapucaProfile *profile,
-                                         const char *path);
+int32_t arapuca_profile_add_write_path(struct arapuca_ArapucaProfile *profile, const char *path);
 
 /**
  * Set memory limit in MB.
@@ -93,8 +91,7 @@ void arapuca_profile_set_max_pids(struct arapuca_ArapucaProfile *profile, uint32
  * # Safety
  * `profile` must be a valid pointer.
  */
-void arapuca_profile_set_max_file_size_mb(struct arapuca_ArapucaProfile *profile,
-                                            uint64_t mb);
+void arapuca_profile_set_max_file_size_mb(struct arapuca_ArapucaProfile *profile, uint64_t mb);
 
 /**
  * Enable/disable network namespace isolation.
@@ -147,7 +144,7 @@ struct arapuca_ArapucaConfig *arapuca_config_new(void);
  * Both pointers must be valid.
  */
 int32_t arapuca_config_set_profile(struct arapuca_ArapucaConfig *cfg,
-                                     const struct arapuca_ArapucaProfile *profile);
+                                   const struct arapuca_ArapucaProfile *profile);
 
 /**
  * Set the task ID on a config.
@@ -180,6 +177,14 @@ int32_t arapuca_config_set_socket_dir(struct arapuca_ArapucaConfig *cfg, const c
  * Both pointers must be valid.
  */
 int32_t arapuca_config_set_work_dir(struct arapuca_ArapucaConfig *cfg, const char *dir);
+
+/**
+ * Set stdin FD on a config.
+ *
+ * # Safety
+ * `cfg` must be a valid pointer.
+ */
+void arapuca_config_set_stdin_fd(struct arapuca_ArapucaConfig *cfg, int32_t fd);
 
 /**
  * Set stdout FD on a config.
@@ -223,12 +228,12 @@ void arapuca_config_free(struct arapuca_ArapucaConfig *cfg);
  * `extra_fds` must have `extra_fds_count` entries (or be NULL if 0).
  */
 struct arapuca_ArapucaProcess *arapuca_launch(struct arapuca_ArapucaSandbox *sb,
-                                                    const struct arapuca_ArapucaConfig *cfg,
-                                                    const char *cmd,
-                                                    const char *const *args,
-                                                    uintptr_t args_count,
-                                                    const int32_t *extra_fds,
-                                                    uintptr_t extra_fds_count);
+                                              const struct arapuca_ArapucaConfig *cfg,
+                                              const char *cmd,
+                                              const char *const *args,
+                                              uintptr_t args_count,
+                                              const int32_t *extra_fds,
+                                              uintptr_t extra_fds_count);
 
 /**
  * Get the PID of a sandboxed process.
@@ -261,7 +266,7 @@ int32_t arapuca_process_wait(struct arapuca_ArapucaProcess *proc);
  * Both pointers must be valid.
  */
 int32_t arapuca_process_resource_stats(const struct arapuca_ArapucaProcess *proc,
-                                         struct arapuca_ArapucaResourceUsage *out);
+                                       struct arapuca_ArapucaResourceUsage *out);
 
 /**
  * Read OOM kill count from the process's cgroup.

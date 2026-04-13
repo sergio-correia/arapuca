@@ -35,6 +35,8 @@ pub struct Config {
     pub phase: String,
     /// Working directory for the subprocess (None = inherit).
     pub work_dir: Option<PathBuf>,
+    /// Redirect subprocess stdin from this FD (None = inherit).
+    pub stdin: Option<RawFd>,
     /// Redirect subprocess stdout to this FD (None = inherit).
     pub stdout: Option<RawFd>,
     /// Redirect subprocess stderr to this FD (None = inherit).

@@ -282,6 +282,7 @@ pub extern "C" fn arapuca_config_new() -> *mut ArapucaConfig {
             task_id: String::new(),
             phase: String::new(),
             work_dir: None,
+            stdin: None,
             stdout: None,
             stderr: None,
             network_proxy_socket: None,
@@ -358,6 +359,19 @@ pub unsafe extern "C" fn arapuca_config_set_work_dir(
     dir: *const c_char,
 ) -> i32 {
     unsafe { set_config_string(cfg, dir, |c, s| c.work_dir = Some(PathBuf::from(s))) }
+}
+
+/// Set stdin FD on a config.
+///
+/// # Safety
+/// `cfg` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_config_set_stdin_fd(cfg: *mut ArapucaConfig, fd: i32) {
+    if let Some(cfg) = unsafe { cfg.as_mut() } {
+        if let Some(inner) = cfg.inner.as_mut() {
+            inner.stdin = Some(fd);
+        }
+    }
 }
 
 /// Set stdout FD on a config.
@@ -925,6 +939,7 @@ mod tests {
             assert_eq!(arapuca_config_set_socket_dir(cfg, dir.as_ptr()), 0);
             assert_eq!(arapuca_config_set_work_dir(cfg, dir.as_ptr()), 0);
             assert_eq!(arapuca_config_set_profile(cfg, profile), 0);
+            arapuca_config_set_stdin_fd(cfg, 0);
             arapuca_config_set_stdout_fd(cfg, 1);
             arapuca_config_set_stderr_fd(cfg, 2);
 
