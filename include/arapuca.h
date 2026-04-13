@@ -179,28 +179,28 @@ int32_t arapuca_config_set_socket_dir(struct arapuca_ArapucaConfig *cfg, const c
 int32_t arapuca_config_set_work_dir(struct arapuca_ArapucaConfig *cfg, const char *dir);
 
 /**
- * Set stdin FD on a config.
+ * Set stdin FD on a config. Returns 0 on success, -1 on error.
  *
  * # Safety
  * `cfg` must be a valid pointer.
  */
-void arapuca_config_set_stdin_fd(struct arapuca_ArapucaConfig *cfg, int32_t fd);
+int32_t arapuca_config_set_stdin_fd(struct arapuca_ArapucaConfig *cfg, int32_t fd);
 
 /**
- * Set stdout FD on a config.
+ * Set stdout FD on a config. Returns 0 on success, -1 on error.
  *
  * # Safety
  * `cfg` must be a valid pointer.
  */
-void arapuca_config_set_stdout_fd(struct arapuca_ArapucaConfig *cfg, int32_t fd);
+int32_t arapuca_config_set_stdout_fd(struct arapuca_ArapucaConfig *cfg, int32_t fd);
 
 /**
- * Set stderr FD on a config.
+ * Set stderr FD on a config. Returns 0 on success, -1 on error.
  *
  * # Safety
  * `cfg` must be a valid pointer.
  */
-void arapuca_config_set_stderr_fd(struct arapuca_ArapucaConfig *cfg, int32_t fd);
+int32_t arapuca_config_set_stderr_fd(struct arapuca_ArapucaConfig *cfg, int32_t fd);
 
 /**
  * Set network proxy socket path on a config.

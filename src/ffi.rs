@@ -361,43 +361,53 @@ pub unsafe extern "C" fn arapuca_config_set_work_dir(
     unsafe { set_config_string(cfg, dir, |c, s| c.work_dir = Some(PathBuf::from(s))) }
 }
 
-/// Set stdin FD on a config.
+/// Helper to set an FD field on a config with validation.
 ///
-/// # Safety
-/// `cfg` must be a valid pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn arapuca_config_set_stdin_fd(cfg: *mut ArapucaConfig, fd: i32) {
-    if let Some(cfg) = unsafe { cfg.as_mut() } {
-        if let Some(inner) = cfg.inner.as_mut() {
-            inner.stdin = Some(fd);
-        }
+/// FDs 0, 1, 2 are valid — `F_DUPFD_CLOEXEC` creates a new FD without
+/// disturbing the parent's original stdio descriptors.
+fn set_config_fd(cfg: *mut ArapucaConfig, fd: i32, setter: impl FnOnce(&mut Config, i32)) -> i32 {
+    clear_error();
+    let Some(cfg) = (unsafe { cfg.as_mut() }) else {
+        set_error("null config pointer");
+        return -1;
+    };
+    let Some(inner) = cfg.inner.as_mut() else {
+        set_error("config already freed");
+        return -1;
+    };
+    if fd < 0 {
+        set_error("invalid fd: must be >= 0");
+        return -1;
     }
+    setter(inner, fd);
+    0
 }
 
-/// Set stdout FD on a config.
+/// Set stdin FD on a config. Returns 0 on success, -1 on error.
 ///
 /// # Safety
 /// `cfg` must be a valid pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn arapuca_config_set_stdout_fd(cfg: *mut ArapucaConfig, fd: i32) {
-    if let Some(cfg) = unsafe { cfg.as_mut() } {
-        if let Some(inner) = cfg.inner.as_mut() {
-            inner.stdout = Some(fd);
-        }
-    }
+pub unsafe extern "C" fn arapuca_config_set_stdin_fd(cfg: *mut ArapucaConfig, fd: i32) -> i32 {
+    set_config_fd(cfg, fd, |c, fd| c.stdin = Some(fd))
 }
 
-/// Set stderr FD on a config.
+/// Set stdout FD on a config. Returns 0 on success, -1 on error.
 ///
 /// # Safety
 /// `cfg` must be a valid pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn arapuca_config_set_stderr_fd(cfg: *mut ArapucaConfig, fd: i32) {
-    if let Some(cfg) = unsafe { cfg.as_mut() } {
-        if let Some(inner) = cfg.inner.as_mut() {
-            inner.stderr = Some(fd);
-        }
-    }
+pub unsafe extern "C" fn arapuca_config_set_stdout_fd(cfg: *mut ArapucaConfig, fd: i32) -> i32 {
+    set_config_fd(cfg, fd, |c, fd| c.stdout = Some(fd))
+}
+
+/// Set stderr FD on a config. Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `cfg` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_config_set_stderr_fd(cfg: *mut ArapucaConfig, fd: i32) -> i32 {
+    set_config_fd(cfg, fd, |c, fd| c.stderr = Some(fd))
 }
 
 /// Set network proxy socket path on a config.
@@ -939,9 +949,14 @@ mod tests {
             assert_eq!(arapuca_config_set_socket_dir(cfg, dir.as_ptr()), 0);
             assert_eq!(arapuca_config_set_work_dir(cfg, dir.as_ptr()), 0);
             assert_eq!(arapuca_config_set_profile(cfg, profile), 0);
-            arapuca_config_set_stdin_fd(cfg, 0);
-            arapuca_config_set_stdout_fd(cfg, 1);
-            arapuca_config_set_stderr_fd(cfg, 2);
+            assert_eq!(arapuca_config_set_stdin_fd(cfg, 0), 0);
+            assert_eq!(arapuca_config_set_stdout_fd(cfg, 1), 0);
+            assert_eq!(arapuca_config_set_stderr_fd(cfg, 2), 0);
+
+            // Negative FDs are rejected.
+            assert_eq!(arapuca_config_set_stdin_fd(cfg, -1), -1);
+            assert_eq!(arapuca_config_set_stdout_fd(cfg, -1), -1);
+            assert_eq!(arapuca_config_set_stderr_fd(cfg, -1), -1);
 
             arapuca_profile_free(profile);
             arapuca_config_free(cfg);
