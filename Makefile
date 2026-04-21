@@ -1,4 +1,4 @@
-.PHONY: build release test lint fmt check audit header man clean
+.PHONY: build release test lint fmt check ci audit header man clean
 
 build:
 	cargo build
@@ -8,6 +8,14 @@ release:
 
 test:
 	cargo test
+
+# Unit tests only (no integration tests — safe on all platforms).
+test-unit:
+	cargo test --lib
+
+# Integration tests (Linux only — exercises Landlock, seccomp, cgroups).
+test-integration:
+	cargo test --test adversarial
 
 lint: fmt-check clippy
 
@@ -20,7 +28,18 @@ fmt-check:
 clippy:
 	cargo clippy -- -D warnings
 
-check: fmt-check clippy test
+# Full pre-commit / CI gate: format, lint, unit tests.
+check: fmt-check clippy test-unit
+
+# CI-only: full check + integration tests (Linux) or unit-only (other).
+# Usage: make ci              (auto-detects platform)
+#        make ci-full          (Linux: includes integration tests)
+ci: check
+ifeq ($(shell uname -s),Linux)
+	cargo test --test adversarial
+endif
+
+ci-full: fmt-check clippy test
 
 audit:
 	cargo audit
