@@ -560,16 +560,19 @@ pub unsafe extern "C" fn arapuca_launch(
     }
     let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
 
-    // Clone config and add extra FDs.
-    let mut launch_config = config.clone();
-    #[cfg(unix)]
-    if extra_fds_count > 0 && !extra_fds.is_null() {
-        for i in 0..extra_fds_count {
-            launch_config
-                .extra_fds
-                .push(unsafe { *extra_fds.add(i) } as RawFd);
+    // Clone config and add extra FDs (Unix) or handles (Windows, future).
+    let launch_config = {
+        #[allow(unused_mut)]
+        let mut cfg = config.clone();
+        #[cfg(unix)]
+        if extra_fds_count > 0 && !extra_fds.is_null() {
+            for i in 0..extra_fds_count {
+                cfg.extra_fds.push(unsafe { *extra_fds.add(i) } as RawFd);
+            }
         }
-    }
+        let _ = (extra_fds, extra_fds_count);
+        cfg
+    };
 
     // Launch.
     match sandbox.launch(&launch_config, &cmd_str, &arg_refs) {
@@ -732,6 +735,7 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
         set_error(&format!("rlimit: {e}"));
         return -1;
     }
+    let _ = inner;
     0
 }
 

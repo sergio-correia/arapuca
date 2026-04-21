@@ -68,7 +68,8 @@ fn main() {
         }
     }
 
-    // 3. Resource limits from env vars.
+    // 3. Resource limits from env vars (Unix only).
+    #[cfg(unix)]
     if let Err(e) = arapuca::rlimit::apply_from_env() {
         eprintln!("arapuca: rlimit: {e}");
         std::process::exit(1);
@@ -111,33 +112,41 @@ fn main() {
         .filter_map(|a| CString::new(a.as_str()).ok())
         .collect();
 
-    // Exec the target command. This replaces the current process.
-    // SAFETY: All CStrings are valid, null-terminated, and live until
-    // execve replaces the process image.
-    unsafe {
-        // Build argv and envp arrays for execve.
-        let argv: Vec<*const libc::c_char> = c_args
-            .iter()
-            .map(|a| a.as_ptr())
-            .chain(std::iter::once(std::ptr::null()))
-            .collect();
+    // Exec the target command (Unix: replaces process, Windows: spawn-and-wait).
+    #[cfg(unix)]
+    {
+        // SAFETY: All CStrings are valid, null-terminated, and live until
+        // execve replaces the process image.
+        unsafe {
+            let argv: Vec<*const libc::c_char> = c_args
+                .iter()
+                .map(|a| a.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect();
 
-        let envp: Vec<*const libc::c_char> = env
-            .iter()
-            .map(|(k, v)| {
-                // Leak a "key=value" CString for the envp array.
-                // This is fine because execve replaces the process.
-                let kv = format!("{}={}", k.to_string_lossy(), v.to_string_lossy());
-                CString::new(kv).unwrap().into_raw() as *const libc::c_char
-            })
-            .chain(std::iter::once(std::ptr::null()))
-            .collect();
+            let envp: Vec<*const libc::c_char> = env
+                .iter()
+                .map(|(k, v)| {
+                    // Leak a "key=value" CString for the envp array.
+                    // This is fine because execve replaces the process.
+                    let kv = format!("{}={}", k.to_string_lossy(), v.to_string_lossy());
+                    CString::new(kv).unwrap().into_raw() as *const libc::c_char
+                })
+                .chain(std::iter::once(std::ptr::null()))
+                .collect();
 
-        let ret = libc::execve(c_cmd.as_ptr(), argv.as_ptr(), envp.as_ptr());
-        if ret == -1 {
-            eprintln!("arapuca: exec {}: {}", cmd, std::io::Error::last_os_error());
-            std::process::exit(1);
+            let ret = libc::execve(c_cmd.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            if ret == -1 {
+                eprintln!("arapuca: exec {}: {}", cmd, std::io::Error::last_os_error());
+                std::process::exit(1);
+            }
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (c_cmd, c_args, env);
+        eprintln!("arapuca: binary not yet supported on this platform");
+        std::process::exit(1);
     }
 }
 

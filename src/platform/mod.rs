@@ -15,14 +15,18 @@ use crate::{Config, process::Process};
 mod darwin;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod other;
+#[cfg(target_os = "windows")]
+mod windows;
 
+#[cfg(target_os = "windows")]
+pub use self::windows::Windows;
 #[cfg(target_os = "macos")]
 pub use darwin::Darwin;
 #[cfg(target_os = "linux")]
 pub use linux::Linux;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub use other::Other;
 
 /// Platform-specific sandbox implementation.
@@ -92,8 +96,14 @@ pub fn new() -> crate::Result<Darwin> {
     Darwin::new()
 }
 
+/// Create the appropriate sandbox for the current platform (Windows).
+#[cfg(target_os = "windows")]
+pub fn new() -> crate::Result<Windows> {
+    Windows::new()
+}
+
 /// Create the appropriate sandbox for the current platform (fallback).
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn new() -> crate::Result<Other> {
     Ok(Other)
 }
