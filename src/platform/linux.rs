@@ -42,13 +42,7 @@ impl Linux {
 }
 
 impl Sandbox for Linux {
-    fn launch(
-        &self,
-        cfg: &Config,
-        cmd: &str,
-        args: &[&str],
-        extra_fds: &[RawFd],
-    ) -> crate::Result<Process> {
+    fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
         // Validate task ID.
         crate::sanitize_task_id(&cfg.task_id)?;
 
@@ -127,8 +121,7 @@ impl Sandbox for Linux {
         super::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
         super::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
 
-        // Capture extra_fds for the pre_exec closure.
-        let fds_to_inherit: Vec<RawFd> = extra_fds.to_vec();
+        let fds_to_inherit: Vec<RawFd> = cfg.extra_fds.clone();
 
         // SAFETY: pre_exec runs between fork and exec. Only
         // async-signal-safe functions are permitted. We use raw libc

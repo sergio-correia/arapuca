@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
@@ -282,9 +283,14 @@ pub extern "C" fn arapuca_config_new() -> *mut ArapucaConfig {
             task_id: String::new(),
             phase: String::new(),
             work_dir: None,
+            #[cfg(unix)]
             stdin: None,
+            #[cfg(unix)]
             stdout: None,
+            #[cfg(unix)]
             stderr: None,
+            #[cfg(unix)]
+            extra_fds: Vec::new(),
             network_proxy_socket: None,
             env: Vec::new(),
         }),
@@ -366,6 +372,7 @@ pub unsafe extern "C" fn arapuca_config_set_work_dir(
 ///
 /// FDs 0, 1, 2 are valid — `F_DUPFD_CLOEXEC` creates a new FD without
 /// disturbing the parent's original stdio descriptors.
+#[cfg(unix)]
 fn set_config_fd(cfg: *mut ArapucaConfig, fd: i32, setter: impl FnOnce(&mut Config, i32)) -> i32 {
     clear_error();
     let Some(cfg) = (unsafe { cfg.as_mut() }) else {
@@ -388,6 +395,7 @@ fn set_config_fd(cfg: *mut ArapucaConfig, fd: i32, setter: impl FnOnce(&mut Conf
 ///
 /// # Safety
 /// `cfg` must be a valid pointer.
+#[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arapuca_config_set_stdin_fd(cfg: *mut ArapucaConfig, fd: i32) -> i32 {
     set_config_fd(cfg, fd, |c, fd| c.stdin = Some(fd))
@@ -397,6 +405,7 @@ pub unsafe extern "C" fn arapuca_config_set_stdin_fd(cfg: *mut ArapucaConfig, fd
 ///
 /// # Safety
 /// `cfg` must be a valid pointer.
+#[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arapuca_config_set_stdout_fd(cfg: *mut ArapucaConfig, fd: i32) -> i32 {
     set_config_fd(cfg, fd, |c, fd| c.stdout = Some(fd))
@@ -406,6 +415,7 @@ pub unsafe extern "C" fn arapuca_config_set_stdout_fd(cfg: *mut ArapucaConfig, f
 ///
 /// # Safety
 /// `cfg` must be a valid pointer.
+#[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arapuca_config_set_stderr_fd(cfg: *mut ArapucaConfig, fd: i32) -> i32 {
     set_config_fd(cfg, fd, |c, fd| c.stderr = Some(fd))
@@ -550,16 +560,19 @@ pub unsafe extern "C" fn arapuca_launch(
     }
     let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
 
-    // Parse extra FDs.
-    let mut fds = Vec::with_capacity(extra_fds_count);
+    // Clone config and add extra FDs.
+    let mut launch_config = config.clone();
+    #[cfg(unix)]
     if extra_fds_count > 0 && !extra_fds.is_null() {
         for i in 0..extra_fds_count {
-            fds.push(unsafe { *extra_fds.add(i) } as RawFd);
+            launch_config
+                .extra_fds
+                .push(unsafe { *extra_fds.add(i) } as RawFd);
         }
     }
 
     // Launch.
-    match sandbox.launch(config, &cmd_str, &arg_refs, &fds) {
+    match sandbox.launch(&launch_config, &cmd_str, &arg_refs) {
         Ok(proc) => Box::into_raw(Box::new(ArapucaProcess { inner: Some(proc) })),
         Err(e) => {
             set_error(&format!("{e}"));
@@ -604,18 +617,16 @@ pub unsafe extern "C" fn arapuca_process_wait(proc_: *mut ArapucaProcess) -> i32
     match process.wait() {
         Ok(status) => {
             if let Some(code) = status.code() {
-                code
-            } else {
-                // Killed by signal. On Unix, signal number is available.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    if let Some(sig) = status.signal() {
-                        return -sig;
-                    }
-                }
-                -1 // Unknown non-exit termination.
+                return code;
             }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = status.signal() {
+                    return -sig;
+                }
+            }
+            -1
         }
         Err(e) => {
             set_error(&format!("{e}"));
@@ -716,6 +727,7 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
             return -1;
         }
     }
+    #[cfg(unix)]
     if let Err(e) = crate::rlimit::apply(inner) {
         set_error(&format!("rlimit: {e}"));
         return -1;
@@ -991,14 +1003,17 @@ mod tests {
             assert_eq!(arapuca_config_set_socket_dir(cfg, dir.as_ptr()), 0);
             assert_eq!(arapuca_config_set_work_dir(cfg, dir.as_ptr()), 0);
             assert_eq!(arapuca_config_set_profile(cfg, profile), 0);
-            assert_eq!(arapuca_config_set_stdin_fd(cfg, 0), 0);
-            assert_eq!(arapuca_config_set_stdout_fd(cfg, 1), 0);
-            assert_eq!(arapuca_config_set_stderr_fd(cfg, 2), 0);
+            #[cfg(unix)]
+            {
+                assert_eq!(arapuca_config_set_stdin_fd(cfg, 0), 0);
+                assert_eq!(arapuca_config_set_stdout_fd(cfg, 1), 0);
+                assert_eq!(arapuca_config_set_stderr_fd(cfg, 2), 0);
 
-            // Negative FDs are rejected.
-            assert_eq!(arapuca_config_set_stdin_fd(cfg, -1), -1);
-            assert_eq!(arapuca_config_set_stdout_fd(cfg, -1), -1);
-            assert_eq!(arapuca_config_set_stderr_fd(cfg, -1), -1);
+                // Negative FDs are rejected.
+                assert_eq!(arapuca_config_set_stdin_fd(cfg, -1), -1);
+                assert_eq!(arapuca_config_set_stdout_fd(cfg, -1), -1);
+                assert_eq!(arapuca_config_set_stderr_fd(cfg, -1), -1);
+            }
 
             let key = CString::new("MY_TOKEN").unwrap();
             let val = CString::new("secret123").unwrap();

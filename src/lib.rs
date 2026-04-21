@@ -23,6 +23,7 @@ pub mod netns;
 pub mod platform;
 mod process;
 mod profile;
+#[cfg(unix)]
 pub mod rlimit;
 #[cfg(target_os = "linux")]
 pub mod seccomp;

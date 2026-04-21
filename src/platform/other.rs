@@ -15,13 +15,7 @@ use crate::{Config, Error, process::Process};
 pub struct Other;
 
 impl Sandbox for Other {
-    fn launch(
-        &self,
-        cfg: &Config,
-        cmd: &str,
-        args: &[&str],
-        extra_fds: &[RawFd],
-    ) -> crate::Result<Process> {
+    fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
         let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;
 
         let mut command = Command::new(cmd);
@@ -44,7 +38,7 @@ impl Sandbox for Other {
         super::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
 
         // Extra FD inheritance.
-        let fds_to_inherit: Vec<RawFd> = extra_fds.to_vec();
+        let fds_to_inherit: Vec<RawFd> = cfg.extra_fds.clone();
         if !fds_to_inherit.is_empty() {
             unsafe {
                 command.pre_exec(move || {

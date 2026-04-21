@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
@@ -36,11 +37,17 @@ pub struct Config {
     /// Working directory for the subprocess (None = inherit).
     pub work_dir: Option<PathBuf>,
     /// Redirect subprocess stdin from this FD (None = inherit).
+    #[cfg(unix)]
     pub stdin: Option<RawFd>,
     /// Redirect subprocess stdout to this FD (None = inherit).
+    #[cfg(unix)]
     pub stdout: Option<RawFd>,
     /// Redirect subprocess stderr to this FD (None = inherit).
+    #[cfg(unix)]
     pub stderr: Option<RawFd>,
+    /// Additional FDs to inherit to the subprocess.
+    #[cfg(unix)]
+    pub extra_fds: Vec<RawFd>,
     /// Path to the network proxy Unix socket. When set, the subprocess
     /// receives an env var pointing to this socket. Uses a non-ARAPUCA
     /// prefix so it is not stripped by the binary.

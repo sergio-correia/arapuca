@@ -146,13 +146,7 @@ impl Darwin {
 }
 
 impl Sandbox for Darwin {
-    fn launch(
-        &self,
-        cfg: &Config,
-        cmd: &str,
-        args: &[&str],
-        _extra_fds: &[RawFd],
-    ) -> crate::Result<Process> {
+    fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
         // Validate task ID.
         crate::sanitize_task_id(&cfg.task_id)?;
 

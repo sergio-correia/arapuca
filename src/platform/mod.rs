@@ -4,7 +4,9 @@
 //! the available isolation primitives (Landlock, seccomp, cgroups, netns
 //! on Linux; sandbox-exec on macOS; degraded fallback elsewhere).
 
+#[cfg(unix)]
 use std::os::unix::io::{FromRawFd, RawFd};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
 use crate::{Config, process::Process};
@@ -30,16 +32,9 @@ pub use other::Other;
 pub trait Sandbox: Send + Sync {
     /// Launch a sandboxed subprocess with the given config.
     ///
-    /// The subprocess inherits only the explicitly listed FDs (via
-    /// `extra_fds`) and a minimal environment. All other FDs have
-    /// CLOEXEC set.
-    fn launch(
-        &self,
-        cfg: &Config,
-        cmd: &str,
-        args: &[&str],
-        extra_fds: &[RawFd],
-    ) -> crate::Result<Process>;
+    /// The subprocess inherits only explicitly configured FDs/handles
+    /// and a minimal environment.
+    fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process>;
 
     /// Reports whether this sandbox implementation is available on
     /// the current platform. Returns an error describing why if not.
@@ -57,6 +52,7 @@ pub trait Sandbox: Send + Sync {
 ///
 /// FDs 0, 1, 2 are valid inputs — `F_DUPFD_CLOEXEC` creates a new FD
 /// without disturbing the parent's original.
+#[cfg(unix)]
 pub(crate) fn setup_stdio(
     command: &mut Command,
     fd: Option<RawFd>,
