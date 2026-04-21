@@ -27,10 +27,22 @@ pub fn minimal_env(tmp_dir: &Path) -> Vec<(String, String)> {
 /// - `ARAPUCA_*` — sandbox config re-injection
 /// - `AGENT_NETWORK_PROXY` — set by launcher, not caller
 /// - `LD_*`, `DYLD_*` — dynamic linker injection
+/// - `COR_*`, `CORECLR_*`, `DOTNET_*`, `COMPLUS_*` — .NET profiler/runtime injection
+/// - `__COMPAT_LAYER` — Windows compatibility shim injection
 /// - Interpreter injection: `BASH_ENV`, `ENV`, `PYTHONPATH`,
 ///   `PYTHONSTARTUP`, `NODE_OPTIONS`, `PERL5OPT`, `PERL5LIB`
+/// - `COMSPEC`, `PSModulePath`, `PATHEXT` — Windows shell/exec injection
 pub fn filter_caller_env(env: &[(String, String)]) -> Vec<(String, String)> {
-    const BLOCKED_PREFIXES: &[&str] = &["ARAPUCA_", "LD_", "DYLD_"];
+    const BLOCKED_PREFIXES: &[&str] = &[
+        "ARAPUCA_",
+        "LD_",
+        "DYLD_",
+        "COR_",
+        "CORECLR_",
+        "DOTNET_",
+        "COMPLUS_",
+        "__COMPAT_LAYER",
+    ];
     const BLOCKED_NAMES: &[&str] = &[
         "AGENT_NETWORK_PROXY",
         "BASH_ENV",
@@ -40,6 +52,9 @@ pub fn filter_caller_env(env: &[(String, String)]) -> Vec<(String, String)> {
         "NODE_OPTIONS",
         "PERL5OPT",
         "PERL5LIB",
+        "COMSPEC",
+        "PSModulePath",
+        "PATHEXT",
     ];
 
     env.iter()

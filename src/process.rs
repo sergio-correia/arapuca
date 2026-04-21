@@ -19,6 +19,12 @@ pub struct Process {
     /// Reference to the cgroup manager for stats/cleanup. Linux only.
     #[cfg(target_os = "linux")]
     pub(crate) cgroup_mgr: Option<std::sync::Arc<crate::cgroup::CgroupManager>>,
+    /// Job Object handle. Kept alive for JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:
+    /// when the handle closes (drop or parent crash), Windows kills all
+    /// processes in the Job Object.
+    #[cfg(windows)]
+    #[allow(dead_code)] // read via Drop — OwnedHandle::drop closes the handle
+    pub(crate) job_handle: Option<std::os::windows::io::OwnedHandle>,
 }
 
 impl Process {
@@ -66,6 +72,10 @@ impl Process {
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
             let _ = mgr.destroy(path);
         }
+        // On Windows, dropping job_handle closes it. Since the child
+        // has already exited (wait() returned), this is a no-op. If
+        // the parent crashes before cleanup(), the Drop still fires,
+        // triggering kill-on-close as a safety net.
         if self.tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&self.tmp_dir);
         }

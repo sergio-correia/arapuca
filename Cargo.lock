@@ -80,6 +80,7 @@ dependencies = [
  "seccompiler",
  "tempfile",
  "thiserror",
+ "windows-sys",
 ]
 
 [[package]]
