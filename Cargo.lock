@@ -78,6 +78,7 @@ dependencies = [
  "log",
  "nix",
  "seccompiler",
+ "tempfile",
  "thiserror",
 ]
 

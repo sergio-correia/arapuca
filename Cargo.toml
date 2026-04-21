@@ -19,6 +19,7 @@ path = "src/bin/arapuca.rs"
 libc = "0.2"
 log = "0.4"
 nix = { version = "0.30", features = ["fs", "process", "sched", "signal", "user"] }
+tempfile = "3"
 thiserror = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -57,7 +57,7 @@ pub fn filter_caller_env(env: &[(String, String)]) -> Vec<(String, String)> {
 /// suffix to prevent symlink attacks and directory squatting.
 pub fn make_tmp_dir(task_id: &str) -> crate::Result<PathBuf> {
     let prefix = format!("arapuca-{task_id}-");
-    let dir = mkdtemp(&prefix)?;
+    let dir = make_temp_dir(&prefix)?;
     Ok(dir)
 }
 
@@ -66,7 +66,7 @@ pub fn make_tmp_dir(task_id: &str) -> crate::Result<PathBuf> {
 /// Creates a directory with mode 0700 and a random suffix for the
 /// control and LLM sockets.
 pub fn make_socket_dir() -> crate::Result<PathBuf> {
-    mkdtemp("arapuca-sock-")
+    make_temp_dir("arapuca-sock-")
 }
 
 /// Canonicalize a list of paths, resolving symlinks and making them absolute.
@@ -92,20 +92,32 @@ pub fn canonicalize_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Parse colon-separated paths from a string.
+/// Platform-specific path list separator.
+///
+/// `:` on Unix, `;` on Windows (where `:` appears in drive letters).
+const PATH_LIST_SEP: char = if cfg!(windows) { ';' } else { ':' };
+
+/// Parse paths from a separator-delimited string.
 ///
 /// Used by the binary to parse ARAPUCA_READ_PATHS and ARAPUCA_WRITE_PATHS
-/// environment variables.
+/// environment variables. Uses `:` on Unix, `;` on Windows.
 pub fn parse_paths(s: &str) -> Vec<PathBuf> {
     if s.is_empty() {
         return Vec::new();
     }
-    s.split(':')
+    s.split(PATH_LIST_SEP)
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
         .collect()
 }
+
+/// Binary name for the arapuca wrapper.
+const WRAPPER_BIN: &str = if cfg!(windows) {
+    "arapuca.exe"
+} else {
+    "arapuca"
+};
 
 /// Returns the path to the arapuca binary if it exists.
 ///
@@ -115,15 +127,18 @@ pub fn wrapper_path() -> Option<PathBuf> {
     // Look next to the current executable.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("arapuca");
+            let candidate = dir.join(WRAPPER_BIN);
             if candidate.is_file() {
                 return Some(candidate);
             }
         }
     }
     // Fall back to PATH.
-    for dir in std::env::var("PATH").unwrap_or_default().split(':') {
-        let candidate = PathBuf::from(dir).join("arapuca");
+    for dir in std::env::var("PATH")
+        .unwrap_or_default()
+        .split(PATH_LIST_SEP)
+    {
+        let candidate = PathBuf::from(dir).join(WRAPPER_BIN);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -143,7 +158,8 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        env.push(("ARAPUCA_READ_PATHS".into(), paths.join(":")));
+        let sep = &PATH_LIST_SEP.to_string();
+        env.push(("ARAPUCA_READ_PATHS".into(), paths.join(sep)));
     }
     if !profile.write_paths.is_empty() {
         let paths: Vec<String> = profile
@@ -151,7 +167,8 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        env.push(("ARAPUCA_WRITE_PATHS".into(), paths.join(":")));
+        let sep = &PATH_LIST_SEP.to_string();
+        env.push(("ARAPUCA_WRITE_PATHS".into(), paths.join(sep)));
     }
     if profile.max_memory_mb > 0 {
         env.push((
@@ -171,29 +188,16 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
     env
 }
 
-/// Create a temporary directory with a random suffix using libc mkdtemp.
+/// Create a temporary directory with a random suffix.
 ///
-/// The `prefix` is prepended to the random suffix. The resulting
-/// directory has mode 0700 (set atomically by mkdtemp).
-fn mkdtemp(prefix: &str) -> crate::Result<PathBuf> {
-    let tmp = std::env::temp_dir();
-    let template = format!("{}XXXXXX", tmp.join(prefix).display());
-    let mut template_bytes = template.into_bytes();
-    template_bytes.push(0); // null-terminate
-
-    // SAFETY: mkdtemp modifies the template in-place and creates the
-    // directory atomically with mode 0700. The buffer is valid and
-    // null-terminated.
-    let result = unsafe { libc::mkdtemp(template_bytes.as_mut_ptr().cast()) };
-    if result.is_null() {
-        return Err(crate::Error::Io(std::io::Error::last_os_error()));
-    }
-
-    // Convert back to PathBuf (strip the null terminator).
-    template_bytes.pop(); // remove null
-    let path_str = String::from_utf8(template_bytes)
-        .map_err(|e| crate::Error::Process(format!("mkdtemp path: {e}")))?;
-    Ok(PathBuf::from(path_str))
+/// Uses the `tempfile` crate which calls `mkdtemp` on Unix (mode 0700,
+/// created atomically) and secure temp-dir creation on Windows.
+/// `keep()` prevents auto-deletion — the caller owns cleanup.
+fn make_temp_dir(prefix: &str) -> crate::Result<PathBuf> {
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(std::env::temp_dir())?;
+    Ok(dir.keep())
 }
 
 #[cfg(test)]
@@ -224,21 +228,25 @@ mod tests {
 
     #[test]
     fn parse_paths_multiple() {
-        let paths = parse_paths("/usr:/lib:/etc");
+        let sep = PATH_LIST_SEP;
+        let input = format!("/a{sep}/b{sep}/c");
+        let paths = parse_paths(&input);
         assert_eq!(
             paths,
             vec![
-                PathBuf::from("/usr"),
-                PathBuf::from("/lib"),
-                PathBuf::from("/etc"),
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/c")
             ]
         );
     }
 
     #[test]
     fn parse_paths_trims_whitespace() {
-        let paths = parse_paths(" /usr : /lib ");
-        assert_eq!(paths, vec![PathBuf::from("/usr"), PathBuf::from("/lib")]);
+        let sep = PATH_LIST_SEP;
+        let input = format!(" /a {sep} /b ");
+        let paths = parse_paths(&input);
+        assert_eq!(paths, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
     }
 
     #[test]
@@ -265,8 +273,13 @@ mod tests {
     #[test]
     fn filter_drops_interpreter_injection() {
         let blocked = vec![
-            "BASH_ENV", "ENV", "PYTHONPATH", "PYTHONSTARTUP",
-            "NODE_OPTIONS", "PERL5OPT", "PERL5LIB",
+            "BASH_ENV",
+            "ENV",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "NODE_OPTIONS",
+            "PERL5OPT",
+            "PERL5LIB",
         ];
         let env: Vec<(String, String)> = blocked
             .iter()
@@ -303,16 +316,17 @@ mod tests {
 
     #[test]
     fn canonicalize_existing_paths() {
-        let paths = vec![PathBuf::from("/usr"), PathBuf::from("/tmp/nonexistent-xyz")];
+        let existing = std::env::temp_dir();
+        let nonexistent_child = existing.join("nonexistent-xyz-arapuca-test");
+        let paths = vec![existing.clone(), nonexistent_child];
         let result = canonicalize_paths(&paths);
-        assert!(result.contains(&PathBuf::from("/usr")));
-        // /tmp/nonexistent-xyz: parent /tmp exists, so fallback works.
-        assert!(result.len() == 2);
+        let canon_existing = std::fs::canonicalize(&existing).unwrap();
+        assert!(result.contains(&canon_existing));
+        assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn canonicalize_fully_nonexistent() {
-        // Both parent and child don't exist — dropped.
         let paths = vec![PathBuf::from("/no-such-parent-xyz/child")];
         let result = canonicalize_paths(&paths);
         assert!(result.is_empty());
