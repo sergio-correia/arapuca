@@ -8,7 +8,6 @@
 //! Current limitations (documented as known gaps):
 //! - No restricted token (child inherits parent's token)
 //! - No integrity level reduction
-//! - No process mitigation policies
 //! - No desktop/window station isolation
 //! - No filesystem isolation (requires AppContainer)
 //! - No network isolation (requires AppContainer)
@@ -50,6 +49,19 @@ use crate::{Config, Error, process::Process};
 
 const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000D;
 const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
+const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY: usize = 0x0002_0007;
+
+const MITIGATION_POLICY: u64 = 0x01           // DEP enable
+    | 0x02                                     // DEP ATL thunk enable
+    | (1 << 8)                                 // mandatory ASLR
+    | (1 << 12)                                // heap terminate on corruption
+    | (1 << 16)                                // bottom-up ASLR
+    | (1 << 20)                                // high-entropy ASLR (x64)
+    | (1 << 24)                                // strict handle checks
+    | (1 << 28)                                // Win32k syscall disable
+    | (1 << 32)                                // extension point disable
+    | (1 << 52)                                // image load no remote
+    | (1 << 56); // image load no low label
 
 /// Windows sandbox implementation.
 pub struct Windows;
@@ -94,7 +106,8 @@ impl Sandbox for Windows {
         }
 
         let job_raw = job_handle.as_raw_handle() as HANDLE;
-        let mut attr_list = AttributeList::new(2).inspect_err(|_| {
+        let mut policy = [MITIGATION_POLICY, 0u64];
+        let mut attr_list = AttributeList::new(3).inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         })?;
         attr_list.add_job_list(&job_raw).inspect_err(|_| {
@@ -102,6 +115,11 @@ impl Sandbox for Windows {
         })?;
         attr_list
             .add_handle_list(&mut handle_list)
+            .inspect_err(|_| {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+            })?;
+        attr_list
+            .add_mitigation_policy(&mut policy)
             .inspect_err(|_| {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
             })?;
@@ -304,6 +322,28 @@ impl AttributeList {
         if ret == 0 {
             return Err(Error::Process(format!(
                 "UpdateProcThreadAttribute(HANDLE_LIST): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    fn add_mitigation_policy(&mut self, policy: &mut [u64; 2]) -> crate::Result<()> {
+        // SAFETY: policy is a valid [u64; 2] that outlives the attribute list.
+        let ret = unsafe {
+            UpdateProcThreadAttribute(
+                self.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+                policy.as_mut_ptr().cast(),
+                std::mem::size_of::<[u64; 2]>(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ret == 0 {
+            return Err(Error::Process(format!(
+                "UpdateProcThreadAttribute(MITIGATION_POLICY): {}",
                 std::io::Error::last_os_error()
             )));
         }
