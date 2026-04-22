@@ -224,7 +224,12 @@ impl Sandbox for Windows {
         // ── Build attribute list ──
         let attr_count = if use_appcontainer { 4 } else { 3 };
         let job_raw = job_handle.as_raw_handle() as HANDLE;
-        let mut policy = [MITIGATION_POLICY, 0u64];
+        let policy_qword2 = if !cfg.profile.allow_exec {
+            1u64 << 44 // PROCESS_CREATION_CHILD_PROCESS_RESTRICTED (ALWAYS_ON)
+        } else {
+            0
+        };
+        let mut policy = [MITIGATION_POLICY, policy_qword2];
 
         // After DACLs are granted, error cleanup must also restore
         // them and delete the AppContainer profile.
