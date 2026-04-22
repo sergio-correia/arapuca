@@ -795,7 +795,9 @@ fn quote_arg(arg: &str, out: &mut String) {
             }
         }
     }
-    for _ in 0..backslashes {
+    // Trailing backslashes must be doubled — they would otherwise
+    // escape the closing quote.
+    for _ in 0..backslashes * 2 {
         out.push('\\');
     }
     out.push('"');
