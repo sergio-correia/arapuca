@@ -228,8 +228,7 @@ impl Sandbox for Windows {
         unsafe { CloseHandle(pi.hThread) };
 
         // SAFETY: hProcess is valid from successful CreateProcessW.
-        let process_handle =
-            unsafe { OwnedHandle::from_raw_handle(pi.hProcess as *mut std::ffi::c_void) };
+        let process_handle = unsafe { OwnedHandle::from_raw_handle(pi.hProcess) };
 
         Ok(Process {
             process_handle,
@@ -298,7 +297,7 @@ fn duplicate_as_inheritable(handle: HANDLE) -> crate::Result<OwnedHandle> {
         )));
     }
     // SAFETY: dup is a valid handle from successful DuplicateHandle.
-    Ok(unsafe { OwnedHandle::from_raw_handle(dup as *mut std::ffi::c_void) })
+    Ok(unsafe { OwnedHandle::from_raw_handle(dup) })
 }
 
 // ─── Restricted token ──────────────────────────────────────────────
@@ -320,7 +319,7 @@ fn create_restricted_token() -> crate::Result<OwnedHandle> {
             std::io::Error::last_os_error()
         )));
     }
-    let token = unsafe { OwnedHandle::from_raw_handle(token as *mut std::ffi::c_void) };
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
 
     let mut restricted: HANDLE = std::ptr::null_mut();
     // SAFETY: token is valid. DISABLE_MAX_PRIVILEGE strips all privileges.
@@ -346,7 +345,7 @@ fn create_restricted_token() -> crate::Result<OwnedHandle> {
             std::io::Error::last_os_error()
         )));
     }
-    let restricted = unsafe { OwnedHandle::from_raw_handle(restricted as *mut std::ffi::c_void) };
+    let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
 
     // Lower integrity to Low (S-1-16-4096).
     set_token_integrity_low(&restricted)?;
@@ -420,7 +419,9 @@ fn resolve_nt_set_information_process() -> crate::Result<NtSetInformationProcess
         ));
     };
     // SAFETY: proc is a valid function pointer from GetProcAddress.
-    Ok(unsafe { std::mem::transmute(proc) })
+    Ok(unsafe {
+        std::mem::transmute::<unsafe extern "system" fn() -> isize, NtSetInformationProcessFn>(proc)
+    })
 }
 
 fn apply_restricted_token(
@@ -531,7 +532,7 @@ impl AttributeList {
                 0,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                 handles.as_mut_ptr().cast(),
-                handles.len() * std::mem::size_of::<HANDLE>(),
+                std::mem::size_of_val(handles),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
@@ -809,7 +810,7 @@ pub(crate) fn encode_env_block(vars: &[(String, String)]) -> Vec<u16> {
     use std::ffi::OsStr;
 
     let mut sorted: Vec<&(String, String)> = vars.iter().collect();
-    sorted.sort_by(|a, b| a.0.to_ascii_uppercase().cmp(&b.0.to_ascii_uppercase()));
+    sorted.sort_by_key(|a| a.0.to_ascii_uppercase());
 
     let mut block = Vec::new();
     for (k, v) in &sorted {
