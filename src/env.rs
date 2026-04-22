@@ -34,14 +34,7 @@ pub fn minimal_env(tmp_dir: &Path) -> Vec<(String, String)> {
 /// - `COMSPEC`, `PSModulePath`, `PATHEXT` — Windows shell/exec injection
 pub fn filter_caller_env(env: &[(String, String)]) -> Vec<(String, String)> {
     const BLOCKED_PREFIXES: &[&str] = &[
-        "ARAPUCA_",
-        "LD_",
-        "DYLD_",
-        "COR_",
-        "CORECLR_",
-        "DOTNET_",
-        "COMPLUS_",
-        "__COMPAT_LAYER",
+        "ARAPUCA_", "LD_", "DYLD_", "COR_", "CORECLR_", "DOTNET_", "COMPLUS_",
     ];
     const BLOCKED_NAMES: &[&str] = &[
         "AGENT_NETWORK_PROXY",
@@ -55,6 +48,7 @@ pub fn filter_caller_env(env: &[(String, String)]) -> Vec<(String, String)> {
         "COMSPEC",
         "PSModulePath",
         "PATHEXT",
+        "__COMPAT_LAYER",
     ];
 
     env.iter()

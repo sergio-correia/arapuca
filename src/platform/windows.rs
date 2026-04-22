@@ -1008,7 +1008,6 @@ impl Drop for SavedDacl {
 }
 
 /// Save the current DACL of a path for later restoration.
-#[allow(dead_code)]
 pub fn save_dacl(path: &Path) -> crate::Result<SavedDacl> {
     let wide_path: Vec<u16> = path
         .as_os_str()
@@ -1115,7 +1114,6 @@ pub fn restore_dacl(saved: &SavedDacl) -> crate::Result<()> {
 /// # Safety requirements on `sid`
 /// - Must be a valid, non-null pointer to a Windows SID structure
 /// - Must remain valid for the duration of this call
-#[allow(dead_code)]
 pub fn grant_path_access(
     path: &Path,
     sid: *mut std::ffi::c_void,
@@ -1235,7 +1233,6 @@ pub fn delete_app_container(name: &str) -> crate::Result<()> {
 ///
 /// AppContainer names are limited to 64 characters. We use a hash
 /// to keep within the limit while avoiding collisions.
-#[allow(dead_code)]
 pub fn container_name(task_id: &str) -> String {
     let pid = std::process::id();
     let hash = fnv1a_64(format!("{task_id}-{pid}").as_bytes());
@@ -1246,7 +1243,6 @@ pub fn container_name(task_id: &str) -> String {
 ///
 /// The SID must be freed with `FreeSid` when no longer needed.
 /// The profile persists in the registry until `delete_app_container`.
-#[allow(dead_code)]
 pub fn create_app_container(name: &str) -> crate::Result<AppContainerSid> {
     let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let wide_desc: Vec<u16> = "arapuca sandbox"
