@@ -13,7 +13,6 @@
 
 mod darwin_profile;
 
-use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
