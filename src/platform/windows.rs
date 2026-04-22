@@ -6,8 +6,6 @@
 //! and environment hardening.
 //!
 //! Current limitations (documented as known gaps):
-//! - No restricted token (child inherits parent's token)
-//! - No integrity level reduction
 //! - No desktop/window station isolation
 //! - No filesystem isolation (requires AppContainer)
 //! - No network isolation (requires AppContainer)
@@ -24,6 +22,11 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, TRUE,
 };
+use windows_sys::Win32::Security::{
+    CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SetTokenInformation, TOKEN_ACCESS_MASK,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL,
+    TOKEN_QUERY, TokenIntegrityLevel,
+};
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
@@ -38,10 +41,12 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
     JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    InitializeProcThreadAttributeList, OpenProcessToken, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
 };
 
 use crate::platform::Sandbox;
@@ -51,6 +56,10 @@ const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000D;
 const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
 const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY: usize = 0x0002_0007;
 
+// QWORD 1 of PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY.
+// ACG (1 << 36, prohibit dynamic code) is deliberately omitted: it
+// breaks JIT runtimes (Python, Node, Java, .NET). Add as opt-in via
+// a Profile flag if needed for compiled-binary-only workloads.
 const MITIGATION_POLICY: u64 = 0x01           // DEP enable
     | 0x02                                     // DEP ATL thunk enable
     | (1 << 8)                                 // mandatory ASLR
@@ -138,6 +147,17 @@ impl Sandbox for Windows {
 
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
+        // Create restricted token before spawning the process.
+        let restricted_token = create_restricted_token().inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        })?;
+
+        // Resolve NtSetInformationProcess before creating the child to
+        // avoid leaving a suspended zombie if resolution fails.
+        let nt_set_info = resolve_nt_set_information_process().inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        })?;
+
         // SAFETY: All pointers are valid. cmdline is a mutable
         // null-terminated UTF-16 buffer. env_block is a valid
         // double-null-terminated UTF-16 environment block.
@@ -145,6 +165,8 @@ impl Sandbox for Windows {
         // restricting inheritance to explicit stdio handles. When no
         // handles exist (detached/service), FALSE prevents leaking all
         // inheritable handles to the child.
+        // CREATE_SUSPENDED: process is created suspended so we can swap
+        // the token before it runs any code.
         let ret = unsafe {
             CreateProcessW(
                 std::ptr::null(),
@@ -152,7 +174,10 @@ impl Sandbox for Windows {
                 std::ptr::null(),
                 std::ptr::null(),
                 inherit_handles,
-                CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                CREATE_NO_WINDOW
+                    | CREATE_SUSPENDED
+                    | EXTENDED_STARTUPINFO_PRESENT
+                    | CREATE_UNICODE_ENVIRONMENT,
                 env_block.as_ptr().cast(),
                 work_dir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
                 &raw mut si.StartupInfo,
@@ -166,6 +191,33 @@ impl Sandbox for Windows {
             let err = std::io::Error::last_os_error();
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(Error::Process(format!("CreateProcessW: {err}")));
+        }
+
+        // Apply restricted token to the suspended process.
+        if let Err(e) =
+            apply_restricted_token(nt_set_info, pi.hProcess, pi.hThread, &restricted_token)
+        {
+            // Fail-closed: kill the suspended child.
+            unsafe {
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+
+        // Resume the thread now that the token is applied.
+        let resume_ret = unsafe { ResumeThread(pi.hThread) };
+        if resume_ret == u32::MAX {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(Error::Process(format!("ResumeThread: {err}")));
         }
 
         // SAFETY: hThread is valid from successful CreateProcessW.
@@ -185,9 +237,8 @@ impl Sandbox for Windows {
 
     fn available(&self) -> crate::Result<()> {
         log::warn!(
-            "Windows sandbox has degraded security: no restricted token, \
-             no filesystem/network isolation, no mitigation policies. \
-             See platform/windows.rs module docs for full gap list."
+            "Windows sandbox: no filesystem/network isolation without \
+             AppContainer. See platform/windows.rs module docs for gaps."
         );
         Ok(())
     }
@@ -242,6 +293,166 @@ fn duplicate_as_inheritable(handle: HANDLE) -> crate::Result<OwnedHandle> {
     }
     // SAFETY: dup is a valid handle from successful DuplicateHandle.
     Ok(unsafe { OwnedHandle::from_raw_handle(dup as *mut std::ffi::c_void) })
+}
+
+// ─── Restricted token ──────────────────────────────────────────────
+
+fn create_restricted_token() -> crate::Result<OwnedHandle> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess is always valid. token is a valid out pointer.
+    let ret = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            (TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY)
+                as TOKEN_ACCESS_MASK,
+            &mut token,
+        )
+    };
+    if ret == 0 {
+        return Err(Error::Process(format!(
+            "OpenProcessToken: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token as *mut std::ffi::c_void) };
+
+    let mut restricted: HANDLE = std::ptr::null_mut();
+    // SAFETY: token is valid. DISABLE_MAX_PRIVILEGE strips all privileges.
+    // No deny-only SIDs or restricting SIDs for now — those require
+    // enumerating the token's groups which is complex. The privilege
+    // stripping + Low IL provide meaningful privilege reduction.
+    let ret = unsafe {
+        CreateRestrictedToken(
+            token.as_raw_handle() as HANDLE,
+            DISABLE_MAX_PRIVILEGE,
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &mut restricted,
+        )
+    };
+    if ret == 0 {
+        return Err(Error::Process(format!(
+            "CreateRestrictedToken: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let restricted = unsafe { OwnedHandle::from_raw_handle(restricted as *mut std::ffi::c_void) };
+
+    // Lower integrity to Low (S-1-16-4096).
+    set_token_integrity_low(&restricted)?;
+
+    Ok(restricted)
+}
+
+fn set_token_integrity_low(token: &OwnedHandle) -> crate::Result<()> {
+    // S-1-16-4096 (Low Mandatory Level)
+    #[repr(C)]
+    struct SidBuffer {
+        revision: u8,
+        sub_authority_count: u8,
+        identifier_authority: [u8; 6],
+        sub_authority: [u32; 1],
+    }
+
+    let low_sid = SidBuffer {
+        revision: 1,
+        sub_authority_count: 1,
+        identifier_authority: [0, 0, 0, 0, 0, 16], // SECURITY_MANDATORY_LABEL_AUTHORITY
+        sub_authority: [4096],                     // SECURITY_MANDATORY_LOW_RID
+    };
+
+    let label = TOKEN_MANDATORY_LABEL {
+        Label: windows_sys::Win32::Security::SID_AND_ATTRIBUTES {
+            Sid: (&raw const low_sid).cast::<std::ffi::c_void>() as *mut _,
+            Attributes: 0x00000020, // SE_GROUP_INTEGRITY
+        },
+    };
+
+    // SAFETY: token is valid, label is a valid TOKEN_MANDATORY_LABEL.
+    let ret = unsafe {
+        SetTokenInformation(
+            token.as_raw_handle() as HANDLE,
+            TokenIntegrityLevel,
+            (&raw const label).cast(),
+            std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32,
+        )
+    };
+    if ret == 0 {
+        return Err(Error::Process(format!(
+            "SetTokenInformation(IntegrityLevel): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+type NtSetInformationProcessFn = unsafe extern "system" fn(
+    process_handle: HANDLE,
+    process_information_class: u32,
+    process_information: *const std::ffi::c_void,
+    process_information_length: u32,
+) -> i32;
+
+fn resolve_nt_set_information_process() -> crate::Result<NtSetInformationProcessFn> {
+    let ntdll: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+    let func_name = b"NtSetInformationProcess\0";
+
+    // SAFETY: ntdll.dll is always loaded in every Windows process.
+    let module = unsafe { GetModuleHandleW(ntdll.as_ptr()) };
+    if module.is_null() {
+        return Err(Error::Process("GetModuleHandleW(ntdll.dll) failed".into()));
+    }
+    // SAFETY: module is valid, func_name is null-terminated.
+    let proc = unsafe { GetProcAddress(module, func_name.as_ptr().cast()) };
+    let Some(proc) = proc else {
+        return Err(Error::Process(
+            "NtSetInformationProcess not found in ntdll.dll".into(),
+        ));
+    };
+    // SAFETY: proc is a valid function pointer from GetProcAddress.
+    Ok(unsafe { std::mem::transmute(proc) })
+}
+
+fn apply_restricted_token(
+    nt_set_info: NtSetInformationProcessFn,
+    process: HANDLE,
+    thread: HANDLE,
+    token: &OwnedHandle,
+) -> crate::Result<()> {
+    // ProcessAccessToken = 9
+    const PROCESS_ACCESS_TOKEN: u32 = 9;
+
+    #[repr(C)]
+    struct ProcessAccessTokenInfo {
+        token: HANDLE,
+        thread: HANDLE,
+    }
+
+    let info = ProcessAccessTokenInfo {
+        token: token.as_raw_handle() as HANDLE,
+        thread,
+    };
+
+    // SAFETY: process is a valid suspended process handle. token and
+    // thread are valid handles. The process has zero started threads.
+    let status = unsafe {
+        nt_set_info(
+            process,
+            PROCESS_ACCESS_TOKEN,
+            (&raw const info).cast(),
+            std::mem::size_of::<ProcessAccessTokenInfo>() as u32,
+        )
+    };
+    if status != 0 {
+        return Err(Error::Process(format!(
+            "NtSetInformationProcess(ProcessAccessToken): NTSTATUS 0x{status:08X}"
+        )));
+    }
+    Ok(())
 }
 
 // ─── Attribute list RAII wrapper ───────────────────────────────────
