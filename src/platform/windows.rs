@@ -300,3 +300,229 @@ fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
 
     env
 }
+
+/// Build a Windows command line from a command and arguments.
+///
+/// Implements `CommandLineToArgvW`-compatible quoting (MSVC C runtime
+/// rules). Arguments containing spaces, tabs, or quotes are wrapped
+/// in double quotes with proper backslash escaping.
+///
+/// Returns a null-terminated mutable UTF-16 buffer — `CreateProcessW`
+/// may modify `lpCommandLine` in-place.
+#[allow(dead_code)]
+pub(crate) fn quote_args(cmd: &str, args: &[&str]) -> Vec<u16> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut cmdline = String::new();
+    quote_arg(cmd, &mut cmdline);
+    for arg in args {
+        cmdline.push(' ');
+        quote_arg(arg, &mut cmdline);
+    }
+    OsStr::new(&cmdline)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+fn quote_arg(arg: &str, out: &mut String) {
+    if arg.is_empty() {
+        out.push_str("\"\"");
+        return;
+    }
+    let needs_quoting = arg.bytes().any(|b| b == b' ' || b == b'\t' || b == b'"');
+    if !needs_quoting {
+        out.push_str(arg);
+        return;
+    }
+    out.push('"');
+    let mut backslashes: usize = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push('\\');
+                out.push('"');
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    for _ in 0..backslashes {
+        out.push('\\');
+    }
+    out.push('"');
+}
+
+/// Encode environment variables into a Windows environment block.
+///
+/// The block is UTF-16 encoded, sorted by key (case-insensitive),
+/// with each entry as `KEY=VALUE\0` and terminated by an extra `\0`.
+/// Required for `CreateProcessW` with `CREATE_UNICODE_ENVIRONMENT`.
+#[allow(dead_code)]
+pub(crate) fn encode_env_block(vars: &[(String, String)]) -> Vec<u16> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut sorted: Vec<&(String, String)> = vars.iter().collect();
+    sorted.sort_by(|a, b| a.0.to_ascii_uppercase().cmp(&b.0.to_ascii_uppercase()));
+
+    let mut block = Vec::new();
+    for (k, v) in &sorted {
+        let entry = format!("{k}={v}");
+        block.extend(OsStr::new(&entry).encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_simple() {
+        let result = quote_args("cmd", &["arg1", "arg2"]);
+        let s: String = result
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        assert_eq!(s, "cmd arg1 arg2");
+    }
+
+    #[test]
+    fn quote_spaces() {
+        let result = quote_args("my program", &["hello world", "simple"]);
+        let s: String = result
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        assert_eq!(s, r#""my program" "hello world" simple"#);
+    }
+
+    #[test]
+    fn quote_embedded_quotes() {
+        let result = quote_args("cmd", &[r#"say "hello""#]);
+        let s: String = result
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        assert_eq!(s, r#"cmd "say \"hello\"""#);
+    }
+
+    #[test]
+    fn quote_backslash_before_quote() {
+        let result = quote_args("cmd", &[r#"path\"#]);
+        let s: String = result
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        // No spaces/quotes in arg, so no quoting needed
+        assert_eq!(s, r"cmd path\");
+    }
+
+    #[test]
+    fn quote_backslash_before_quote_with_space() {
+        let result = quote_args("cmd", &[r#"c:\my dir\"#]);
+        let s: String = result
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        // Trailing backslash before closing quote must be doubled
+        assert_eq!(s, r#"cmd "c:\my dir\\""#);
+    }
+
+    #[test]
+    fn quote_empty_arg() {
+        let result = quote_args("cmd", &[""]);
+        let s: String = result
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        assert_eq!(s, r#"cmd """#);
+    }
+
+    #[test]
+    fn quote_windows_path_with_spaces() {
+        let result = quote_args("cmd", &[r"C:\Program Files\app"]);
+        let s: String = result
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        assert_eq!(s, r#"cmd "C:\Program Files\app""#);
+    }
+
+    #[test]
+    fn quote_null_terminated() {
+        let result = quote_args("cmd", &[]);
+        assert_eq!(*result.last().unwrap(), 0u16);
+    }
+
+    #[test]
+    fn env_block_sorted() {
+        let vars = vec![
+            ("ZEBRA".into(), "1".into()),
+            ("ALPHA".into(), "2".into()),
+            ("middle".into(), "3".into()),
+        ];
+        let block = encode_env_block(&vars);
+        let decoded: String = block
+            .iter()
+            .map(|&c| if c == 0 { '\n' } else { c as u8 as char })
+            .collect();
+        assert!(decoded.starts_with("ALPHA=2\n"));
+        assert!(decoded.contains("middle=3\n"));
+        assert!(decoded.contains("ZEBRA=1\n"));
+        assert!(decoded.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn env_block_case_insensitive_sort() {
+        let vars = vec![
+            ("path".into(), "1".into()),
+            ("PATH".into(), "2".into()),
+            ("Path".into(), "3".into()),
+        ];
+        let block = encode_env_block(&vars);
+        // All three have same uppercase key, so original order preserved
+        // (sort_by is stable)
+        let decoded: String = block
+            .iter()
+            .map(|&c| if c == 0 { '\n' } else { c as u8 as char })
+            .collect();
+        assert!(decoded.starts_with("path=1\n"));
+    }
+
+    #[test]
+    fn env_block_double_null_terminated() {
+        let vars = vec![("A".into(), "1".into())];
+        let block = encode_env_block(&vars);
+        let len = block.len();
+        assert_eq!(block[len - 1], 0);
+        assert_eq!(block[len - 2], 0);
+    }
+
+    #[test]
+    fn env_block_empty() {
+        let block = encode_env_block(&[]);
+        assert_eq!(block, vec![0u16]);
+    }
+}
