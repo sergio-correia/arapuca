@@ -7,8 +7,6 @@
 //!
 //! Current limitations (documented as known gaps):
 //! - No desktop/window station isolation
-//! - No filesystem isolation (requires AppContainer)
-//! - No network isolation (requires AppContainer)
 //! - No file size limits (no Windows per-process equivalent)
 
 #[cfg(not(target_pointer_width = "64"))]
@@ -27,9 +25,10 @@ use windows_sys::Win32::Security::Authorization::{
     SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SetTokenInformation, TOKEN_ACCESS_MASK,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL,
-    TOKEN_QUERY, TokenIntegrityLevel,
+    CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE, SECURITY_CAPABILITIES,
+    SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel,
+    WinCapabilityInternetClientSid,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -59,6 +58,7 @@ use crate::{Config, Error, process::Process};
 const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000D;
 const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
 const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY: usize = 0x0002_0007;
+const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = 0x0002_0009;
 
 // QWORD 1 of PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY.
 // ACG (1 << 36, prohibit dynamic code) is deliberately omitted: it
@@ -90,10 +90,11 @@ impl Sandbox for Windows {
         crate::sanitize_task_id(&cfg.task_id)?;
 
         let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;
-
-        let job_handle = create_job_object(&cfg.profile).inspect_err(|_| {
+        let cleanup_tmp = |_: &Error| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
-        })?;
+        };
+
+        let job_handle = create_job_object(&cfg.profile).inspect_err(cleanup_tmp)?;
 
         let env_vars = build_env(cfg, &tmp_dir);
         let env_block = encode_env_block(&env_vars);
@@ -106,37 +107,147 @@ impl Sandbox for Windows {
                 .collect()
         });
 
-        // Duplicate parent's stdio handles as inheritable copies for the
-        // child. Only these handles appear in HANDLE_LIST — all other
-        // handles in the parent are NOT inherited.
-        let stdio_handles = duplicate_stdio().inspect_err(|_| {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-        })?;
+        let stdio_handles = duplicate_stdio().inspect_err(cleanup_tmp)?;
+        let mut handle_list: Vec<HANDLE> = stdio_handles
+            .iter()
+            .map(|h| h.as_raw_handle() as HANDLE)
+            .collect();
+        let inherit_handles = if handle_list.is_empty() { 0 } else { TRUE };
 
-        let mut handle_list = Vec::new();
-        for h in &stdio_handles {
-            handle_list.push(h.as_raw_handle() as HANDLE);
+        let use_appcontainer =
+            !cfg.profile.read_paths.is_empty() || !cfg.profile.write_paths.is_empty();
+
+        // ── AppContainer path: filesystem + network isolation ──
+        let mut container_name_owned: Option<String> = None;
+        let mut saved_dacls: Vec<SavedDacl> = Vec::new();
+        let mut app_container_sid: Option<AppContainerSid> = None;
+        let mut net_sid_buf = vec![0u8; 68]; // MAX_SID_SIZE
+        let mut capabilities: Vec<SID_AND_ATTRIBUTES> = Vec::new();
+        let mut sec_caps: SECURITY_CAPABILITIES = unsafe { std::mem::zeroed() };
+
+        if use_appcontainer {
+            let name = container_name(&cfg.task_id);
+            let ac_sid = create_app_container(&name).inspect_err(cleanup_tmp)?;
+
+            // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+            const READ_EXEC: u32 = 0x120089 | 0x1200A0;
+            // FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE
+            const READ_WRITE_EXEC: u32 = 0x120089 | 0x120116 | 0x1200A0 | 0x10000;
+
+            // Closure to rollback DACLs + delete container on error.
+            let rollback = |dacls: &[SavedDacl], cname: &str| {
+                for sd in dacls {
+                    if let Err(e) = restore_dacl(sd) {
+                        log::warn!("rollback DACL restore: {e}");
+                    }
+                }
+                let _ = delete_app_container(cname);
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+            };
+
+            // Grant read access to read_paths.
+            for path in &cfg.profile.read_paths {
+                match save_dacl(path) {
+                    Ok(sd) => {
+                        if let Err(e) = grant_path_access(path, ac_sid.sid, READ_EXEC, true) {
+                            rollback(&saved_dacls, &name);
+                            return Err(e);
+                        }
+                        saved_dacls.push(sd);
+                    }
+                    Err(e) => {
+                        rollback(&saved_dacls, &name);
+                        return Err(e);
+                    }
+                }
+            }
+
+            // Grant write access to write_paths + tmp_dir.
+            let write_with_tmp: Vec<PathBuf> = cfg
+                .profile
+                .write_paths
+                .iter()
+                .cloned()
+                .chain(std::iter::once(tmp_dir.clone()))
+                .collect();
+
+            for path in &write_with_tmp {
+                match save_dacl(path) {
+                    Ok(sd) => {
+                        if let Err(e) = grant_path_access(path, ac_sid.sid, READ_WRITE_EXEC, true) {
+                            rollback(&saved_dacls, &name);
+                            return Err(e);
+                        }
+                        saved_dacls.push(sd);
+                    }
+                    Err(e) => {
+                        rollback(&saved_dacls, &name);
+                        return Err(e);
+                    }
+                }
+            }
+
+            // Network capability: grant internetClient unless isolated.
+            if !cfg.profile.use_netns {
+                let mut sid_size: u32 = net_sid_buf.len() as u32;
+                // SAFETY: net_sid_buf is large enough for any SID.
+                let ret = unsafe {
+                    CreateWellKnownSid(
+                        WinCapabilityInternetClientSid,
+                        std::ptr::null_mut(),
+                        net_sid_buf.as_mut_ptr().cast(),
+                        &mut sid_size,
+                    )
+                };
+                if ret != 0 {
+                    capabilities.push(SID_AND_ATTRIBUTES {
+                        Sid: net_sid_buf.as_mut_ptr().cast(),
+                        Attributes: 0x4, // SE_GROUP_ENABLED
+                    });
+                } else {
+                    log::warn!(
+                        "CreateWellKnownSid(internetClient) failed, child will have no network"
+                    );
+                }
+            }
+
+            sec_caps.AppContainerSid = ac_sid.sid;
+            if !capabilities.is_empty() {
+                sec_caps.Capabilities = capabilities.as_mut_ptr();
+                sec_caps.CapabilityCount = capabilities.len() as u32;
+            }
+
+            container_name_owned = Some(name);
+            app_container_sid = Some(ac_sid);
         }
 
+        // ── Build attribute list ──
+        let attr_count = if use_appcontainer { 4 } else { 3 };
         let job_raw = job_handle.as_raw_handle() as HANDLE;
         let mut policy = [MITIGATION_POLICY, 0u64];
-        let mut attr_list = AttributeList::new(3).inspect_err(|_| {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-        })?;
-        attr_list.add_job_list(&job_raw).inspect_err(|_| {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-        })?;
+
+        // After DACLs are granted, error cleanup must also restore
+        // them and delete the AppContainer profile.
+        let cleanup_full = |_: &Error| {
+            rollback_appcontainer(&saved_dacls, &container_name_owned, &tmp_dir);
+        };
+
+        let mut attr_list = AttributeList::new(attr_count).inspect_err(cleanup_full)?;
+        attr_list.add_job_list(&job_raw).inspect_err(cleanup_full)?;
         attr_list
             .add_handle_list(&mut handle_list)
-            .inspect_err(|_| {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-            })?;
+            .inspect_err(cleanup_full)?;
         attr_list
             .add_mitigation_policy(&mut policy)
-            .inspect_err(|_| {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-            })?;
+            .inspect_err(cleanup_full)?;
 
+        if use_appcontainer {
+            attr_list
+                .add_security_capabilities(&mut sec_caps)
+                .inspect_err(cleanup_full)?;
+        }
+
+        // ── Build STARTUPINFOEXW ──
         let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         if handle_list.len() >= 3 {
@@ -147,104 +258,106 @@ impl Sandbox for Windows {
         }
         si.lpAttributeList = attr_list.as_ptr();
 
-        let inherit_handles = if handle_list.is_empty() { 0 } else { TRUE };
-
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-        // Create restricted token before spawning the process.
-        let restricted_token = create_restricted_token().inspect_err(|_| {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-        })?;
-
-        // Resolve NtSetInformationProcess before creating the child to
-        // avoid leaving a suspended zombie if resolution fails.
-        let nt_set_info = resolve_nt_set_information_process().inspect_err(|_| {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-        })?;
-
-        // SAFETY: All pointers are valid. cmdline is a mutable
-        // null-terminated UTF-16 buffer. env_block is a valid
-        // double-null-terminated UTF-16 environment block.
-        // bInheritHandles is TRUE only when HANDLE_LIST is populated,
-        // restricting inheritance to explicit stdio handles. When no
-        // handles exist (detached/service), FALSE prevents leaking all
-        // inheritable handles to the child.
-        // CREATE_SUSPENDED: process is created suspended so we can swap
-        // the token before it runs any code.
-        let ret = unsafe {
-            CreateProcessW(
-                std::ptr::null(),
-                cmdline.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                inherit_handles,
-                CREATE_NO_WINDOW
-                    | CREATE_SUSPENDED
-                    | EXTENDED_STARTUPINFO_PRESENT
-                    | CREATE_UNICODE_ENVIRONMENT,
-                env_block.as_ptr().cast(),
-                work_dir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
-                &raw mut si.StartupInfo,
-                &mut pi,
-            )
-        };
-
-        drop(attr_list);
-
-        if ret == 0 {
-            let err = std::io::Error::last_os_error();
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(Error::Process(format!("CreateProcessW: {err}")));
-        }
-
-        // Apply restricted token to the suspended process.
-        if let Err(e) =
-            apply_restricted_token(nt_set_info, pi.hProcess, pi.hThread, &restricted_token)
-        {
-            // Fail-closed: kill the suspended child.
-            unsafe {
-                TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+        if use_appcontainer {
+            // AppContainer path: SECURITY_CAPABILITIES creates the lowbox
+            // token at spawn. No CREATE_SUSPENDED or token swap — swapping
+            // the token would destroy AppContainer isolation. Privilege
+            // stripping is not applied; AppContainer's deny-by-default
+            // access model renders most privileges inert.
+            let ret = unsafe {
+                CreateProcessW(
+                    std::ptr::null(),
+                    cmdline.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    inherit_handles,
+                    CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                    env_block.as_ptr().cast(),
+                    work_dir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                    &raw mut si.StartupInfo,
+                    &mut pi,
+                )
+            };
+            drop(attr_list);
+            if ret == 0 {
+                let err = std::io::Error::last_os_error();
+                rollback_appcontainer(&saved_dacls, &container_name_owned, &tmp_dir);
+                return Err(Error::Process(format!("CreateProcessW: {err}")));
             }
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(e);
-        }
+        } else {
+            // Fallback path: CREATE_SUSPENDED + restricted token swap.
+            let restricted_token = create_restricted_token().inspect_err(cleanup_tmp)?;
+            let nt_set_info = resolve_nt_set_information_process().inspect_err(cleanup_tmp)?;
 
-        // Resume the thread now that the token is applied.
-        let resume_ret = unsafe { ResumeThread(pi.hThread) };
-        if resume_ret == u32::MAX {
-            let err = std::io::Error::last_os_error();
-            unsafe {
-                TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+            let ret = unsafe {
+                CreateProcessW(
+                    std::ptr::null(),
+                    cmdline.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    inherit_handles,
+                    CREATE_NO_WINDOW
+                        | CREATE_SUSPENDED
+                        | EXTENDED_STARTUPINFO_PRESENT
+                        | CREATE_UNICODE_ENVIRONMENT,
+                    env_block.as_ptr().cast(),
+                    work_dir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                    &raw mut si.StartupInfo,
+                    &mut pi,
+                )
+            };
+            drop(attr_list);
+            if ret == 0 {
+                let err = std::io::Error::last_os_error();
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(Error::Process(format!("CreateProcessW: {err}")));
             }
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(Error::Process(format!("ResumeThread: {err}")));
+
+            if let Err(e) =
+                apply_restricted_token(nt_set_info, pi.hProcess, pi.hThread, &restricted_token)
+            {
+                unsafe {
+                    TerminateProcess(pi.hProcess, 1);
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                }
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(e);
+            }
+
+            let resume_ret = unsafe { ResumeThread(pi.hThread) };
+            if resume_ret == u32::MAX {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    TerminateProcess(pi.hProcess, 1);
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                }
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(Error::Process(format!("ResumeThread: {err}")));
+            }
         }
 
-        // SAFETY: hThread is valid from successful CreateProcessW.
         unsafe { CloseHandle(pi.hThread) };
-
-        // SAFETY: hProcess is valid from successful CreateProcessW.
         let process_handle = unsafe { OwnedHandle::from_raw_handle(pi.hProcess) };
+
+        // The kernel copied the SID during CreateProcessW, so the
+        // AppContainerSid can be freed now.
+        drop(app_container_sid);
 
         Ok(Process {
             process_handle,
             process_id: pi.dwProcessId,
             tmp_dir,
             job_handle: Some(job_handle),
-            container_name: None,
-            saved_dacls: Vec::new(),
+            container_name: container_name_owned,
+            saved_dacls,
         })
     }
 
     fn available(&self) -> crate::Result<()> {
-        log::warn!(
-            "Windows sandbox: no filesystem/network isolation without \
-             AppContainer. See platform/windows.rs module docs for gaps."
-        );
         Ok(())
     }
 
@@ -567,6 +680,29 @@ impl AttributeList {
         }
         Ok(())
     }
+
+    fn add_security_capabilities(&mut self, caps: &mut SECURITY_CAPABILITIES) -> crate::Result<()> {
+        // SAFETY: caps is a valid SECURITY_CAPABILITIES that outlives
+        // the attribute list.
+        let ret = unsafe {
+            UpdateProcThreadAttribute(
+                self.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                (caps as *mut SECURITY_CAPABILITIES).cast(),
+                std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ret == 0 {
+            return Err(Error::Process(format!(
+                "UpdateProcThreadAttribute(SECURITY_CAPABILITIES): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for AttributeList {
@@ -712,6 +848,22 @@ fn set_job_ui_restrictions(handle: &OwnedHandle) -> crate::Result<()> {
 }
 
 // ─── Environment ───────────────────────────────────────────────────
+
+fn rollback_appcontainer(
+    saved_dacls: &[SavedDacl],
+    container_name: &Option<String>,
+    tmp_dir: &Path,
+) {
+    for sd in saved_dacls {
+        if let Err(e) = restore_dacl(sd) {
+            log::warn!("rollback DACL restore: {e}");
+        }
+    }
+    if let Some(name) = container_name {
+        let _ = delete_app_container(name);
+    }
+    let _ = std::fs::remove_dir_all(tmp_dir);
+}
 
 fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = crate::env::filter_caller_env(&cfg.env);
