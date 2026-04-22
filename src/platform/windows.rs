@@ -1074,6 +1074,103 @@ pub fn delete_app_container(name: &str) -> crate::Result<()> {
     Ok(())
 }
 
+/// Generate a unique AppContainer profile name from task_id and pid.
+///
+/// AppContainer names are limited to 64 characters. We use a hash
+/// to keep within the limit while avoiding collisions.
+#[allow(dead_code)]
+pub fn container_name(task_id: &str) -> String {
+    let pid = std::process::id();
+    let hash = fnv1a_64(format!("{task_id}-{pid}").as_bytes());
+    format!("arapuca-{hash:016x}")
+}
+
+/// Create an AppContainer profile and return its SID.
+///
+/// The SID must be freed with `FreeSid` when no longer needed.
+/// The profile persists in the registry until `delete_app_container`.
+#[allow(dead_code)]
+pub fn create_app_container(name: &str) -> crate::Result<AppContainerSid> {
+    let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_desc: Vec<u16> = "arapuca sandbox"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut sid: windows_sys::Win32::Security::PSID = std::ptr::null_mut();
+
+    // SAFETY: All strings are valid null-terminated UTF-16.
+    let hr = unsafe {
+        windows_sys::Win32::Security::Isolation::CreateAppContainerProfile(
+            wide_name.as_ptr(),
+            wide_name.as_ptr(),
+            wide_desc.as_ptr(),
+            std::ptr::null(),
+            0,
+            &mut sid,
+        )
+    };
+
+    if hr != 0 {
+        // HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) = 0x800700B7
+        if hr == 0x800700B7u32 as i32 {
+            delete_app_container(name)
+                .map_err(|e| Error::Process(format!("stale AppContainer profile: {e}")))?;
+            // Single retry after deleting the stale profile.
+            let mut sid2: windows_sys::Win32::Security::PSID = std::ptr::null_mut();
+            let hr2 = unsafe {
+                windows_sys::Win32::Security::Isolation::CreateAppContainerProfile(
+                    wide_name.as_ptr(),
+                    wide_name.as_ptr(),
+                    wide_desc.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    &mut sid2,
+                )
+            };
+            if hr2 != 0 {
+                return Err(Error::Process(format!(
+                    "CreateAppContainerProfile({name}) retry: HRESULT 0x{hr2:08X}"
+                )));
+            }
+            return Ok(AppContainerSid { sid: sid2 });
+        }
+        return Err(Error::Process(format!(
+            "CreateAppContainerProfile({name}): HRESULT 0x{hr:08X}"
+        )));
+    }
+
+    Ok(AppContainerSid { sid })
+}
+
+/// RAII wrapper for an AppContainer SID allocated by the system.
+pub struct AppContainerSid {
+    pub sid: windows_sys::Win32::Security::PSID,
+}
+
+impl Drop for AppContainerSid {
+    fn drop(&mut self) {
+        if !self.sid.is_null() {
+            // SAFETY: sid was allocated by CreateAppContainerProfile.
+            unsafe { windows_sys::Win32::Security::FreeSid(self.sid) };
+        }
+    }
+}
+
+// SAFETY: AppContainerSid holds a system-allocated SID pointer
+// accessed only during process creation. Not Sync because concurrent
+// reads of the raw pointer would be unsafe.
+unsafe impl Send for AppContainerSid {}
+
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
