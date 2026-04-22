@@ -1,39 +1,37 @@
 //! Windows sandbox implementation.
 //!
 //! Provides process isolation via Job Objects (resource limits, UI
-//! restrictions, kill-on-close) with environment hardening.
+//! restrictions, kill-on-close), process creation via `CreateProcessW`
+//! with `PROC_THREAD_ATTRIBUTE_JOB_LIST` for atomic Job assignment,
+//! and environment hardening.
 //!
 //! Current limitations (documented as known gaps):
-//! - Spawn-to-assign race: child runs briefly without Job Object
-//!   limits between spawn() and AssignProcessToJobObject(). Phase 2
-//!   will use CREATE_SUSPENDED + ResumeThread or
-//!   PROC_THREAD_ATTRIBUTE_JOB_LIST for atomic assignment.
 //! - No restricted token (child inherits parent's token)
 //! - No integrity level reduction
-//! - No process mitigation policies (requires STARTUPINFOEXW)
-//! - No handle inheritance control (no PROC_THREAD_ATTRIBUTE_HANDLE_LIST)
+//! - No process mitigation policies
+//! - No explicit handle inheritance control
 //! - No desktop/window station isolation
 //! - No filesystem isolation (requires AppContainer)
 //! - No network isolation (requires AppContainer)
 //! - No file size limits (no Windows per-process equivalent)
-//!
-//! These will be addressed in follow-up commits. Even without them,
-//! the Job Object provides hard resource limits, UI restrictions to
-//! prevent shatter attacks, and kill-on-close for parent-death cleanup.
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("arapuca requires 64-bit Windows");
 
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
 
-use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, TRUE,
+};
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
-    JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
+    CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
     JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
     JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
     JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
@@ -41,10 +39,16 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
     JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
-use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows_sys::Win32::System::Threading::{
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+};
 
 use crate::platform::Sandbox;
 use crate::{Config, Error, process::Process};
+
+const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000D;
 
 /// Windows sandbox implementation.
 pub struct Windows;
@@ -65,56 +69,81 @@ impl Sandbox for Windows {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         })?;
 
-        let mut command = Command::new(cmd);
-        command.args(args);
-        command.creation_flags(CREATE_NO_WINDOW);
-
-        if let Some(ref work_dir) = cfg.work_dir {
-            command.current_dir(work_dir);
-        }
-
         let env_vars = build_env(cfg, &tmp_dir);
-        command.env_clear();
-        for (k, v) in &env_vars {
-            command.env(k, v);
-        }
+        let env_block = encode_env_block(&env_vars);
+        let mut cmdline = quote_args(cmd, args);
 
-        // KNOWN GAP: the child starts running immediately. There is a
-        // brief race window before AssignProcessToJobObject where the
-        // child runs without resource limits. std::process::Command
-        // does not expose the thread handle needed for CREATE_SUSPENDED
-        // + ResumeThread. Phase 2 will switch to raw CreateProcessW.
-        let child = command.spawn().map_err(|e| {
+        let work_dir: Option<Vec<u16>> = cfg.work_dir.as_ref().map(|p| {
+            p.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        });
+
+        // SAFETY: GetStdHandle returns the current process's stdio handles.
+        // Returns INVALID_HANDLE_VALUE on error or NULL if no console.
+        // Both are safe to pass to STARTUPINFO — the child simply gets
+        // no stdio.
+        let stdin_h = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let stdout_h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        let stderr_h = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+
+        let job_raw = job_handle.as_raw_handle() as HANDLE;
+        let mut attr_list = AttributeList::new(1).inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
-            Error::Process(format!("start process: {e}"))
+        })?;
+        attr_list.add_job_list(&job_raw).inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
         })?;
 
-        // SAFETY: Child's raw handle is a valid process HANDLE from
-        // CreateProcessW. AssignProcessToJobObject requires
-        // PROCESS_SET_QUOTA | PROCESS_TERMINATE access, which the
-        // creator process has by default.
+        let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = stdin_h as HANDLE;
+        si.StartupInfo.hStdOutput = stdout_h as HANDLE;
+        si.StartupInfo.hStdError = stderr_h as HANDLE;
+        si.lpAttributeList = attr_list.as_ptr();
+
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+        // SAFETY: All pointers are valid. cmdline is a mutable
+        // null-terminated UTF-16 buffer. env_block is a valid
+        // double-null-terminated UTF-16 environment block.
+        // KNOWN GAP: bInheritHandles=TRUE without HANDLE_LIST inherits
+        // all inheritable handles in the parent process.
         let ret = unsafe {
-            AssignProcessToJobObject(
-                job_handle.as_raw_handle() as HANDLE,
-                child.as_raw_handle() as HANDLE,
+            CreateProcessW(
+                std::ptr::null(),
+                cmdline.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                TRUE,
+                CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                env_block.as_ptr().cast(),
+                work_dir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                &raw mut si.StartupInfo,
+                &mut pi,
             )
         };
+
+        drop(attr_list);
+
         if ret == 0 {
             let err = std::io::Error::last_os_error();
-            // Fail-closed: kill the child — it must not run without
-            // resource limits. On Windows, Child::drop only closes the
-            // handle; it does not terminate the process.
-            let mut child = child;
-            let _ = child.kill();
-            let _ = child.wait();
             let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(Error::Process(format!(
-                "assign process to job object: {err}"
-            )));
+            return Err(Error::Process(format!("CreateProcessW: {err}")));
         }
 
+        // SAFETY: hThread is valid from successful CreateProcessW.
+        unsafe { CloseHandle(pi.hThread) };
+
+        // SAFETY: hProcess is valid from successful CreateProcessW.
+        let process_handle =
+            unsafe { OwnedHandle::from_raw_handle(pi.hProcess as *mut std::ffi::c_void) };
+
         Ok(Process {
-            child,
+            process_handle,
+            process_id: pi.dwProcessId,
             tmp_dir,
             job_handle: Some(job_handle),
         })
@@ -123,7 +152,7 @@ impl Sandbox for Windows {
     fn available(&self) -> crate::Result<()> {
         log::warn!(
             "Windows sandbox has degraded security: no restricted token, \
-             no filesystem/network isolation, spawn-to-assign race window. \
+             no filesystem/network isolation, no mitigation policies. \
              See platform/windows.rs module docs for full gap list."
         );
         Ok(())
@@ -138,6 +167,75 @@ impl Sandbox for Windows {
     }
 }
 
+// ─── Attribute list RAII wrapper ───────────────────────────────────
+
+struct AttributeList {
+    buffer: Vec<u8>,
+}
+
+impl AttributeList {
+    fn new(count: u32) -> crate::Result<Self> {
+        let mut size: usize = 0;
+        // SAFETY: First call with null determines required buffer size.
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size);
+        }
+        if size == 0 {
+            return Err(Error::Process(
+                "InitializeProcThreadAttributeList: size is 0".into(),
+            ));
+        }
+        let mut buffer = vec![0u8; size];
+        // SAFETY: buffer is large enough (size returned by first call).
+        let ret = unsafe {
+            InitializeProcThreadAttributeList(buffer.as_mut_ptr().cast(), count, 0, &mut size)
+        };
+        if ret == 0 {
+            return Err(Error::Process(format!(
+                "InitializeProcThreadAttributeList: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(Self { buffer })
+    }
+
+    fn as_ptr(&mut self) -> *mut std::ffi::c_void {
+        self.buffer.as_mut_ptr().cast()
+    }
+
+    fn add_job_list(&mut self, job: &HANDLE) -> crate::Result<()> {
+        // SAFETY: self.buffer is a valid initialized attribute list.
+        // job points to a valid HANDLE that outlives the attribute list.
+        let ret = unsafe {
+            UpdateProcThreadAttribute(
+                self.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                (job as *const HANDLE).cast(),
+                std::mem::size_of::<HANDLE>(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ret == 0 {
+            return Err(Error::Process(format!(
+                "UpdateProcThreadAttribute(JOB_LIST): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AttributeList {
+    fn drop(&mut self) {
+        // SAFETY: buffer was successfully initialized.
+        unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
+    }
+}
+
+// ─── Job Object ────────────────────────────────────────────────────
+
 fn create_job_object(profile: &crate::Profile) -> crate::Result<OwnedHandle> {
     // SAFETY: CreateJobObjectW with NULL security attributes and name
     // creates an anonymous Job Object.
@@ -151,8 +249,6 @@ fn create_job_object(profile: &crate::Profile) -> crate::Result<OwnedHandle> {
     // SAFETY: raw is a valid handle we own (verified above).
     let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
 
-    // Make the handle non-inheritable so the child can't hold it open
-    // (which would defeat kill-on-close). Fail-closed if this fails.
     // SAFETY: handle is a valid Job Object handle.
     let ret = unsafe {
         windows_sys::Win32::Foundation::SetHandleInformation(
@@ -273,10 +369,9 @@ fn set_job_ui_restrictions(handle: &OwnedHandle) -> crate::Result<()> {
     Ok(())
 }
 
+// ─── Environment ───────────────────────────────────────────────────
+
 fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
-    // Start with filtered caller vars, then override with safe defaults.
-    // Command::env uses last-write-wins, so safe defaults must come last
-    // to prevent caller-supplied PATH/SystemRoot/etc. from taking effect.
     let mut env: Vec<(String, String)> = crate::env::filter_caller_env(&cfg.env);
 
     if let Some(ref proxy) = cfg.network_proxy_socket {
@@ -301,6 +396,8 @@ fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
     env
 }
 
+// ─── Utilities ─────────────────────────────────────────────────────
+
 /// Build a Windows command line from a command and arguments.
 ///
 /// Implements `CommandLineToArgvW`-compatible quoting (MSVC C runtime
@@ -309,10 +406,8 @@ fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
 ///
 /// Returns a null-terminated mutable UTF-16 buffer — `CreateProcessW`
 /// may modify `lpCommandLine` in-place.
-#[allow(dead_code)]
 pub(crate) fn quote_args(cmd: &str, args: &[&str]) -> Vec<u16> {
     use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
 
     let mut cmdline = String::new();
     quote_arg(cmd, &mut cmdline);
@@ -369,10 +464,8 @@ fn quote_arg(arg: &str, out: &mut String) {
 /// The block is UTF-16 encoded, sorted by key (case-insensitive),
 /// with each entry as `KEY=VALUE\0` and terminated by an extra `\0`.
 /// Required for `CreateProcessW` with `CREATE_UNICODE_ENVIRONMENT`.
-#[allow(dead_code)]
 pub(crate) fn encode_env_block(vars: &[(String, String)]) -> Vec<u16> {
     use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
 
     let mut sorted: Vec<&(String, String)> = vars.iter().collect();
     sorted.sort_by(|a, b| a.0.to_ascii_uppercase().cmp(&b.0.to_ascii_uppercase()));
@@ -432,7 +525,6 @@ mod tests {
             .take_while(|&&c| c != 0)
             .map(|&c| c as u8 as char)
             .collect();
-        // No spaces/quotes in arg, so no quoting needed
         assert_eq!(s, r"cmd path\");
     }
 
@@ -444,19 +536,7 @@ mod tests {
             .take_while(|&&c| c != 0)
             .map(|&c| c as u8 as char)
             .collect();
-        // Trailing backslash before closing quote must be doubled
         assert_eq!(s, r#"cmd "c:\my dir\\""#);
-    }
-
-    #[test]
-    fn quote_empty_arg() {
-        let result = quote_args("cmd", &[""]);
-        let s: String = result
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8 as char)
-            .collect();
-        assert_eq!(s, r#"cmd """#);
     }
 
     #[test]
@@ -468,6 +548,17 @@ mod tests {
             .map(|&c| c as u8 as char)
             .collect();
         assert_eq!(s, r#"cmd "C:\Program Files\app""#);
+    }
+
+    #[test]
+    fn quote_empty_arg() {
+        let result = quote_args("cmd", &[""]);
+        let s: String = result
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        assert_eq!(s, r#"cmd """#);
     }
 
     #[test]
@@ -502,8 +593,6 @@ mod tests {
             ("Path".into(), "3".into()),
         ];
         let block = encode_env_block(&vars);
-        // All three have same uppercase key, so original order preserved
-        // (sort_by is stable)
         let decoded: String = block
             .iter()
             .map(|&c| if c == 0 { '\n' } else { c as u8 as char })
