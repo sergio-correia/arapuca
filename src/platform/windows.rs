@@ -9,7 +9,6 @@
 //! - No restricted token (child inherits parent's token)
 //! - No integrity level reduction
 //! - No process mitigation policies
-//! - No explicit handle inheritance control
 //! - No desktop/window station isolation
 //! - No filesystem isolation (requires AppContainer)
 //! - No network isolation (requires AppContainer)
@@ -23,7 +22,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, TRUE,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, TRUE,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -41,14 +41,15 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
 };
 
 use crate::platform::Sandbox;
 use crate::{Config, Error, process::Process};
 
 const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000D;
+const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
 
 /// Windows sandbox implementation.
 pub struct Windows;
@@ -80,44 +81,59 @@ impl Sandbox for Windows {
                 .collect()
         });
 
-        // SAFETY: GetStdHandle returns the current process's stdio handles.
-        // Returns INVALID_HANDLE_VALUE on error or NULL if no console.
-        // Both are safe to pass to STARTUPINFO — the child simply gets
-        // no stdio.
-        let stdin_h = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-        let stdout_h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-        let stderr_h = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        // Duplicate parent's stdio handles as inheritable copies for the
+        // child. Only these handles appear in HANDLE_LIST — all other
+        // handles in the parent are NOT inherited.
+        let stdio_handles = duplicate_stdio().inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        })?;
+
+        let mut handle_list = Vec::new();
+        for h in &stdio_handles {
+            handle_list.push(h.as_raw_handle() as HANDLE);
+        }
 
         let job_raw = job_handle.as_raw_handle() as HANDLE;
-        let mut attr_list = AttributeList::new(1).inspect_err(|_| {
+        let mut attr_list = AttributeList::new(2).inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         })?;
         attr_list.add_job_list(&job_raw).inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         })?;
+        attr_list
+            .add_handle_list(&mut handle_list)
+            .inspect_err(|_| {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+            })?;
 
         let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        si.StartupInfo.hStdInput = stdin_h as HANDLE;
-        si.StartupInfo.hStdOutput = stdout_h as HANDLE;
-        si.StartupInfo.hStdError = stderr_h as HANDLE;
+        if handle_list.len() >= 3 {
+            si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            si.StartupInfo.hStdInput = handle_list[0];
+            si.StartupInfo.hStdOutput = handle_list[1];
+            si.StartupInfo.hStdError = handle_list[2];
+        }
         si.lpAttributeList = attr_list.as_ptr();
+
+        let inherit_handles = if handle_list.is_empty() { 0 } else { TRUE };
 
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
         // SAFETY: All pointers are valid. cmdline is a mutable
         // null-terminated UTF-16 buffer. env_block is a valid
         // double-null-terminated UTF-16 environment block.
-        // KNOWN GAP: bInheritHandles=TRUE without HANDLE_LIST inherits
-        // all inheritable handles in the parent process.
+        // bInheritHandles is TRUE only when HANDLE_LIST is populated,
+        // restricting inheritance to explicit stdio handles. When no
+        // handles exist (detached/service), FALSE prevents leaking all
+        // inheritable handles to the child.
         let ret = unsafe {
             CreateProcessW(
                 std::ptr::null(),
                 cmdline.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
-                TRUE,
+                inherit_handles,
                 CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                 env_block.as_ptr().cast(),
                 work_dir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
@@ -165,6 +181,49 @@ impl Sandbox for Windows {
     fn cgroups_available(&self) -> bool {
         false
     }
+}
+
+// ─── Stdio handle duplication ──────────────────────────────────────
+
+fn duplicate_stdio() -> crate::Result<Vec<OwnedHandle>> {
+    let std_handles = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+    let mut result = Vec::with_capacity(3);
+
+    for &id in &std_handles {
+        let h = unsafe { GetStdHandle(id) };
+        if h == INVALID_HANDLE_VALUE || h == 0 as HANDLE {
+            continue;
+        }
+        let dup = duplicate_as_inheritable(h)?;
+        result.push(dup);
+    }
+    Ok(result)
+}
+
+fn duplicate_as_inheritable(handle: HANDLE) -> crate::Result<OwnedHandle> {
+    let current = unsafe { GetCurrentProcess() };
+    let mut dup: HANDLE = std::ptr::null_mut();
+    // SAFETY: current process and handle are valid. The duplicated
+    // handle is inheritable (bInheritHandle=TRUE) with same access.
+    let ret = unsafe {
+        DuplicateHandle(
+            current,
+            handle,
+            current,
+            &mut dup,
+            0,
+            TRUE,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ret == 0 {
+        return Err(Error::Process(format!(
+            "DuplicateHandle: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: dup is a valid handle from successful DuplicateHandle.
+    Ok(unsafe { OwnedHandle::from_raw_handle(dup as *mut std::ffi::c_void) })
 }
 
 // ─── Attribute list RAII wrapper ───────────────────────────────────
@@ -220,6 +279,31 @@ impl AttributeList {
         if ret == 0 {
             return Err(Error::Process(format!(
                 "UpdateProcThreadAttribute(JOB_LIST): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    fn add_handle_list(&mut self, handles: &mut [HANDLE]) -> crate::Result<()> {
+        if handles.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: handles is a valid array that outlives the attribute list.
+        let ret = unsafe {
+            UpdateProcThreadAttribute(
+                self.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                handles.as_mut_ptr().cast(),
+                handles.len() * std::mem::size_of::<HANDLE>(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ret == 0 {
+            return Err(Error::Process(format!(
+                "UpdateProcThreadAttribute(HANDLE_LIST): {}",
                 std::io::Error::last_os_error()
             )));
         }
