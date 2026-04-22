@@ -32,6 +32,12 @@ pub struct Process {
     #[cfg(windows)]
     #[allow(dead_code)]
     pub(crate) job_handle: Option<std::os::windows::io::OwnedHandle>,
+    /// AppContainer profile name for cleanup.
+    #[cfg(windows)]
+    pub(crate) container_name: Option<String>,
+    /// Saved DACLs for restoration during cleanup.
+    #[cfg(windows)]
+    pub(crate) saved_dacls: Vec<crate::platform::windows::SavedDacl>,
 }
 
 impl Process {
@@ -124,6 +130,17 @@ impl Process {
         #[cfg(target_os = "linux")]
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
             let _ = mgr.destroy(path);
+        }
+        #[cfg(windows)]
+        {
+            for saved in &self.saved_dacls {
+                if let Err(e) = crate::platform::windows::restore_dacl(saved) {
+                    log::warn!("failed to restore DACL: {e}");
+                }
+            }
+            if let Some(ref name) = self.container_name {
+                let _ = crate::platform::windows::delete_app_container(name);
+            }
         }
         if self.tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&self.tmp_dir);

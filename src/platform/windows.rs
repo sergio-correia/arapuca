@@ -16,11 +16,15 @@ compile_error!("arapuca requires 64-bit Windows");
 
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, TRUE,
+    INVALID_HANDLE_VALUE, LocalFree, TRUE,
+};
+use windows_sys::Win32::Security::Authorization::{
+    EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
+    SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
     CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SetTokenInformation, TOKEN_ACCESS_MASK,
@@ -232,6 +236,8 @@ impl Sandbox for Windows {
             process_id: pi.dwProcessId,
             tmp_dir,
             job_handle: Some(job_handle),
+            container_name: None,
+            saved_dacls: Vec::new(),
         })
     }
 
@@ -813,6 +819,256 @@ pub(crate) fn encode_env_block(vars: &[(String, String)]) -> Vec<u16> {
     }
     block.push(0);
     block
+}
+
+// ─── DACL save/restore ─────────────────────────────────────────────
+
+const DACL_SECURITY_INFORMATION: u32 = 4;
+const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+
+/// Saved DACL state for a path — used to restore the original
+/// security descriptor after the sandbox exits.
+pub struct SavedDacl {
+    path: PathBuf,
+    sd: *mut std::ffi::c_void,
+}
+
+// SAFETY: SavedDacl holds a system-allocated security descriptor
+// pointer accessed only for restoration (single-threaded). Not Sync
+// because concurrent reads of the raw pointer would be unsafe.
+unsafe impl Send for SavedDacl {}
+
+impl Drop for SavedDacl {
+    fn drop(&mut self) {
+        if !self.sd.is_null() {
+            // SAFETY: sd was allocated by GetNamedSecurityInfoW.
+            unsafe { LocalFree(self.sd) };
+        }
+    }
+}
+
+/// Save the current DACL of a path for later restoration.
+#[allow(dead_code)]
+pub fn save_dacl(path: &Path) -> crate::Result<SavedDacl> {
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+
+    // SAFETY: wide_path is null-terminated. sd is a valid out pointer.
+    // GetNamedSecurityInfoW allocates the security descriptor; caller
+    // must free with LocalFree.
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if err != 0 {
+        return Err(Error::Process(format!(
+            "GetNamedSecurityInfoW({}): error {err}",
+            path.display()
+        )));
+    }
+
+    Ok(SavedDacl {
+        path: path.to_path_buf(),
+        sd,
+    })
+}
+
+/// Restore a previously saved DACL to its path.
+pub fn restore_dacl(saved: &SavedDacl) -> crate::Result<()> {
+    if saved.sd.is_null() {
+        return Ok(());
+    }
+
+    let wide_path: Vec<u16> = saved
+        .path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // Extract the DACL from the saved security descriptor.
+    let mut dacl: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut dacl_present: i32 = 0;
+    let mut dacl_defaulted: i32 = 0;
+
+    // SAFETY: saved.sd is a valid security descriptor from
+    // GetNamedSecurityInfoW.
+    let ret = unsafe {
+        windows_sys::Win32::Security::GetSecurityDescriptorDacl(
+            saved.sd,
+            &mut dacl_present,
+            &mut dacl as *mut *mut _ as *mut *mut _,
+            &mut dacl_defaulted,
+        )
+    };
+    if ret == 0 {
+        return Err(Error::Process(format!(
+            "GetSecurityDescriptorDacl({}): {}",
+            saved.path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let dacl_ptr = if dacl_present != 0 {
+        dacl as *const _
+    } else {
+        std::ptr::null()
+    };
+
+    // SAFETY: wide_path is null-terminated, dacl_ptr is valid or null.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            wide_path.as_ptr() as *mut _,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl_ptr,
+            std::ptr::null(),
+        )
+    };
+    if err != 0 {
+        return Err(Error::Process(format!(
+            "SetNamedSecurityInfoW restore({}): error {err}",
+            saved.path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+/// Grant an AppContainer SID access to a path by adding an ACE.
+///
+/// # Safety requirements on `sid`
+/// - Must be a valid, non-null pointer to a Windows SID structure
+/// - Must remain valid for the duration of this call
+#[allow(dead_code)]
+pub fn grant_path_access(
+    path: &Path,
+    sid: *mut std::ffi::c_void,
+    access_mask: u32,
+    inherit: bool,
+) -> crate::Result<()> {
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let inherit_flags: u32 = if inherit {
+        1 | 2 // CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+    } else {
+        0
+    };
+
+    let mut ea: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
+    ea.grfAccessPermissions = access_mask;
+    ea.grfAccessMode = SET_ACCESS;
+    ea.grfInheritance = inherit_flags;
+    ea.Trustee = unsafe { std::mem::zeroed::<TRUSTEE_W>() };
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = 0; // TRUSTEE_IS_UNKNOWN — AppContainer SIDs are dynamic
+    ea.Trustee.ptstrName = sid as *mut u16;
+
+    // Get existing DACL.
+    let mut existing_dacl: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut existing_dacl as *mut *mut _ as *mut *mut _,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if err != 0 {
+        return Err(Error::Process(format!(
+            "GetNamedSecurityInfoW({}): error {err}",
+            path.display()
+        )));
+    }
+
+    // Merge new ACE with existing DACL.
+    let mut new_dacl: *mut std::ffi::c_void = std::ptr::null_mut();
+    let err = unsafe {
+        SetEntriesInAclW(
+            1,
+            &ea,
+            existing_dacl as *mut _,
+            &mut new_dacl as *mut *mut _ as *mut *mut _,
+        )
+    };
+
+    if !sd.is_null() {
+        unsafe { LocalFree(sd) };
+    }
+
+    if err != 0 {
+        return Err(Error::Process(format!(
+            "SetEntriesInAclW({}): error {err}",
+            path.display()
+        )));
+    }
+
+    // Apply the new DACL.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            wide_path.as_ptr() as *mut _,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl as *const _,
+            std::ptr::null(),
+        )
+    };
+
+    if !new_dacl.is_null() {
+        unsafe { LocalFree(new_dacl) };
+    }
+
+    if err != 0 {
+        return Err(Error::Process(format!(
+            "SetNamedSecurityInfoW grant({}): error {err}",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+/// Delete an AppContainer profile by name.
+pub fn delete_app_container(name: &str) -> crate::Result<()> {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // SAFETY: wide is a valid null-terminated UTF-16 string.
+    let hr = unsafe {
+        windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile(wide.as_ptr())
+    };
+    if hr != 0 {
+        return Err(Error::Process(format!(
+            "DeleteAppContainerProfile({name}): HRESULT 0x{hr:08X}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
