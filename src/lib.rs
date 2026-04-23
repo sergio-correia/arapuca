@@ -10,6 +10,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod audit;
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 pub mod diskquota;

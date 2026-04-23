@@ -78,6 +78,8 @@ dependencies = [
  "log",
  "nix",
  "seccompiler",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "windows-sys",
