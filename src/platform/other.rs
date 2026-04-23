@@ -65,7 +65,12 @@ impl Sandbox for Other {
             Error::Process(format!("start process: {e}"))
         })?;
 
-        Ok(Process { child, tmp_dir })
+        Ok(Process {
+            child,
+            tmp_dir,
+            audit_ctx: None,
+            final_stats: None,
+        })
     }
 
     fn available(&self) -> crate::Result<()> {

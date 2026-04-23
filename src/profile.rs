@@ -1,6 +1,9 @@
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::audit::{AuditSink, AuditVerbosity};
 
 /// Filesystem and resource restrictions for a sandboxed process.
 #[derive(Debug, Clone, Default)]
@@ -24,7 +27,7 @@ pub struct Profile {
 }
 
 /// Full configuration for launching a sandboxed process.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Security restrictions to apply.
     pub profile: Profile,
@@ -57,6 +60,47 @@ pub struct Config {
     /// LD_*, DYLD_*, and other dangerous names are silently dropped.
     /// If the same key is added multiple times, the last value wins.
     pub env: Vec<(String, String)>,
+    /// Optional audit event sink. When None, no events are emitted
+    /// and zero audit overhead is incurred.
+    pub audit_sink: Option<Arc<dyn AuditSink>>,
+    /// Controls how much detail audit events include.
+    pub audit_verbosity: AuditVerbosity,
+    /// Caller-supplied principal identity for audit records.
+    pub audit_principal: Option<String>,
+    /// Caller-supplied correlation ID for distributed tracing.
+    pub audit_correlation_id: Option<String>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("Config");
+        s.field("profile", &self.profile)
+            .field("socket_dir", &self.socket_dir)
+            .field("task_id", &self.task_id)
+            .field("phase", &self.phase)
+            .field("work_dir", &self.work_dir);
+        #[cfg(unix)]
+        {
+            s.field("stdin", &self.stdin)
+                .field("stdout", &self.stdout)
+                .field("stderr", &self.stderr)
+                .field("extra_fds", &self.extra_fds);
+        }
+        s.field("network_proxy_socket", &self.network_proxy_socket)
+            .field("env", &format!("[{} vars]", self.env.len()))
+            .field(
+                "audit_sink",
+                if self.audit_sink.is_some() {
+                    &"Some(<AuditSink>)"
+                } else {
+                    &"None"
+                },
+            )
+            .field("audit_verbosity", &self.audit_verbosity)
+            .field("audit_principal", &self.audit_principal)
+            .field("audit_correlation_id", &self.audit_correlation_id)
+            .finish()
+    }
 }
 
 /// Resource usage statistics from cgroups v2.

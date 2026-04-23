@@ -194,6 +194,8 @@ impl Sandbox for Linux {
             tmp_dir,
             cgroup_path,
             cgroup_mgr: self.cgroup_mgr.clone(),
+            audit_ctx: None,
+            final_stats: None,
         })
     }
 

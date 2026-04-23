@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use crate::ResourceUsage;
+use crate::audit::AuditContext;
 
 /// A running sandboxed subprocess.
 pub struct Process {
@@ -38,6 +39,12 @@ pub struct Process {
     /// Saved DACLs for restoration during cleanup.
     #[cfg(windows)]
     pub(crate) saved_dacls: Vec<crate::platform::windows::SavedDacl>,
+    /// Audit context for emitting lifecycle events.
+    #[allow(dead_code)]
+    pub(crate) audit_ctx: Option<AuditContext>,
+    /// Resource stats captured in wait() while cgroup still exists.
+    #[allow(dead_code)]
+    pub(crate) final_stats: Option<ResourceUsage>,
 }
 
 impl Process {

@@ -314,7 +314,12 @@ impl Sandbox for Darwin {
         // Start parent-PID watchdog (replaces PR_SET_PDEATHSIG).
         Self::start_parent_watchdog(pid);
 
-        Ok(Process { child, tmp_dir })
+        Ok(Process {
+            child,
+            tmp_dir,
+            audit_ctx: None,
+            final_stats: None,
+        })
     }
 
     fn available(&self) -> crate::Result<()> {

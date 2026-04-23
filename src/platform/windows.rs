@@ -359,6 +359,8 @@ impl Sandbox for Windows {
             job_handle: Some(job_handle),
             container_name: container_name_owned,
             saved_dacls,
+            audit_ctx: None,
+            final_stats: None,
         })
     }
 

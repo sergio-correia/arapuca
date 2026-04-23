@@ -293,6 +293,10 @@ pub extern "C" fn arapuca_config_new() -> *mut ArapucaConfig {
             extra_fds: Vec::new(),
             network_proxy_socket: None,
             env: Vec::new(),
+            audit_sink: None,
+            audit_verbosity: crate::audit::AuditVerbosity::Standard,
+            audit_principal: None,
+            audit_correlation_id: None,
         }),
     }))
 }
