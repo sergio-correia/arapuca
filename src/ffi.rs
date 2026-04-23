@@ -482,6 +482,94 @@ pub unsafe extern "C" fn arapuca_config_add_env(
     0
 }
 
+/// Callback type for receiving audit events as JSON.
+///
+/// # Safety contract
+///
+/// - `event_json` is valid only for the duration of the callback. The
+///   callback must copy the data if it needs to retain it.
+/// - `user_data` must remain valid until `arapuca_process_cleanup()`
+///   returns. Passing stack or freed heap memory is undefined behavior.
+/// - The callback may be invoked from any thread. The callback and
+///   `user_data` must be safe for concurrent access.
+/// - The callback must return normally. `longjmp`, C++ exceptions, and
+///   Go panics in cgo callbacks are undefined behavior.
+/// - The callback must not call any arapuca function (no reentrancy).
+#[cfg(feature = "serde")]
+pub type ArapucaAuditCallback = unsafe extern "C" fn(
+    event_json: *const c_char,
+    event_json_len: usize,
+    user_data: *mut std::ffi::c_void,
+);
+
+#[cfg(feature = "serde")]
+struct FfiAuditSink {
+    callback: ArapucaAuditCallback,
+    user_data: *mut std::ffi::c_void,
+}
+
+// SAFETY: The FFI contract documented above requires user_data to be
+// thread-safe and to outlive the sandbox lifecycle. Non-local control
+// flow from within the callback is documented as UB.
+#[cfg(feature = "serde")]
+unsafe impl Send for FfiAuditSink {}
+#[cfg(feature = "serde")]
+unsafe impl Sync for FfiAuditSink {}
+
+#[cfg(feature = "serde")]
+impl crate::audit::AuditSink for FfiAuditSink {
+    fn emit(&self, event: crate::audit::AuditEvent) {
+        let json = serde_json::to_string(&event)
+            .unwrap_or_else(|_| r#"{"error":"audit event serialization failed"}"#.into());
+        let cstr = match CString::new(json) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let ptr = cstr.as_ptr();
+        let len = cstr.as_bytes().len();
+        unsafe { (self.callback)(ptr, len, self.user_data) };
+    }
+}
+
+/// Set an audit callback on a config. Requires the `serde` feature.
+///
+/// The callback receives JSON-serialized audit events during the
+/// sandbox lifecycle. See `ArapucaAuditCallback` for the safety
+/// contract.
+///
+/// Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `cfg` must be a valid pointer. `cb` must be a valid function pointer.
+/// `user_data` must remain valid until `arapuca_process_cleanup()`.
+#[cfg(feature = "serde")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_config_set_audit_callback(
+    cfg: *mut ArapucaConfig,
+    cb: Option<ArapucaAuditCallback>,
+    user_data: *mut std::ffi::c_void,
+) -> i32 {
+    clear_error();
+    let Some(cfg) = (unsafe { cfg.as_mut() }) else {
+        set_error("null config pointer");
+        return -1;
+    };
+    let Some(inner) = cfg.inner.as_mut() else {
+        set_error("config already freed");
+        return -1;
+    };
+    let Some(cb) = cb else {
+        set_error("null callback pointer");
+        return -1;
+    };
+    let sink = FfiAuditSink {
+        callback: cb,
+        user_data,
+    };
+    inner.audit_sink = Some(std::sync::Arc::new(sink));
+    0
+}
+
 /// Free a config. Safe to call with NULL.
 ///
 /// # Safety
