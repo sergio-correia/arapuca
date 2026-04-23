@@ -14,8 +14,9 @@ pub struct CloudInitConfig<'a> {
     /// Username to create.
     pub user: &'a str,
     /// Directories to mount via virtio-fs.
-    /// Each entry: (virtiofs tag, mount point).
-    pub virtiofs_mounts: Vec<(&'a str, &'a str)>,
+    /// Each entry: (virtiofs tag, mount point, mount options).
+    /// Use "defaults" for read-write, "ro" for read-only.
+    pub virtiofs_mounts: Vec<(&'a str, &'a str, &'a str)>,
     /// Files to write into the VM filesystem.
     pub write_files: Vec<WriteFile<'a>>,
     /// Shell commands to run after boot (optional).
@@ -62,11 +63,12 @@ pub fn generate_datasource(cfg: &CloudInitConfig<'_>, output_dir: &Path) -> io::
 
     if !cfg.virtiofs_mounts.is_empty() {
         user_data.push_str("mounts:\n");
-        for (tag, mountpoint) in &cfg.virtiofs_mounts {
+        for (tag, mountpoint, options) in &cfg.virtiofs_mounts {
             user_data.push_str(&format!(
-                "  - [\"{}\", \"{}\", \"virtiofs\", \"defaults\", \"0\", \"0\"]\n",
+                "  - [\"{}\", \"{}\", \"virtiofs\", \"{}\", \"0\", \"0\"]\n",
                 yaml_escape(tag),
                 yaml_escape(mountpoint),
+                yaml_escape(options),
             ));
         }
     }
@@ -145,7 +147,10 @@ mod tests {
         let cfg = CloudInitConfig {
             hostname: "worker",
             user: "agent",
-            virtiofs_mounts: vec![("work", "/home/agent/work"), ("data", "/mnt/data")],
+            virtiofs_mounts: vec![
+                ("work", "/home/agent/work", "defaults"),
+                ("data", "/mnt/data", "ro"),
+            ],
             write_files: vec![],
             runcmd: Some(vec!["dnf install -y podman", "/usr/bin/setup.sh"]),
         };

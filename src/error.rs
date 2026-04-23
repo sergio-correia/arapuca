@@ -26,6 +26,10 @@ pub enum Error {
     #[error("cgroup controller not delegated: {0}")]
     CgroupDegraded(String),
 
+    /// Micro-VM operation failed.
+    #[error("microvm: {0}")]
+    MicroVm(String),
+
     /// Process launch or lifecycle error.
     #[error("process: {0}")]
     Process(String),

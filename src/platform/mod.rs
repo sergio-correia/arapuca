@@ -15,6 +15,8 @@ use crate::{Config, process::Process};
 mod darwin;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(all(target_os = "linux", feature = "microvm"))]
+mod microvm;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod other;
 #[cfg(target_os = "windows")]
@@ -26,6 +28,8 @@ pub use self::windows::Windows;
 pub use darwin::Darwin;
 #[cfg(target_os = "linux")]
 pub use linux::Linux;
+#[cfg(all(target_os = "linux", feature = "microvm"))]
+pub use microvm::MicroVm;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub use other::Other;
 

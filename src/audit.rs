@@ -203,6 +203,7 @@ pub enum SandboxLayer {
     EnvFilter,
     FdSanitization,
     ProxyBridge,
+    MicroVm,
     // macOS
     Seatbelt,
     MemoryMonitor,
@@ -231,6 +232,11 @@ pub enum LayerDetail {
     ProxyBridge {
         port: u16,
         uds_path: String,
+    },
+    MicroVm {
+        image_path: String,
+        cpus: u32,
+        mem_mb: u32,
     },
     Other(String),
 }

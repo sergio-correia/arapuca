@@ -539,7 +539,7 @@ impl Sandbox for Linux {
         }
 
         Ok(Process {
-            child,
+            child: crate::process::ChildHandle::Managed(child),
             tmp_dir,
             cgroup_path,
             cgroup_mgr: self.cgroup_mgr.clone(),

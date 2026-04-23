@@ -24,7 +24,7 @@ thiserror = "2"
 
 [features]
 serde = ["dep:serde", "dep:serde_json"]
-microvm = ["dep:reqwest"]
+microvm = ["dep:reqwest", "dep:krun-sys"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -45,6 +45,7 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 seccompiler = "0.5"
+krun-sys = { version = "1.10", optional = true }
 
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false, optional = true }
 

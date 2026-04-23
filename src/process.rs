@@ -8,11 +8,21 @@ use std::path::PathBuf;
 use crate::ResourceUsage;
 use crate::audit::{AuditContext, AuditEvent};
 
+/// Child process variant — either a std::process::Child or a raw
+/// PID from fork() (used by the micro-VM path where we fork
+/// directly instead of going through Command).
+#[cfg(not(windows))]
+pub(crate) enum ChildHandle {
+    Managed(std::process::Child),
+    #[cfg_attr(not(feature = "microvm"), allow(dead_code))]
+    Forked(u32),
+}
+
 /// A running sandboxed subprocess.
 pub struct Process {
     /// The child process handle (Unix platforms).
     #[cfg(not(windows))]
-    pub(crate) child: std::process::Child,
+    pub(crate) child: ChildHandle,
     /// Process handle (Windows). Owned — CloseHandle on drop.
     #[cfg(windows)]
     pub(crate) process_handle: std::os::windows::io::OwnedHandle,
@@ -51,7 +61,10 @@ impl Process {
     /// Get the PID of the sandboxed process.
     #[cfg(not(windows))]
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        match &self.child {
+            ChildHandle::Managed(c) => c.id(),
+            ChildHandle::Forked(pid) => *pid,
+        }
     }
 
     /// Get the PID of the sandboxed process.
@@ -63,11 +76,25 @@ impl Process {
     /// Wait for the process to exit and return the exit status.
     #[cfg(not(windows))]
     pub fn wait(&mut self) -> crate::Result<std::process::ExitStatus> {
-        let pid = self.child.id();
-        let status = self
-            .child
-            .wait()
-            .map_err(|e| crate::Error::Process(format!("wait: {e}")))?;
+        let pid = self.pid();
+        let status = match &mut self.child {
+            ChildHandle::Managed(c) => c
+                .wait()
+                .map_err(|e| crate::Error::Process(format!("wait: {e}")))?,
+            ChildHandle::Forked(child_pid) => {
+                use std::os::unix::process::ExitStatusExt;
+                let mut wstatus: libc::c_int = 0;
+                // SAFETY: child_pid is a valid PID from fork.
+                let ret = unsafe { libc::waitpid(*child_pid as libc::pid_t, &mut wstatus, 0) };
+                if ret < 0 {
+                    return Err(crate::Error::Process(format!(
+                        "waitpid: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                std::process::ExitStatus::from_raw(wstatus)
+            }
+        };
 
         // Capture stats while cgroup still exists (before cleanup
         // destroys it). Eliminates the TOCTOU gap.

@@ -17,6 +17,16 @@ pub enum Isolation {
     MicroVm(MicroVmConfig),
 }
 
+impl Isolation {
+    /// Returns the image source if this is a MicroVm isolation.
+    pub fn image_source(&self) -> Option<&ImageSource> {
+        match self {
+            Self::MicroVm(cfg) => Some(&cfg.image),
+            Self::Process => None,
+        }
+    }
+}
+
 /// Configuration for micro-VM isolation.
 ///
 /// No `Default` — the caller must explicitly choose the image,
