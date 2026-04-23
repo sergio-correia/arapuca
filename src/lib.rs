@@ -19,6 +19,7 @@ pub mod diskquota;
 pub mod env;
 mod error;
 pub mod ffi;
+pub mod images;
 #[cfg(target_os = "linux")]
 pub mod landlock;
 #[cfg(target_os = "linux")]
