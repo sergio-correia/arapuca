@@ -74,7 +74,10 @@ fn parse_metadata_json(json: &str) -> Result<ImageMetadata, String> {
 
 /// Minimal JSON string field extractor. Avoids a serde_json
 /// dependency for the images module (serde is optional).
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
+///
+/// Limitation: does not handle escape sequences in values.
+/// Field values must not contain `"` or `\`.
+pub(crate) fn extract_json_string(json: &str, key: &str) -> Option<String> {
     let pattern = format!("\"{key}\"");
     let key_pos = json.find(&pattern)?;
     let after_key = &json[key_pos + pattern.len()..];
