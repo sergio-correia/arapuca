@@ -7,7 +7,12 @@
 use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::Arc;
 
+use crate::audit::{
+    AuditContext, AuditEvent, AuditVerbosity, SCHEMA_VERSION, SandboxLayer, SkipReason,
+    sanitize_audit_string,
+};
 use crate::platform::Sandbox;
 use crate::{Config, Error, process::Process};
 
@@ -18,6 +23,68 @@ impl Sandbox for Other {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
         let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;
 
+        let audit_ctx = cfg
+            .audit_sink
+            .as_ref()
+            .map(|sink| AuditContext::new(Arc::clone(sink), cfg.audit_verbosity.clone()));
+
+        if let Some(ref ctx) = audit_ctx {
+            let args_field = match ctx.verbosity() {
+                AuditVerbosity::Verbose => {
+                    Some(args.iter().map(|a| sanitize_audit_string(a)).collect())
+                }
+                _ => None,
+            };
+            ctx.emit(AuditEvent::SandboxInit {
+                timestamp: ctx.timestamp(),
+                wall_clock_epoch_ns: ctx.wall_clock_epoch_ns(),
+                schema_version: SCHEMA_VERSION,
+                task_id: sanitize_audit_string(&cfg.task_id),
+                phase: sanitize_audit_string(&cfg.phase),
+                command: sanitize_audit_string(cmd),
+                arg_count: args.len(),
+                args: args_field,
+                principal: cfg.audit_principal.as_deref().map(sanitize_audit_string),
+                correlation_id: cfg
+                    .audit_correlation_id
+                    .as_deref()
+                    .map(sanitize_audit_string),
+            })?;
+
+            // All security layers are unavailable on this platform.
+            for layer in [
+                SandboxLayer::Landlock,
+                SandboxLayer::Seccomp,
+                SandboxLayer::Cgroup,
+                SandboxLayer::NetworkNamespace,
+                SandboxLayer::Rlimit,
+                SandboxLayer::NoNewPrivs,
+                SandboxLayer::Setsid,
+                SandboxLayer::Pdeathsig,
+            ] {
+                ctx.emit(AuditEvent::LayerSkipped {
+                    timestamp: ctx.timestamp(),
+                    layer,
+                    reason: SkipReason::PlatformUnsupported,
+                })?;
+            }
+
+            ctx.emit(AuditEvent::SandboxReady {
+                timestamp: ctx.timestamp(),
+                applied_layers: vec![SandboxLayer::EnvFilter, SandboxLayer::FdSanitization],
+                skipped_layers: vec![
+                    SandboxLayer::Landlock,
+                    SandboxLayer::Seccomp,
+                    SandboxLayer::Cgroup,
+                    SandboxLayer::NetworkNamespace,
+                    SandboxLayer::Rlimit,
+                    SandboxLayer::NoNewPrivs,
+                    SandboxLayer::Setsid,
+                    SandboxLayer::Pdeathsig,
+                ],
+            })?;
+        }
+
         let mut command = Command::new(cmd);
         command.args(args);
 
@@ -26,7 +93,17 @@ impl Sandbox for Other {
         }
 
         let mut env_vars = crate::env::minimal_env(&tmp_dir);
-        env_vars.extend(crate::env::filter_caller_env(&cfg.env).passed);
+        let filter_result = crate::env::filter_caller_env(&cfg.env);
+        env_vars.extend(filter_result.passed);
+
+        if let Some(ref ctx) = audit_ctx {
+            ctx.emit(AuditEvent::EnvPolicy {
+                timestamp: ctx.timestamp(),
+                passed_keys: env_vars.iter().map(|(k, _)| k.clone()).collect(),
+                dropped: filter_result.dropped,
+            })?;
+        }
+
         command.env_clear();
         for (k, v) in &env_vars {
             command.env(k, v);
@@ -65,10 +142,19 @@ impl Sandbox for Other {
             Error::Process(format!("start process: {e}"))
         })?;
 
+        if let Some(ref ctx) = audit_ctx {
+            if let Err(e) = ctx.emit(AuditEvent::ProcessStarted {
+                timestamp: ctx.timestamp(),
+                pid: child.id(),
+            }) {
+                log::error!("audit emit failed: {e}");
+            }
+        }
+
         Ok(Process {
             child,
             tmp_dir,
-            audit_ctx: None,
+            audit_ctx,
             final_stats: None,
         })
     }
