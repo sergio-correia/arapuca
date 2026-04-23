@@ -21,6 +21,7 @@ fn main() {
     // Audit FD: if set, write JSON status lines as each layer is applied.
     // The library creates a pipe and passes the write end via this env var.
     // Closed before execve so the target command cannot write to it.
+    #[cfg(unix)]
     let audit_fd: Option<i32> = std::env::var("ARAPUCA_AUDIT_FD")
         .ok()
         .and_then(|s| s.parse().ok());
