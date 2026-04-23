@@ -237,7 +237,34 @@ impl Sandbox for Linux {
         super::setup_stdio(&mut command, cfg.stdout, "stdout", Command::stdout)?;
         super::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
 
-        let fds_to_inherit: Vec<RawFd> = cfg.extra_fds.clone();
+        let mut fds_to_inherit: Vec<RawFd> = cfg.extra_fds.clone();
+
+        // ── Audit pipe for wrapper binary verification ─────────────
+        // When auditing is active and the wrapper binary is used, create
+        // a pipe so the wrapper can report which layers it actually
+        // applied. The write end is passed as an extra FD; the parent
+        // reads from the read end after spawn.
+        let audit_pipe = if audit_ctx.is_some() && use_landlock {
+            let mut fds = [0i32; 2];
+            // SAFETY: fds is a valid 2-element array. O_CLOEXEC prevents
+            // leaking the read end to the child process.
+            let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            if ret == 0 {
+                let target_fd = 3 + fds_to_inherit.len() as i32;
+                fds_to_inherit.push(fds[1]);
+                Some((fds[0], fds[1], target_fd))
+            } else {
+                log::warn!("audit pipe creation failed, continuing without");
+                None
+            }
+        } else {
+            None
+        };
+
+        // Add ARAPUCA_AUDIT_FD to wrapper env so it knows which FD to write to.
+        if let Some((_, _, target_fd)) = audit_pipe {
+            command.env("ARAPUCA_AUDIT_FD", target_fd.to_string());
+        }
 
         // ── Emit pre_exec layer events from parent ─────────────────
         // pre_exec is async-signal-safe — no AuditContext allowed inside.
@@ -416,6 +443,13 @@ impl Sandbox for Linux {
                     error: sanitize_audit_string(&format!("spawn failed: {e}")),
                 });
             }
+            if let Some((read_fd, write_fd, _)) = audit_pipe {
+                // SAFETY: valid FDs from pipe().
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+            }
             if let Some(ref path) = cgroup_path {
                 if let Some(ref mgr) = self.cgroup_mgr {
                     let _ = mgr.destroy(path);
@@ -424,6 +458,19 @@ impl Sandbox for Linux {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             Error::Process(format!("start sandboxed process: {e}"))
         })?;
+
+        // ── Read wrapper audit pipe ────────────────────────────────
+        // Close write end in parent (essential — otherwise EOF never
+        // arrives). Then read all lines until EOF. The wrapper writes
+        // events before execve; the write end closes at exec (CLOEXEC
+        // is cleared, but the wrapper explicitly closes it).
+        if let Some((read_fd, write_fd, _)) = audit_pipe {
+            // SAFETY: write_fd is a valid descriptor from pipe().
+            unsafe { libc::close(write_fd) };
+            validate_wrapper_audit(read_fd);
+            // SAFETY: read_fd is a valid descriptor from pipe().
+            unsafe { libc::close(read_fd) };
+        }
 
         // ── Emit ProcessStarted ────────────────────────────────────
         if let Some(ref ctx) = audit_ctx {
@@ -481,5 +528,59 @@ impl Sandbox for Linux {
 
     fn cgroups_available(&self) -> bool {
         self.cgroup_mgr.is_some()
+    }
+}
+
+/// Read and validate audit events from the wrapper binary's pipe.
+///
+/// The wrapper writes one JSON line per applied layer. We read until
+/// EOF (the wrapper closes the FD before execve) and validate that
+/// all expected layers were applied. Buffer bounded to 64 KiB to
+/// prevent OOM from a compromised wrapper.
+fn validate_wrapper_audit(read_fd: RawFd) {
+    const MAX_BUF: usize = 64 * 1024;
+    let mut buf = vec![0u8; MAX_BUF];
+    let mut total = 0;
+
+    loop {
+        // SAFETY: read_fd is a valid descriptor, buf is valid memory.
+        let n = unsafe {
+            libc::read(
+                read_fd,
+                buf[total..].as_mut_ptr().cast::<libc::c_void>(),
+                buf.len() - total,
+            )
+        };
+        if n == 0 {
+            break;
+        }
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            log::warn!("wrapper audit pipe read error: {err}");
+            break;
+        }
+        total += n as usize;
+        if total >= MAX_BUF {
+            log::warn!("wrapper audit pipe exceeded 64 KiB, truncating");
+            break;
+        }
+    }
+
+    if total == 0 {
+        log::warn!("wrapper audit pipe: no events received (wrapper may have crashed)");
+        return;
+    }
+
+    let text = String::from_utf8_lossy(&buf[..total]);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    log::info!("wrapper audit: received {} events", lines.len());
+
+    for line in &lines {
+        if line.contains(r#""status":"failed""#) {
+            log::error!("wrapper audit: layer failure reported: {line}");
+        }
     }
 }

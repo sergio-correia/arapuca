@@ -18,6 +18,13 @@ use std::ffi::CString;
 use std::path::PathBuf;
 
 fn main() {
+    // Audit FD: if set, write JSON status lines as each layer is applied.
+    // The library creates a pipe and passes the write end via this env var.
+    // Closed before execve so the target command cannot write to it.
+    let audit_fd: Option<i32> = std::env::var("ARAPUCA_AUDIT_FD")
+        .ok()
+        .and_then(|s| s.parse().ok());
+
     // Find -- separator.
     let args: Vec<String> = std::env::args().collect();
     let sep_idx = args.iter().position(|a| a == "--");
@@ -59,21 +66,29 @@ fn main() {
         };
 
         if let Err(e) = arapuca::landlock::apply(&profile) {
+            audit_layer(audit_fd, "Landlock", false, Some(&e.to_string()));
             eprintln!("arapuca: landlock: {e}");
             std::process::exit(1);
         }
+        audit_layer(audit_fd, "Landlock", true, None);
+
         if let Err(e) = arapuca::seccomp::apply() {
+            audit_layer(audit_fd, "Seccomp", false, Some(&e.to_string()));
             eprintln!("arapuca: seccomp: {e}");
             std::process::exit(1);
         }
+        audit_layer(audit_fd, "Seccomp", true, None);
     }
 
     // 3. Resource limits from env vars (Unix only).
     #[cfg(unix)]
     if let Err(e) = arapuca::rlimit::apply_from_env() {
+        audit_layer(audit_fd, "Rlimit", false, Some(&e.to_string()));
         eprintln!("arapuca: rlimit: {e}");
         std::process::exit(1);
     }
+    #[cfg(unix)]
+    audit_layer(audit_fd, "Rlimit", true, None);
 
     // 4. Pdeathsig — kill subprocess if parent dies (Linux only).
     #[cfg(target_os = "linux")]
@@ -87,6 +102,14 @@ fn main() {
                 std::io::Error::last_os_error()
             );
         }
+        audit_layer(audit_fd, "Pdeathsig", true, None);
+    }
+
+    // Close audit FD before exec — the target command must not inherit it.
+    #[cfg(unix)]
+    if let Some(fd) = audit_fd {
+        // SAFETY: fd is a valid file descriptor from ARAPUCA_AUDIT_FD.
+        unsafe { libc::close(fd) };
     }
 
     // Strip ARAPUCA_* env vars so the agent can't inspect its own
@@ -157,6 +180,43 @@ fn env_paths(name: &str) -> Vec<PathBuf> {
         Ok(v) => arapuca::env::parse_paths(&v),
         Err(_) => Vec::new(),
     }
+}
+
+/// Write an audit status line to the audit FD (if set).
+///
+/// Writes newline-delimited JSON. Errors are silently ignored — audit
+/// is observability, not a security gate.
+#[cfg(unix)]
+fn audit_layer(fd: Option<i32>, layer: &str, ok: bool, error: Option<&str>) {
+    let Some(fd) = fd else { return };
+    let status = if ok { "applied" } else { "failed" };
+    let json = if let Some(err) = error {
+        let escaped = json_escape(err);
+        format!(r#"{{"layer":"{layer}","status":"{status}","error":"{escaped}"}}"#)
+    } else {
+        format!(r#"{{"layer":"{layer}","status":"{status}"}}"#)
+    };
+    let line = format!("{json}\n");
+    // SAFETY: fd is a valid descriptor from ARAPUCA_AUDIT_FD, buf/len valid.
+    let _ = unsafe { libc::write(fd, line.as_ptr().cast::<libc::c_void>(), line.len()) };
+}
+
+/// Escape a string for JSON (RFC 8259): backslash, double-quote,
+/// and all control characters below U+0020.
+#[cfg(unix)]
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c < '\u{0020}' => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Simple PATH lookup for a command name.
