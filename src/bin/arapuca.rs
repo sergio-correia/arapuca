@@ -27,6 +27,11 @@ fn main() {
         image_subcommand(&args[2..]);
         return;
     }
+    #[cfg(feature = "microvm")]
+    if args.get(1).is_some_and(|a| a == "vm") {
+        vm_subcommand(&args[2..]);
+        return;
+    }
 
     // Audit FD: if set, write JSON status lines as each layer is applied.
     // The library creates a pipe and passes the write end via this env var.
@@ -312,6 +317,409 @@ fn image_rm(args: &[String]) {
             eprintln!("arapuca: image rm failed: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+// ─── VM subcommands ────────────────────────────────────────────
+
+#[cfg(feature = "microvm")]
+fn vm_subcommand(args: &[String]) {
+    match args.first().map(|s| s.as_str()) {
+        Some("run") => vm_run(&args[1..]),
+        _ => {
+            eprintln!("usage: arapuca vm run [flags] -- command [args...]");
+            eprintln!();
+            eprintln!("flags:");
+            eprintln!("  --image <distro:version|path>   image to boot (required)");
+            eprintln!("  --cpus <n>                      vCPUs (default: 2)");
+            eprintln!("  --mem <mb>                      RAM in MB (default: 2048)");
+            eprintln!("  -v, --volume <host:guest[:opts]> mount host dir (ro,z,Z)");
+            eprintln!("  --net                           enable networking (passt)");
+            eprintln!("  --env <KEY=VALUE>               set env var in guest");
+            eprintln!("  --write-file <host:guest>       inject file into guest");
+            eprintln!("  --timeout <seconds>             wall-clock limit");
+            eprintln!("  --task-id <id>                  task identifier");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(feature = "microvm")]
+fn vm_run(args: &[String]) {
+    use arapuca::platform::{MicroVm, Sandbox};
+
+    let mut image: Option<String> = None;
+    let mut cpus: u32 = 2;
+    let mut mem_mb: u32 = 2048;
+    let mut volumes: Vec<(String, String, String)> = Vec::new(); // host, guest, opts
+    let mut net = false;
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut write_files: Vec<(String, String)> = Vec::new(); // host, guest
+    let mut timeout: Option<u64> = None;
+    let mut task_id: Option<String> = None;
+
+    // Find -- separator.
+    let sep_pos = args.iter().position(|a| a == "--");
+    let flag_args = match sep_pos {
+        Some(pos) => &args[..pos],
+        None => args,
+    };
+    let cmd_args: &[String] = match sep_pos {
+        Some(pos) if pos + 1 < args.len() => &args[pos + 1..],
+        _ => &[],
+    };
+
+    // Parse flags.
+    let mut i = 0;
+    while i < flag_args.len() {
+        match flag_args[i].as_str() {
+            "--image" => {
+                i += 1;
+                image = Some(
+                    flag_args
+                        .get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("--image requires a value");
+                            std::process::exit(125);
+                        })
+                        .clone(),
+                );
+            }
+            "--cpus" => {
+                i += 1;
+                cpus = flag_args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("--cpus requires a positive integer");
+                        std::process::exit(125);
+                    });
+                if cpus == 0 {
+                    eprintln!("--cpus must be > 0");
+                    std::process::exit(125);
+                }
+            }
+            "--mem" => {
+                i += 1;
+                mem_mb = flag_args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("--mem requires a positive integer");
+                        std::process::exit(125);
+                    });
+                if mem_mb == 0 {
+                    eprintln!("--mem must be > 0");
+                    std::process::exit(125);
+                }
+            }
+            "-v" | "--volume" => {
+                i += 1;
+                let spec = flag_args.get(i).unwrap_or_else(|| {
+                    eprintln!("-v requires host:guest[:opts]");
+                    std::process::exit(125);
+                });
+                let parts: Vec<&str> = spec.splitn(3, ':').collect();
+                if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+                    eprintln!("invalid volume: {spec} (expected host:guest[:opts])");
+                    std::process::exit(125);
+                }
+                volumes.push((
+                    parts[0].to_string(),
+                    parts[1].to_string(),
+                    parts.get(2).unwrap_or(&"").to_string(),
+                ));
+            }
+            "--net" => {
+                net = true;
+            }
+            "--env" => {
+                i += 1;
+                let kv = flag_args.get(i).unwrap_or_else(|| {
+                    eprintln!("--env requires KEY=VALUE");
+                    std::process::exit(125);
+                });
+                if let Some((k, v)) = kv.split_once('=') {
+                    env.push((k.to_string(), v.to_string()));
+                } else {
+                    eprintln!("invalid --env: {kv} (expected KEY=VALUE)");
+                    std::process::exit(125);
+                }
+            }
+            "--write-file" => {
+                i += 1;
+                let spec = flag_args.get(i).unwrap_or_else(|| {
+                    eprintln!("--write-file requires host_path:guest_path");
+                    std::process::exit(125);
+                });
+                if let Some((host, guest)) = spec.split_once(':') {
+                    if host.is_empty() || guest.is_empty() {
+                        eprintln!("invalid --write-file: {spec}");
+                        std::process::exit(125);
+                    }
+                    // Validate host file.
+                    let meta = match std::fs::metadata(host) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("--write-file: {host}: {e}");
+                            std::process::exit(125);
+                        }
+                    };
+                    if !meta.is_file() {
+                        eprintln!("--write-file: {host}: not a regular file");
+                        std::process::exit(125);
+                    }
+                    if meta.len() > 1024 * 1024 {
+                        eprintln!("--write-file: {host}: file too large (max 1MB)");
+                        std::process::exit(125);
+                    }
+                    if !guest.starts_with('/') {
+                        eprintln!("--write-file: guest path must be absolute: {guest}");
+                        std::process::exit(125);
+                    }
+                    write_files.push((host.to_string(), guest.to_string()));
+                } else {
+                    eprintln!("invalid --write-file: {spec} (expected host:guest)");
+                    std::process::exit(125);
+                }
+                // TODO: plumb write_files through to cloud-init
+                // generation in MicroVm::launch(). For now, warn.
+                eprintln!("warning: --write-file is not yet wired to the VM launch path");
+            }
+            "--timeout" => {
+                i += 1;
+                let secs: u64 = flag_args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("--timeout requires a positive integer (seconds)");
+                        std::process::exit(125);
+                    });
+                if secs == 0 {
+                    eprintln!("--timeout must be > 0");
+                    std::process::exit(125);
+                }
+                timeout = Some(secs);
+            }
+            "--task-id" => {
+                i += 1;
+                task_id = Some(
+                    flag_args
+                        .get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("--task-id requires a value");
+                            std::process::exit(125);
+                        })
+                        .clone(),
+                );
+            }
+            other => {
+                eprintln!("unknown flag: {other}");
+                eprintln!("run 'arapuca vm' for usage");
+                std::process::exit(125);
+            }
+        }
+        i += 1;
+    }
+
+    let image = image.unwrap_or_else(|| {
+        eprintln!("--image is required");
+        std::process::exit(125);
+    });
+
+    // Parse image specifier.
+    let image_source =
+        if image.contains('/') || image.ends_with(".qcow2") || image.ends_with(".raw") {
+            arapuca::ImageSource::Path(PathBuf::from(&image))
+        } else if let Some((distro, version)) = image.split_once(':') {
+            if distro.is_empty() || version.is_empty() {
+                eprintln!("invalid image: {image} (expected distro:version or path)");
+                std::process::exit(125);
+            }
+            arapuca::ImageSource::Distro {
+                name: distro.to_string(),
+                version: version.to_string(),
+            }
+        } else {
+            eprintln!("invalid image: {image} (expected distro:version or path)");
+            std::process::exit(125);
+        };
+
+    // Build profile.
+    let mut read_paths = Vec::new();
+    let mut write_paths = Vec::new();
+
+    for (host, _guest, opts) in &volumes {
+        let opts_lower = opts.to_lowercase();
+
+        // SELinux relabeling.
+        #[cfg(target_os = "linux")]
+        if opts.contains('z') || opts.contains('Z') {
+            apply_selinux_label(host);
+        }
+
+        if opts_lower.contains("ro") {
+            read_paths.push(PathBuf::from(host));
+        } else {
+            write_paths.push(PathBuf::from(host));
+        }
+    }
+
+    let task = task_id.unwrap_or_else(|| format!("vm-{}", std::process::id()));
+
+    let profile = arapuca::Profile {
+        isolation: arapuca::Isolation::MicroVm(arapuca::MicroVmConfig {
+            image: image_source,
+            cpus,
+            mem_mb,
+        }),
+        read_paths,
+        write_paths,
+        use_netns: !net,
+        ..Default::default()
+    };
+
+    let config = arapuca::Config {
+        profile,
+        socket_dir: std::env::temp_dir(),
+        task_id: task,
+        phase: "vm-run".into(),
+        work_dir: None,
+        #[cfg(unix)]
+        stdin: None,
+        #[cfg(unix)]
+        stdout: None,
+        #[cfg(unix)]
+        stderr: None,
+        #[cfg(unix)]
+        extra_fds: Vec::new(),
+        network_proxy_socket: None,
+        env,
+        audit_sink: None,
+        audit_verbosity: arapuca::audit::AuditVerbosity::Standard,
+        audit_principal: None,
+        audit_correlation_id: None,
+    };
+
+    // Build the command string.
+    let cmd = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
+    let cmd_rest: Vec<&str> = cmd_args.iter().skip(1).map(|s| s.as_str()).collect();
+
+    // Launch.
+    let sandbox = MicroVm::new().unwrap_or_else(|e| {
+        eprintln!("arapuca: microvm: {e}");
+        std::process::exit(125);
+    });
+
+    if let Err(e) = sandbox.available() {
+        eprintln!("arapuca: microvm not available: {e}");
+        std::process::exit(125);
+    }
+
+    let mut process = match sandbox.launch(&config, cmd, &cmd_rest) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("arapuca: vm launch failed: {e}");
+            std::process::exit(125);
+        }
+    };
+
+    // Wait with optional timeout. The done flag prevents the
+    // timer thread from killing a recycled PID after the VM exits.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    if let Some(secs) = timeout {
+        let pid = process.pid();
+        let done_clone = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            if done_clone.load(Ordering::Acquire) {
+                return;
+            }
+            eprintln!("arapuca: timeout ({secs}s), killing VM");
+            // SAFETY: pid is valid and not yet recycled (done is false).
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if done_clone.load(Ordering::Acquire) {
+                return;
+            }
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        });
+    }
+
+    let status = process.wait();
+    done.store(true, std::sync::atomic::Ordering::Release);
+
+    let exit_code = match status {
+        Ok(s) => {
+            if let Some(code) = s.code() {
+                code
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    128 + s.signal().unwrap_or(9)
+                }
+                #[cfg(not(unix))]
+                {
+                    137
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("arapuca: wait failed: {e}");
+            125
+        }
+    };
+
+    process.cleanup();
+    std::process::exit(exit_code);
+}
+
+#[cfg(all(feature = "microvm", target_os = "linux"))]
+fn apply_selinux_label(path: &str) {
+    // Reject dangerous paths that should never be relabeled.
+    let canonical = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("warning: cannot resolve {path} for SELinux relabel: {e}");
+            return;
+        }
+    };
+    let canon_str = canonical.to_string_lossy();
+    let dangerous = [
+        "/", "/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc",
+        "/sys", "/run", "/tmp",
+    ];
+    if dangerous
+        .iter()
+        .any(|d| canon_str == *d || canon_str.starts_with(&format!("{d}/")))
+    {
+        eprintln!("warning: refusing to relabel {path} (system directory)");
+        return;
+    }
+
+    let enforcing = std::fs::read_to_string("/sys/fs/selinux/enforce")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+
+    if !enforcing {
+        return;
+    }
+
+    // Use the canonicalized path to prevent TOCTOU symlink swaps.
+    let status = std::process::Command::new("chcon")
+        .args(["-R", "-t", "svirt_sandbox_file_t", &*canon_str])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "warning: chcon failed on {path} (exit {})",
+            s.code().unwrap_or(-1)
+        ),
+        Err(e) => eprintln!("warning: chcon not available: {e}"),
     }
 }
 
