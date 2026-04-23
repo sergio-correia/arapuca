@@ -20,6 +20,14 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Dispatch subcommands before the sandbox path.
+    if args.get(1).is_some_and(|a| a == "image") {
+        image_subcommand(&args[2..]);
+        return;
+    }
+
     // Audit FD: if set, write JSON status lines as each layer is applied.
     // The library creates a pipe and passes the write end via this env var.
     // Closed before execve so the target command cannot write to it.
@@ -29,12 +37,11 @@ fn main() {
         .and_then(|s| s.parse().ok());
 
     // Find -- separator.
-    let args: Vec<String> = std::env::args().collect();
     let sep_idx = args.iter().position(|a| a == "--");
     let cmd_idx = match sep_idx {
         Some(i) if i + 1 < args.len() => i + 1,
         _ => {
-            eprintln!("arapuca: usage: arapuca -- command [args...]");
+            eprintln!("arapuca: usage: arapuca [image pull|list|rm] | [-- command ...]");
             std::process::exit(1);
         }
     };
@@ -187,6 +194,124 @@ fn main() {
         let _ = (c_cmd, c_args, env);
         eprintln!("arapuca: binary not yet supported on this platform");
         std::process::exit(1);
+    }
+}
+
+// ─── Image subcommands ─────────────────────────────────────────
+
+fn image_subcommand(args: &[String]) {
+    let subcmd = args.first().map(|s| s.as_str());
+    match subcmd {
+        Some("pull") => image_pull(&args[1..]),
+        Some("list") => image_list(),
+        Some("rm") => image_rm(&args[1..]),
+        _ => {
+            eprintln!("usage: arapuca image <pull|list|rm>");
+            eprintln!();
+            eprintln!("  pull <distro>:<version>   download and cache an image");
+            eprintln!("  list                      show cached images");
+            eprintln!("  rm <distro>:<version>     remove a cached image");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(feature = "microvm")]
+fn image_pull(args: &[String]) {
+    let spec = match args.first() {
+        Some(s) => s,
+        None => {
+            eprintln!("usage: arapuca image pull <distro>:<version>");
+            std::process::exit(1);
+        }
+    };
+
+    let (distro, version) = match spec.split_once(':') {
+        Some((d, v)) if !d.is_empty() && !v.is_empty() => (d, v),
+        _ => {
+            eprintln!("invalid image specifier: {spec} (expected distro:version)");
+            std::process::exit(1);
+        }
+    };
+
+    let source = arapuca::ImageSource::Distro {
+        name: distro.into(),
+        version: version.into(),
+    };
+
+    match arapuca::images::resolve(&source) {
+        Ok(cached) => {
+            println!("{}", cached.path.display());
+        }
+        Err(e) => {
+            eprintln!("arapuca: image pull failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(feature = "microvm"))]
+fn image_pull(_args: &[String]) {
+    eprintln!("arapuca: image pull requires the 'microvm' feature");
+    eprintln!("rebuild with: cargo build --features microvm");
+    std::process::exit(1);
+}
+
+fn image_list() {
+    match arapuca::images::cache::list() {
+        Ok(images) => {
+            if images.is_empty() {
+                println!("no cached images");
+                return;
+            }
+            for (name, cached) in &images {
+                let size = std::fs::metadata(&cached.path)
+                    .map(|m| m.len() / (1024 * 1024))
+                    .unwrap_or(0);
+                println!(
+                    "{name}  {size}MB  root={} fs={}",
+                    cached.metadata.root_device, cached.metadata.fstype,
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("arapuca: image list failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn image_rm(args: &[String]) {
+    let spec = match args.first() {
+        Some(s) => s,
+        None => {
+            eprintln!("usage: arapuca image rm <name>");
+            std::process::exit(1);
+        }
+    };
+
+    // Accept both "distro:version" and cache name formats.
+    let cache_name = if let Some((distro, version)) = spec.split_once(':') {
+        if distro.is_empty() || version.is_empty() {
+            eprintln!("invalid image specifier: {spec} (expected distro:version)");
+            std::process::exit(1);
+        }
+        let arch = std::env::consts::ARCH;
+        format!("{distro}-{version}-{arch}")
+    } else {
+        spec.clone()
+    };
+
+    match arapuca::images::cache::remove(&cache_name) {
+        Ok(true) => println!("removed {cache_name}"),
+        Ok(false) => {
+            eprintln!("image not found: {cache_name}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("arapuca: image rm failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
