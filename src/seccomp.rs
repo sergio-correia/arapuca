@@ -224,6 +224,25 @@ fn tier2_eperm_syscalls() -> Vec<i64> {
     ]
 }
 
+/// Summary of the seccomp filter policy for audit reporting.
+pub(crate) struct SeccompSummary {
+    pub tier1_kill_count: usize,
+    pub tier2_eperm_count: usize,
+    pub socket_filter: bool,
+    pub prctl_filter: bool,
+}
+
+// NOTE: socket_filter and prctl_filter are hardcoded to match
+// build_filter(). Update these if those filters become conditional.
+pub(crate) fn summary() -> SeccompSummary {
+    SeccompSummary {
+        tier1_kill_count: tier1_kill_syscalls().len(),
+        tier2_eperm_count: tier2_eperm_syscalls().len(),
+        socket_filter: true,
+        prctl_filter: true,
+    }
+}
+
 /// Determine the target architecture for seccompiler.
 fn target_arch() -> crate::Result<TargetArch> {
     #[cfg(target_arch = "x86_64")]

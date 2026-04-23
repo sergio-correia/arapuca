@@ -19,6 +19,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+use crate::audit::{
+    AuditContext, AuditEvent, AuditVerbosity, LayerDetail, SCHEMA_VERSION, SandboxLayer,
+    SkipReason, sanitize_audit_string,
+};
 use crate::cgroup::{CgroupLimits, CgroupManager};
 use crate::platform::Sandbox;
 use crate::{Config, Error, process::Process};
@@ -52,6 +56,40 @@ impl Sandbox for Linux {
 
         let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;
 
+        let audit_ctx = cfg
+            .audit_sink
+            .as_ref()
+            .map(|sink| AuditContext::new(Arc::clone(sink), cfg.audit_verbosity.clone()));
+
+        // Track layers for SandboxReady summary.
+        let mut applied_layers = Vec::new();
+        let mut skipped_layers = Vec::new();
+
+        // ── Emit SandboxInit ───────────────────────────────────────
+        if let Some(ref ctx) = audit_ctx {
+            let args_field = match ctx.verbosity() {
+                AuditVerbosity::Verbose => {
+                    Some(args.iter().map(|a| sanitize_audit_string(a)).collect())
+                }
+                _ => None,
+            };
+            ctx.emit(AuditEvent::SandboxInit {
+                timestamp: ctx.timestamp(),
+                wall_clock_epoch_ns: ctx.wall_clock_epoch_ns(),
+                schema_version: SCHEMA_VERSION,
+                task_id: sanitize_audit_string(&cfg.task_id),
+                phase: sanitize_audit_string(&cfg.phase),
+                command: sanitize_audit_string(cmd),
+                arg_count: args.len(),
+                args: args_field,
+                principal: cfg.audit_principal.as_deref().map(sanitize_audit_string),
+                correlation_id: cfg
+                    .audit_correlation_id
+                    .as_deref()
+                    .map(sanitize_audit_string),
+            })?;
+        }
+
         // Determine the actual command. We may wrap it with the
         // arapuca binary (Landlock+seccomp) and/or unshare (netns).
         let mut actual_cmd = cmd.to_string();
@@ -69,18 +107,85 @@ impl Sandbox for Linux {
             wrapper_args.extend(actual_args);
             actual_cmd = wrapper_path.to_string_lossy().into_owned();
             actual_args = wrapper_args;
+
+            let abi = crate::landlock::abi_version();
+            for layer in [
+                SandboxLayer::Landlock,
+                SandboxLayer::Seccomp,
+                SandboxLayer::Rlimit,
+                SandboxLayer::NoNewPrivs,
+            ] {
+                let detail = if layer == SandboxLayer::Landlock {
+                    Some(LayerDetail::Landlock {
+                        abi_version: abi,
+                        fully_enforced: abi >= 5,
+                    })
+                } else {
+                    None
+                };
+                if let Some(ref ctx) = audit_ctx {
+                    ctx.emit(AuditEvent::LayerApplied {
+                        timestamp: ctx.timestamp(),
+                        layer: layer.clone(),
+                        detail,
+                    })?;
+                }
+                applied_layers.push(layer);
+            }
+        } else {
+            // Wrapper binary absent or no paths configured — no
+            // Landlock/seccomp/rlimit/NO_NEW_PRIVS.
+            let has_paths =
+                !cfg.profile.read_paths.is_empty() || !cfg.profile.write_paths.is_empty();
+            let reason = if wrapper.is_none() && has_paths {
+                log::warn!("arapuca wrapper binary not found — no Landlock/seccomp applied");
+                SkipReason::ComponentMissing("wrapper binary not found".into())
+            } else {
+                SkipReason::NotConfigured
+            };
+            for layer in [
+                SandboxLayer::Landlock,
+                SandboxLayer::Seccomp,
+                SandboxLayer::Rlimit,
+                SandboxLayer::NoNewPrivs,
+            ] {
+                if let Some(ref ctx) = audit_ctx {
+                    ctx.emit(AuditEvent::LayerSkipped {
+                        timestamp: ctx.timestamp(),
+                        layer: layer.clone(),
+                        reason: reason.clone(),
+                    })?;
+                }
+                skipped_layers.push(layer);
+            }
         }
 
-        // Layer 2: Network namespace.
+        // ── Network namespace ──────────────────────────────────────
         let mut command = if cfg.profile.use_netns {
             let mut c = Command::new("unshare");
             c.args(["--user", "--net", "--map-current-user", "--"]);
             c.arg(&actual_cmd);
             c.args(&actual_args);
+            if let Some(ref ctx) = audit_ctx {
+                ctx.emit(AuditEvent::LayerApplied {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::NetworkNamespace,
+                    detail: None,
+                })?;
+            }
+            applied_layers.push(SandboxLayer::NetworkNamespace);
             c
         } else {
             let mut c = Command::new(&actual_cmd);
             c.args(&actual_args);
+            if let Some(ref ctx) = audit_ctx {
+                ctx.emit(AuditEvent::LayerSkipped {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::NetworkNamespace,
+                    reason: SkipReason::NotConfigured,
+                })?;
+            }
+            skipped_layers.push(SandboxLayer::NetworkNamespace);
             c
         };
 
@@ -109,7 +214,18 @@ impl Sandbox for Linux {
         }
 
         // Append caller-supplied env vars (filtered for safety).
-        env_vars.extend(crate::env::filter_caller_env(&cfg.env).passed);
+        let filter_result = crate::env::filter_caller_env(&cfg.env);
+        env_vars.extend(filter_result.passed);
+
+        // ── Emit EnvPolicy ─────────────────────────────────────────
+        if let Some(ref ctx) = audit_ctx {
+            ctx.emit(AuditEvent::EnvPolicy {
+                timestamp: ctx.timestamp(),
+                passed_keys: env_vars.iter().map(|(k, _)| k.clone()).collect(),
+                dropped: filter_result.dropped,
+            })?;
+        }
+        applied_layers.push(SandboxLayer::EnvFilter);
 
         command.env_clear();
         for (k, v) in &env_vars {
@@ -122,6 +238,39 @@ impl Sandbox for Linux {
         super::setup_stdio(&mut command, cfg.stderr, "stderr", Command::stderr)?;
 
         let fds_to_inherit: Vec<RawFd> = cfg.extra_fds.clone();
+
+        // ── Emit pre_exec layer events from parent ─────────────────
+        // pre_exec is async-signal-safe — no AuditContext allowed inside.
+        // We emit from the parent with the semantic "will be applied."
+        if let Some(ref ctx) = audit_ctx {
+            ctx.emit(AuditEvent::LayerApplied {
+                timestamp: ctx.timestamp(),
+                layer: SandboxLayer::Setsid,
+                detail: None,
+            })?;
+            ctx.emit(AuditEvent::LayerApplied {
+                timestamp: ctx.timestamp(),
+                layer: SandboxLayer::Pdeathsig,
+                detail: None,
+            })?;
+
+            let inherited: Vec<i32> = (0..fds_to_inherit.len()).map(|i| (3 + i) as i32).collect();
+            ctx.emit(AuditEvent::LayerApplied {
+                timestamp: ctx.timestamp(),
+                layer: SandboxLayer::FdSanitization,
+                detail: None,
+            })?;
+            ctx.emit(AuditEvent::FdInheritance {
+                timestamp: ctx.timestamp(),
+                inherited_fds: inherited,
+                stdin_redirected: cfg.stdin.is_some(),
+                stdout_redirected: cfg.stdout.is_some(),
+                stderr_redirected: cfg.stderr.is_some(),
+            })?;
+        }
+        applied_layers.push(SandboxLayer::Setsid);
+        applied_layers.push(SandboxLayer::Pdeathsig);
+        applied_layers.push(SandboxLayer::FdSanitization);
 
         // SAFETY: pre_exec runs between fork and exec. Only
         // async-signal-safe functions are permitted. We use raw libc
@@ -154,7 +303,54 @@ impl Sandbox for Linux {
             });
         }
 
-        // Create cgroup if available and limits are set.
+        // ── Emit policy summary events ─────────────────────────────
+        if let Some(ref ctx) = audit_ctx {
+            ctx.emit(AuditEvent::FilesystemPolicy {
+                timestamp: ctx.timestamp(),
+                read_paths: cfg
+                    .profile
+                    .read_paths
+                    .iter()
+                    .map(|p| sanitize_audit_string(&p.to_string_lossy()))
+                    .collect(),
+                write_paths: cfg
+                    .profile
+                    .write_paths
+                    .iter()
+                    .map(|p| sanitize_audit_string(&p.to_string_lossy()))
+                    .collect(),
+            })?;
+
+            ctx.emit(AuditEvent::ResourceLimits {
+                timestamp: ctx.timestamp(),
+                memory_mb: cfg.profile.max_memory_mb,
+                cpu_pct: cfg.profile.max_cpu_pct,
+                max_pids: cfg.profile.max_pids,
+                max_file_size_mb: cfg.profile.max_file_size_mb,
+                allow_exec: cfg.profile.allow_exec,
+            })?;
+
+            ctx.emit(AuditEvent::NetworkPolicy {
+                timestamp: ctx.timestamp(),
+                isolated: cfg.profile.use_netns,
+                proxy_socket: cfg
+                    .network_proxy_socket
+                    .as_ref()
+                    .map(|p| sanitize_audit_string(&p.to_string_lossy())),
+            })?;
+
+            let seccomp = crate::seccomp::summary();
+            ctx.emit(AuditEvent::SeccompPolicy {
+                timestamp: ctx.timestamp(),
+                tier1_kill_count: seccomp.tier1_kill_count,
+                tier2_eperm_count: seccomp.tier2_eperm_count,
+                socket_filter: seccomp.socket_filter,
+                prctl_filter: seccomp.prctl_filter,
+                allow_exec: cfg.profile.allow_exec,
+            })?;
+        }
+
+        // ── Create cgroup ──────────────────────────────────────────
         let limits = CgroupLimits {
             memory_max_mb: cfg.profile.max_memory_mb,
             pids_max: cfg.profile.max_pids,
@@ -165,14 +361,61 @@ impl Sandbox for Linux {
         if let Some(ref mgr) = self.cgroup_mgr {
             if limits.has_limits() {
                 match mgr.create(&cfg.task_id, &limits) {
-                    Ok(path) => cgroup_path = Some(path),
-                    Err(e) => log::warn!("cgroup creation failed: {e} (continuing without)"),
+                    Ok(path) => {
+                        if let Some(ref ctx) = audit_ctx {
+                            ctx.emit(AuditEvent::LayerApplied {
+                                timestamp: ctx.timestamp(),
+                                layer: SandboxLayer::Cgroup,
+                                detail: Some(LayerDetail::Cgroup {
+                                    path: sanitize_audit_string(&path.to_string_lossy()),
+                                }),
+                            })?;
+                        }
+                        applied_layers.push(SandboxLayer::Cgroup);
+                        cgroup_path = Some(path);
+                    }
+                    Err(e) => {
+                        log::warn!("cgroup creation failed: {e} (continuing without)");
+                        if let Some(ref ctx) = audit_ctx {
+                            ctx.emit(AuditEvent::LayerSkipped {
+                                timestamp: ctx.timestamp(),
+                                layer: SandboxLayer::Cgroup,
+                                reason: SkipReason::PartialFailure(format!("{e}")),
+                            })?;
+                        }
+                        skipped_layers.push(SandboxLayer::Cgroup);
+                    }
                 }
             }
+        } else if limits.has_limits() {
+            if let Some(ref ctx) = audit_ctx {
+                ctx.emit(AuditEvent::LayerSkipped {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::Cgroup,
+                    reason: SkipReason::NotAvailable,
+                })?;
+            }
+            skipped_layers.push(SandboxLayer::Cgroup);
         }
 
+        // ── Emit SandboxReady ──────────────────────────────────────
+        if let Some(ref ctx) = audit_ctx {
+            ctx.emit(AuditEvent::SandboxReady {
+                timestamp: ctx.timestamp(),
+                applied_layers: applied_layers.clone(),
+                skipped_layers: skipped_layers.clone(),
+            })?;
+        }
+
+        // ── Spawn ──────────────────────────────────────────────────
         let child = command.spawn().map_err(|e| {
-            // Clean up on failure.
+            if let Some(ref ctx) = audit_ctx {
+                let _ = ctx.emit(AuditEvent::LayerFailed {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::Setsid,
+                    error: sanitize_audit_string(&format!("spawn failed: {e}")),
+                });
+            }
             if let Some(ref path) = cgroup_path {
                 if let Some(ref mgr) = self.cgroup_mgr {
                     let _ = mgr.destroy(path);
@@ -182,10 +425,29 @@ impl Sandbox for Linux {
             Error::Process(format!("start sandboxed process: {e}"))
         })?;
 
+        // ── Emit ProcessStarted ────────────────────────────────────
+        if let Some(ref ctx) = audit_ctx {
+            ctx.emit(AuditEvent::ProcessStarted {
+                timestamp: ctx.timestamp(),
+                pid: child.id(),
+            })?;
+        }
+
         // Add subprocess PID to cgroup.
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &cgroup_path) {
             if let Err(e) = mgr.add_pid(path, child.id()) {
                 log::warn!("failed to add PID to cgroup: {e}");
+                if let Some(ref ctx) = audit_ctx {
+                    // Post-spawn: can't abort (child is running), so we
+                    // intentionally discard mandatory emit errors here.
+                    if let Err(ae) = ctx.emit(AuditEvent::LayerSkipped {
+                        timestamp: ctx.timestamp(),
+                        layer: SandboxLayer::Cgroup,
+                        reason: SkipReason::PartialFailure(format!("add_pid failed: {e}")),
+                    }) {
+                        log::error!("audit emit failed: {ae}");
+                    }
+                }
             }
         }
 
@@ -194,7 +456,7 @@ impl Sandbox for Linux {
             tmp_dir,
             cgroup_path,
             cgroup_mgr: self.cgroup_mgr.clone(),
-            audit_ctx: None,
+            audit_ctx,
             final_stats: None,
         })
     }

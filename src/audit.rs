@@ -307,7 +307,6 @@ pub trait AuditSink: Send + Sync {
 
 /// Internal helper that centralizes timestamp computation and
 /// panic-safe event emission.
-#[allow(dead_code)]
 pub(crate) struct AuditContext {
     sink: Arc<dyn AuditSink>,
     epoch: Instant,
@@ -315,7 +314,6 @@ pub(crate) struct AuditContext {
     verbosity: AuditVerbosity,
 }
 
-#[allow(dead_code)]
 impl AuditContext {
     pub fn new(sink: Arc<dyn AuditSink>, verbosity: AuditVerbosity) -> Self {
         let epoch = Instant::now();
@@ -382,7 +380,6 @@ impl std::fmt::Debug for AuditContext {
 /// Strip control characters and bidi overrides from a string before
 /// it enters an audit event, preventing log injection attacks on
 /// downstream consumers.
-#[allow(dead_code)]
 pub(crate) fn sanitize_audit_string(s: &str) -> String {
     s.chars()
         .filter(|c| {
