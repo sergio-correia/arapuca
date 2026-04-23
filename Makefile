@@ -1,13 +1,22 @@
-.PHONY: build release test lint fmt check ci audit header man clean
+.PHONY: build release build-microvm release-microvm test test-unit test-integration lint fmt fmt-check clippy check ci ci-full audit header man clean static
+
+FEATURES ?=
 
 build:
-	cargo build
+	cargo build $(if $(FEATURES),--features $(FEATURES))
 
 release:
-	cargo build --release
+	cargo build --release $(if $(FEATURES),--features $(FEATURES))
+
+# Build with micro-VM support (requires libkrun).
+build-microvm:
+	cargo build --features microvm
+
+release-microvm:
+	cargo build --release --features microvm
 
 test:
-	cargo test
+	cargo test $(if $(FEATURES),--features $(FEATURES))
 
 # Unit tests only (no integration tests — safe on all platforms).
 test-unit:
@@ -27,6 +36,7 @@ fmt-check:
 
 clippy:
 	cargo clippy -- -D warnings
+	$(if $(FEATURES),cargo clippy --features $(FEATURES) -- -D warnings)
 
 # Full pre-commit / CI gate: format, lint, unit tests.
 check: fmt-check clippy test-unit
