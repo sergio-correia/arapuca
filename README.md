@@ -22,7 +22,9 @@ be bypassed from userspace.
 - **Cgroups v2** resource limits — memory, CPU, PIDs, OOM detection,
   usage telemetry
 - **Network namespace** isolation — CLONE_NEWUSER + CLONE_NEWNET
-  blocks all direct network access
+  blocks all direct network access; automatic **proxy bridge** relays
+  HTTP traffic through a Unix domain socket so standard tools
+  (curl, git, npm) work via HTTP_PROXY
 
 ### macOS
 
@@ -195,6 +197,7 @@ case.
 | Landlock | Kernel filesystem MAC | Reading/writing files outside allowlist |
 | Seccomp BPF | Syscall filter | ptrace, mount, namespace escape, kernel modules |
 | Network namespace | CLONE_NEWNET | All direct network access (AF_INET/AF_INET6) |
+| Proxy bridge | TCP-to-UDS relay | Enables HTTP_PROXY in netns via hardened child process |
 | Cgroups v2 | Resource limits | Memory exhaustion, fork bombs, CPU starvation |
 | Rlimits | POSIX limits | Large file creation, process proliferation |
 | Pdeathsig | PR_SET_PDEATHSIG | Orphan processes surviving parent crash |
@@ -420,7 +423,8 @@ block has a `// SAFETY:` comment. Expected `unsafe` locations:
 | `platform/linux.rs` | `pre_exec()` for setsid + pdeathsig |
 | `platform/darwin/mod.rs` | `pre_exec()` for setsid, `kill()` for monitors |
 | `platform/windows.rs` | Win32 API calls: `CreateProcessW`, `CreateJobObjectW`, `CreateRestrictedToken`, `SetTokenInformation`, `DuplicateHandle`, DACL/ACL operations, `NtSetInformationProcess` |
-| `bin/arapuca.rs` | `libc::prctl`, `libc::execve` |
+| `bridge.rs` | Netlink socket/send/recv for loopback, `OwnedFd::from_raw_fd` |
+| `bin/arapuca.rs` | `libc::prctl`, `libc::execve`, `libc::fork`, `close_range`, `poll`, `read` |
 
 ## Building
 
@@ -469,6 +473,7 @@ src/
 ├── cgroup.rs           # Cgroups v2 manager (Linux)
 ├── netns.rs            # Network namespace probe (Linux)
 ├── audit.rs            # Structured audit events, sink trait, context
+├── bridge.rs           # Netns proxy bridge: loopback, relay, seccomp
 ├── env.rs              # Minimal environment, temp dirs, path utils
 ├── diskquota.rs        # Disk usage monitoring
 ├── process.rs          # Sandboxed process lifecycle
