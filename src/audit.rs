@@ -202,6 +202,7 @@ pub enum SandboxLayer {
     NoNewPrivs,
     EnvFilter,
     FdSanitization,
+    ProxyBridge,
     // macOS
     Seatbelt,
     MemoryMonitor,
@@ -226,6 +227,10 @@ pub enum LayerDetail {
     },
     Cgroup {
         path: String,
+    },
+    ProxyBridge {
+        port: u16,
+        uds_path: String,
     },
     Other(String),
 }

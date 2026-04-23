@@ -238,6 +238,41 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
     env
 }
 
+/// Fixed port for the proxy bridge TCP listener. The bridge runs
+/// inside an isolated network namespace where port conflicts are
+/// impossible. Used by both `bridge_env()` and the audit layer.
+pub const BRIDGE_PORT: u16 = 18080;
+
+/// Build the `ARAPUCA_PROXY_BRIDGE` env var for the wrapper binary.
+///
+/// Returns `Some((key, value))` when both `use_netns` is true and
+/// `proxy_socket` is set. The value format is `<port>:<socket_path>`.
+/// Returns `None` if the bridge should not be activated, or an error
+/// if the socket path contains a colon (which would break parsing).
+pub fn bridge_env(
+    use_netns: bool,
+    proxy_socket: Option<&std::path::Path>,
+) -> crate::Result<Option<(String, String)>> {
+    let Some(socket) = proxy_socket else {
+        return Ok(None);
+    };
+    if !use_netns {
+        return Ok(None);
+    }
+
+    let socket_str = socket.to_string_lossy();
+    if socket_str.contains(':') {
+        return Err(crate::Error::Validation(format!(
+            "proxy socket path must not contain colons: {socket_str}"
+        )));
+    }
+
+    Ok(Some((
+        "ARAPUCA_PROXY_BRIDGE".into(),
+        format!("{BRIDGE_PORT}:{socket_str}"),
+    )))
+}
+
 /// Create a temporary directory with a random suffix.
 ///
 /// Uses the `tempfile` crate which calls `mkdtemp` on Unix (mode 0700,
@@ -458,5 +493,37 @@ mod tests {
         let paths = vec![PathBuf::from("/no-such-parent-xyz/child")];
         let result = canonicalize_paths(&paths);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn bridge_env_both_set() {
+        let result = bridge_env(true, Some(Path::new("/tmp/proxy.sock"))).unwrap();
+        let (key, value) = result.unwrap();
+        assert_eq!(key, "ARAPUCA_PROXY_BRIDGE");
+        assert_eq!(value, format!("{BRIDGE_PORT}:/tmp/proxy.sock"));
+    }
+
+    #[test]
+    fn bridge_env_no_netns() {
+        let result = bridge_env(false, Some(Path::new("/tmp/proxy.sock"))).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn bridge_env_no_socket() {
+        let result = bridge_env(true, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn bridge_env_neither_set() {
+        let result = bridge_env(false, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn bridge_env_colon_in_path() {
+        let result = bridge_env(true, Some(Path::new("/tmp/bad:path.sock")));
+        assert!(result.is_err());
     }
 }

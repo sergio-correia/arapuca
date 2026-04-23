@@ -352,8 +352,14 @@ fn fork_bridge(audit_fd: Option<i32>) -> Option<u16> {
         }
     };
 
-    if poll_ret <= 0 {
+    if poll_ret == 0 {
         eprintln!("arapuca: bridge: readiness timeout (5s)");
+        // SAFETY: child_pid is a valid PID from fork.
+        unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        std::process::exit(1);
+    }
+    if poll_ret < 0 {
+        eprintln!("arapuca: bridge: poll: {}", std::io::Error::last_os_error());
         // SAFETY: child_pid is a valid PID from fork.
         unsafe { libc::kill(child_pid, libc::SIGKILL) };
         std::process::exit(1);

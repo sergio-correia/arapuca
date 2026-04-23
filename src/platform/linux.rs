@@ -213,6 +213,46 @@ impl Sandbox for Linux {
             ));
         }
 
+        // Configure the proxy bridge when netns + proxy socket are
+        // both set. The wrapper binary forks a TCP-to-UDS relay child.
+        // The library only configures the env var here — the actual
+        // bridge fork and readiness confirmation happen inside the
+        // wrapper binary. The binary emits its own audit event on
+        // successful bridge startup.
+        match crate::env::bridge_env(cfg.profile.use_netns, cfg.network_proxy_socket.as_deref()) {
+            Ok(Some(kv)) => {
+                env_vars.push(kv);
+                if let Some(ref ctx) = audit_ctx {
+                    ctx.emit(AuditEvent::LayerApplied {
+                        timestamp: ctx.timestamp(),
+                        layer: SandboxLayer::ProxyBridge,
+                        detail: Some(LayerDetail::ProxyBridge {
+                            port: crate::env::BRIDGE_PORT,
+                            uds_path: cfg
+                                .network_proxy_socket
+                                .as_ref()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        }),
+                    })?;
+                }
+                applied_layers.push(SandboxLayer::ProxyBridge);
+            }
+            Ok(None) => {
+                if let Some(ref ctx) = audit_ctx {
+                    ctx.emit(AuditEvent::LayerSkipped {
+                        timestamp: ctx.timestamp(),
+                        layer: SandboxLayer::ProxyBridge,
+                        reason: SkipReason::NotConfigured,
+                    })?;
+                }
+                skipped_layers.push(SandboxLayer::ProxyBridge);
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+
         // Append caller-supplied env vars (filtered for safety).
         let filter_result = crate::env::filter_caller_env(&cfg.env);
         env_vars.extend(filter_result.passed);
