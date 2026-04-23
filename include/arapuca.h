@@ -9,6 +9,18 @@
 #include <stdlib.h>
 
 /**
+ * Current schema version. Incremented only for breaking changes.
+ */
+#define arapuca_SCHEMA_VERSION 1
+
+/**
+ * Fixed port for the proxy bridge TCP listener. The bridge runs
+ * inside an isolated network namespace where port conflicts are
+ * impossible. Used by both `bridge_env()` and the audit layer.
+ */
+#define arapuca_BRIDGE_PORT 18080
+
+/**
  * Opaque launch config.
  */
 typedef struct arapuca_ArapucaConfig arapuca_ArapucaConfig;
@@ -27,6 +39,8 @@ typedef struct arapuca_ArapucaProfile arapuca_ArapucaProfile;
  * Opaque sandbox handle (platform-specific, type-erased).
  */
 typedef struct arapuca_ArapucaSandbox arapuca_ArapucaSandbox;
+
+typedef struct arapuca_Option_ArapucaAuditCallback arapuca_Option_ArapucaAuditCallback;
 
 /**
  * Resource usage statistics from cgroups v2.
@@ -100,6 +114,32 @@ void arapuca_profile_set_max_file_size_mb(struct arapuca_ArapucaProfile *profile
  * `profile` must be a valid pointer.
  */
 void arapuca_profile_set_netns(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
+ * Set micro-VM isolation on a profile with a distro image source.
+ *
+ * After this call, launching with this profile creates a VM instead
+ * of a process-level sandbox. Requires the `microvm` feature.
+ *
+ * # Safety
+ * `profile` and `distro`/`version` must be valid pointers.
+ */
+int32_t arapuca_profile_set_isolation_microvm(struct arapuca_ArapucaProfile *profile,
+                                              const char *distro,
+                                              const char *version,
+                                              uint32_t cpus,
+                                              uint32_t mem_mb);
+
+/**
+ * Set micro-VM isolation on a profile with an explicit image path.
+ *
+ * # Safety
+ * `profile` and `image_path` must be valid pointers.
+ */
+int32_t arapuca_profile_set_isolation_microvm_path(struct arapuca_ArapucaProfile *profile,
+                                                   const char *image_path,
+                                                   uint32_t cpus,
+                                                   uint32_t mem_mb);
 
 /**
  * Free a profile. Safe to call with NULL.
@@ -223,6 +263,23 @@ int32_t arapuca_config_set_network_proxy(struct arapuca_ArapucaConfig *cfg, cons
 int32_t arapuca_config_add_env(struct arapuca_ArapucaConfig *cfg,
                                const char *key,
                                const char *value);
+
+/**
+ * Set an audit callback on a config. Requires the `serde` feature.
+ *
+ * The callback receives JSON-serialized audit events during the
+ * sandbox lifecycle. See `ArapucaAuditCallback` for the safety
+ * contract.
+ *
+ * Returns 0 on success, -1 on error.
+ *
+ * # Safety
+ * `cfg` must be a valid pointer. `cb` must be a valid function pointer.
+ * `user_data` must remain valid until `arapuca_process_cleanup()`.
+ */
+int32_t arapuca_config_set_audit_callback(struct arapuca_ArapucaConfig *cfg,
+                                          struct arapuca_Option_ArapucaAuditCallback cb,
+                                          void *user_data);
 
 /**
  * Free a config. Safe to call with NULL.
@@ -377,5 +434,23 @@ bool arapuca_netns_available(void);
  * the same thread. Caller must NOT free it.
  */
 const char *arapuca_last_error(void);
+
+/**
+ * Check whether micro-VM isolation is available on this system.
+ *
+ * Returns true if KVM and qemu-img are available.
+ */
+bool arapuca_microvm_available(void);
+
+/**
+ * Pull (download and cache) a micro-VM image.
+ *
+ * Returns the cached image path as a string. Caller MUST free
+ * with `arapuca_free_string()`. Returns NULL on error.
+ *
+ * # Safety
+ * `distro` and `version` must be valid null-terminated strings.
+ */
+char *arapuca_image_pull(const char *distro, const char *version);
 
 #endif  /* ARAPUCA_H */

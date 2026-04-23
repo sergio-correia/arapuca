@@ -217,6 +217,100 @@ pub unsafe extern "C" fn arapuca_profile_set_netns(profile: *mut ArapucaProfile,
     }
 }
 
+/// Set micro-VM isolation on a profile with a distro image source.
+///
+/// After this call, launching with this profile creates a VM instead
+/// of a process-level sandbox. Requires the `microvm` feature.
+///
+/// # Safety
+/// `profile` and `distro`/`version` must be valid pointers.
+#[cfg(feature = "microvm")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_isolation_microvm(
+    profile: *mut ArapucaProfile,
+    distro: *const c_char,
+    version: *const c_char,
+    cpus: u32,
+    mem_mb: u32,
+) -> i32 {
+    clear_error();
+    let Some(profile) = (unsafe { profile.as_mut() }) else {
+        set_error("null profile pointer");
+        return -1;
+    };
+    let Some(inner) = profile.inner.as_mut() else {
+        set_error("profile already freed");
+        return -1;
+    };
+    let distro = match unsafe { validate_cstr(distro) } {
+        Ok(s) => s,
+        Err(msg) => {
+            set_error(&msg);
+            return -1;
+        }
+    };
+    let version = match unsafe { validate_cstr(version) } {
+        Ok(s) => s,
+        Err(msg) => {
+            set_error(&msg);
+            return -1;
+        }
+    };
+    if cpus == 0 || mem_mb == 0 {
+        set_error("cpus and mem_mb must be non-zero");
+        return -1;
+    }
+    inner.isolation = crate::Isolation::MicroVm(crate::MicroVmConfig {
+        image: crate::ImageSource::Distro {
+            name: distro,
+            version,
+        },
+        cpus,
+        mem_mb,
+    });
+    0
+}
+
+/// Set micro-VM isolation on a profile with an explicit image path.
+///
+/// # Safety
+/// `profile` and `image_path` must be valid pointers.
+#[cfg(feature = "microvm")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_isolation_microvm_path(
+    profile: *mut ArapucaProfile,
+    image_path: *const c_char,
+    cpus: u32,
+    mem_mb: u32,
+) -> i32 {
+    clear_error();
+    let Some(profile) = (unsafe { profile.as_mut() }) else {
+        set_error("null profile pointer");
+        return -1;
+    };
+    let Some(inner) = profile.inner.as_mut() else {
+        set_error("profile already freed");
+        return -1;
+    };
+    let path = match unsafe { validate_cstr(image_path) } {
+        Ok(s) => s,
+        Err(msg) => {
+            set_error(&msg);
+            return -1;
+        }
+    };
+    if cpus == 0 || mem_mb == 0 {
+        set_error("cpus and mem_mb must be non-zero");
+        return -1;
+    }
+    inner.isolation = crate::Isolation::MicroVm(crate::MicroVmConfig {
+        image: crate::ImageSource::Path(PathBuf::from(path)),
+        cpus,
+        mem_mb,
+    });
+    0
+}
+
 /// Free a profile. Safe to call with NULL.
 ///
 /// # Safety
@@ -1024,6 +1118,77 @@ unsafe fn set_config_string(
     };
     setter(inner, s);
     0
+}
+
+// ─── Micro-VM API ──────────────────────────────────────────────────
+
+/// Check whether micro-VM isolation is available on this system.
+///
+/// Returns true if KVM and qemu-img are available.
+#[cfg(feature = "microvm")]
+#[unsafe(no_mangle)]
+pub extern "C" fn arapuca_microvm_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::MicroVm::new()
+            .and_then(|vm| {
+                use crate::platform::Sandbox;
+                vm.available()
+            })
+            .is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Pull (download and cache) a micro-VM image.
+///
+/// Returns the cached image path as a string. Caller MUST free
+/// with `arapuca_free_string()`. Returns NULL on error.
+///
+/// # Safety
+/// `distro` and `version` must be valid null-terminated strings.
+#[cfg(feature = "microvm")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_image_pull(
+    distro: *const c_char,
+    version: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    let distro = match unsafe { validate_cstr(distro) } {
+        Ok(s) => s,
+        Err(msg) => {
+            set_error(&msg);
+            return std::ptr::null_mut();
+        }
+    };
+    let version = match unsafe { validate_cstr(version) } {
+        Ok(s) => s,
+        Err(msg) => {
+            set_error(&msg);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let source = crate::ImageSource::Distro {
+        name: distro,
+        version,
+    };
+    match crate::images::resolve(&source) {
+        Ok(cached) => match CString::new(cached.path.to_string_lossy().as_bytes()) {
+            Ok(cs) => cs.into_raw(),
+            Err(e) => {
+                set_error(&format!("path encoding: {e}"));
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_error(&format!("{e}"));
+            std::ptr::null_mut()
+        }
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
