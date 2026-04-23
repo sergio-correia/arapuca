@@ -5,7 +5,7 @@
 //! Linux-only.
 
 use std::io;
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -435,26 +435,29 @@ pub fn relay(tcp: TcpStream, uds_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Listen on TCP and relay each connection to a UDS.
+/// Accept connections on a pre-bound TCP listener and relay each
+/// to a UDS.
 ///
 /// Enforces [`MAX_CONNECTIONS`] concurrent connection limit. Sends
-/// a single readiness byte on `ready_fd` once the listener is
-/// bound. Runs until the process is killed (via pdeathsig).
+/// a single readiness byte on `ready_fd` once the accept loop is
+/// ready. Runs until the process is killed (via pdeathsig).
 ///
-/// # Errors
+/// The listener must already be bound — this function only accepts,
+/// it does not bind. This allows the caller to bind before applying
+/// seccomp (which does not allow `bind`/`listen`).
 ///
-/// Returns an error if the listener cannot be bound or the
-/// readiness signal cannot be sent.
 /// # Safety
 ///
 /// `ready_fd` must be a valid, open file descriptor for a pipe write
 /// end that the caller owns. It will be closed after the readiness
 /// byte is sent.
-pub fn listen_and_relay(addr: SocketAddr, uds_path: &Path, ready_fd: RawFd) -> io::Result<()> {
+///
+/// # Errors
+///
+/// Returns an error if the readiness signal cannot be sent.
+pub fn listen_and_relay(listener: TcpListener, uds_path: &Path, ready_fd: RawFd) -> io::Result<()> {
     // SAFETY: caller guarantees ready_fd is a valid, owned pipe write end.
     let ready = unsafe { OwnedFd::from_raw_fd(ready_fd) };
-
-    let listener = TcpListener::bind(addr)?;
 
     // Signal readiness to the parent.
     // SAFETY: ready is valid (owned), writing a single byte to a pipe.
@@ -582,8 +585,7 @@ mod tests {
             }
         });
 
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let tcp_listener = TcpListener::bind(addr).unwrap();
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bound_addr = tcp_listener.local_addr().unwrap();
 
         let active = Arc::new(AtomicUsize::new(0));
