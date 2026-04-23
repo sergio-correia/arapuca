@@ -641,6 +641,9 @@ fn vm_run(args: &[String]) {
         }
     };
 
+    // Forward SIGINT/SIGTERM to the VM child for graceful shutdown.
+    install_signal_forwarder(process.pid() as i32);
+
     // Wait with optional timeout. The done flag prevents the
     // timer thread from killing a recycled PID after the VM exits.
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -667,6 +670,7 @@ fn vm_run(args: &[String]) {
 
     let status = process.wait();
     done.store(true, std::sync::atomic::Ordering::Release);
+    VM_PID.store(0, std::sync::atomic::Ordering::Release);
 
     let exit_code = match status {
         Ok(s) => {
@@ -692,6 +696,51 @@ fn vm_run(args: &[String]) {
 
     process.cleanup();
     std::process::exit(exit_code);
+}
+
+#[cfg(all(feature = "microvm", unix))]
+static VM_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Install signal handlers that forward SIGINT/SIGTERM to the VM
+/// child process. First signal sends SIGTERM for graceful shutdown;
+/// second signal sends SIGKILL.
+#[cfg(all(feature = "microvm", unix))]
+fn install_signal_forwarder(child_pid: i32) {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
+
+    VM_PID.store(child_pid, Ordering::Release);
+
+    extern "C" fn handler(_sig: libc::c_int) {
+        let pid = VM_PID.load(Ordering::Acquire);
+        if pid <= 0 {
+            return;
+        }
+        let count = SIGNAL_COUNT.fetch_add(1, Ordering::AcqRel);
+        if count == 0 {
+            // First signal: SIGTERM for graceful shutdown.
+            // SAFETY: pid is a valid child PID, SIGTERM is safe.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        } else {
+            // Second signal: SIGKILL.
+            // SAFETY: pid is a valid child PID.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+
+    // Use sigaction instead of signal to avoid handler-reset-on-
+    // delivery (System V semantics). sigaction keeps the handler
+    // installed across invocations.
+    // SAFETY: handler is async-signal-safe (only atomics + kill).
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        let handler_ptr: extern "C" fn(libc::c_int) = handler;
+        sa.sa_sigaction = handler_ptr as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+    }
 }
 
 #[cfg(all(feature = "microvm", target_os = "linux"))]
