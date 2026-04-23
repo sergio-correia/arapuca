@@ -24,6 +24,7 @@ thiserror = "2"
 
 [features]
 serde = ["dep:serde", "dep:serde_json"]
+microvm = []
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -5,9 +5,46 @@ use std::sync::Arc;
 
 use crate::audit::{AuditSink, AuditVerbosity};
 
+/// Isolation level for a sandboxed process.
+#[derive(Debug, Clone, Default)]
+pub enum Isolation {
+    /// Process-level sandbox (Landlock, seccomp, cgroups, netns).
+    #[default]
+    Process,
+    /// Micro-VM sandbox (libkrun). Strongest isolation — the
+    /// subprocess runs inside a lightweight virtual machine with
+    /// its own kernel. Requires the `microvm` feature.
+    MicroVm(MicroVmConfig),
+}
+
+/// Configuration for micro-VM isolation.
+///
+/// No `Default` — the caller must explicitly choose the image,
+/// CPU count, and memory allocation.
+#[derive(Debug, Clone)]
+pub struct MicroVmConfig {
+    /// Image to boot.
+    pub image: ImageSource,
+    /// Number of vCPUs.
+    pub cpus: u32,
+    /// RAM in MB.
+    pub mem_mb: u32,
+}
+
+/// Source for a micro-VM root filesystem image.
+#[derive(Debug, Clone)]
+pub enum ImageSource {
+    /// Absolute path to a qcow2 file.
+    Path(PathBuf),
+    /// Distro specifier resolved via built-in or external providers.
+    Distro { name: String, version: String },
+}
+
 /// Filesystem and resource restrictions for a sandboxed process.
 #[derive(Debug, Clone, Default)]
 pub struct Profile {
+    /// Isolation level. Defaults to process-level sandbox.
+    pub isolation: Isolation,
     /// Allowed read-only paths (canonicalized).
     pub read_paths: Vec<PathBuf>,
     /// Allowed read-write paths (canonicalized).
