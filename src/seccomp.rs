@@ -244,7 +244,7 @@ pub(crate) fn summary() -> SeccompSummary {
 }
 
 /// Determine the target architecture for seccompiler.
-fn target_arch() -> crate::Result<TargetArch> {
+pub(crate) fn target_arch() -> crate::Result<TargetArch> {
     #[cfg(target_arch = "x86_64")]
     {
         Ok(TargetArch::x86_64)

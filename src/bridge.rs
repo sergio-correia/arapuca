@@ -157,6 +157,234 @@ pub fn loopback_up() -> io::Result<()> {
 const MAX_CONNECTIONS: usize = 64;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Thread-creation flags required by glibc/musl for `pthread_create`.
+const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
+    | libc::CLONE_FS
+    | libc::CLONE_FILES
+    | libc::CLONE_SIGHAND
+    | libc::CLONE_THREAD) as u64;
+
+/// Apply a minimal default-deny seccomp filter for the bridge process.
+///
+/// Only syscalls needed for TCP accept, UDS connect, bidirectional
+/// relay, and thread management are allowed. Everything else kills
+/// the process. This prevents a compromised bridge from being used
+/// as a seccomp-free pivot.
+///
+/// `clone` is restricted to require thread-creation flags (the flags
+/// must be present, though BPF cannot prevent additional flags from
+/// also being set — defense-in-depth, not a hard guarantee).
+/// `clone3` returns `ENOSYS` to force glibc fallback to `clone`
+/// (where the flag filter applies). `socket` is restricted to
+/// `AF_UNIX` only — the TCP listener is already bound pre-seccomp.
+/// `mprotect` denies `PROT_EXEC` to block code injection.
+///
+/// # Preconditions
+///
+/// The TCP listener must already be bound before calling this
+/// function, since `bind` and `listen` are not in the allowlist.
+///
+/// # Errors
+///
+/// Returns an error if the filter cannot be built or installed.
+pub fn apply_bridge_seccomp() -> crate::Result<()> {
+    let (clone3_prog, main_prog) = build_bridge_filters()?;
+
+    // Install clone3 ENOSYS filter first. Seccomp filter stacking:
+    // last installed is checked first, and the kernel takes the
+    // most restrictive action across all filters.
+    seccompiler::apply_filter(&clone3_prog)
+        .map_err(|e| crate::Error::Seccomp(format!("install clone3 filter: {e}")))?;
+
+    seccompiler::apply_filter(&main_prog)
+        .map_err(|e| crate::Error::Seccomp(format!("install bridge filter: {e}")))?;
+
+    log::info!("bridge seccomp: filter applied");
+    Ok(())
+}
+
+/// Build two BPF programs:
+/// 1. clone3 → ENOSYS (forces glibc fallback to clone)
+/// 2. main allowlist (everything else)
+fn build_bridge_filters() -> crate::Result<(seccompiler::BpfProgram, seccompiler::BpfProgram)> {
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+    };
+    use std::collections::HashMap;
+
+    let arch = crate::seccomp::target_arch()?;
+
+    let mut allow: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+
+    // I/O: accept, connect, relay, shutdown.
+    for nr in [
+        libc::SYS_accept4,
+        libc::SYS_connect,
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_writev,
+        libc::SYS_recvfrom,
+        libc::SYS_sendto,
+        libc::SYS_close,
+        libc::SYS_shutdown,
+        libc::SYS_poll,
+        libc::SYS_ppoll,
+        libc::SYS_epoll_wait,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_create1,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // Thread management.
+    for nr in [
+        libc::SYS_futex,
+        libc::SYS_set_robust_list,
+        libc::SYS_sched_yield,
+        libc::SYS_gettid,
+        libc::SYS_getpid,
+        libc::SYS_tgkill,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // clone: require thread-creation flags to be present.
+    let clone_rule = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(CLONE_THREAD_FLAGS),
+            CLONE_THREAD_FLAGS,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("clone condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("clone rule: {e}")))?;
+    allow.insert(libc::SYS_clone, vec![clone_rule]);
+
+    // clone3: must be in the main allowlist (→ Allow) so the
+    // stacked clone3 filter's Errno(ENOSYS) wins via seccomp's
+    // most-restrictive-action rule. Without this, the main
+    // filter's KillProcess mismatch would override the ENOSYS.
+    allow.insert(libc::SYS_clone3, vec![]);
+
+    // Memory management.
+    for nr in [
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_brk,
+        libc::SYS_mremap,
+        libc::SYS_madvise,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // mprotect: deny PROT_EXEC (arg2 must NOT have bit 0x4 set).
+    let mprotect_rule = SeccompRule::new(vec![
+        SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(libc::PROT_EXEC as u64),
+            0,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("mprotect condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("mprotect rule: {e}")))?;
+    allow.insert(libc::SYS_mprotect, vec![mprotect_rule]);
+
+    // Signals.
+    for nr in [
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // Process lifecycle.
+    for nr in [libc::SYS_exit, libc::SYS_exit_group] {
+        allow.insert(nr, vec![]);
+    }
+
+    // socket: only AF_UNIX. The TCP listener is already bound
+    // pre-seccomp; the bridge only needs AF_UNIX for connecting
+    // to the UDS proxy. Blocking AF_INET/AF_INET6 prevents the
+    // bridge from being used as a network pivot.
+    let socket_unix_rule = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_UNIX as u64,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("socket condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("socket rule: {e}")))?;
+    allow.insert(libc::SYS_socket, vec![socket_unix_rule]);
+
+    // Misc (needed by glibc/Rust runtime).
+    for nr in [
+        libc::SYS_getrandom,
+        libc::SYS_clock_gettime,
+        libc::SYS_clock_nanosleep,
+        libc::SYS_nanosleep,
+        libc::SYS_setsockopt,
+        libc::SYS_getsockopt,
+        libc::SYS_fcntl,
+        libc::SYS_prlimit64,
+        libc::SYS_rseq,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // clone3: return ENOSYS to force glibc fallback to clone
+    // (where our flag filter applies). Allowing clone3 would let
+    // the bridge create processes with arbitrary namespace flags,
+    // since BPF cannot inspect the clone_args struct pointer.
+    // glibc handles ENOSYS gracefully — it retries with clone.
+    //
+    // This is a separate filter because seccompiler only supports
+    // one match action per filter. Seccomp filter stacking applies
+    // the most restrictive action, so:
+    //   - clone3 → ENOSYS (from this filter)
+    //   - allowlisted syscalls → Allow (from the main filter)
+    //   - everything else → KillProcess (from the main filter)
+    let mut clone3_deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    clone3_deny.insert(libc::SYS_clone3, vec![]);
+
+    let clone3_filter = SeccompFilter::new(
+        clone3_deny.into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )
+    .map_err(|e| crate::Error::Seccomp(format!("build clone3 filter: {e}")))?;
+
+    let clone3_prog: seccompiler::BpfProgram =
+        clone3_filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| {
+                crate::Error::Seccomp(format!("compile clone3 filter: {e}"))
+            })?;
+
+    // Main allowlist filter.
+    //   mismatch_action = KillProcess (unknown syscalls → kill)
+    //   match_action    = Allow       (listed syscalls → allow)
+    let filter = SeccompFilter::new(
+        allow.into_iter().collect(),
+        SeccompAction::KillProcess,
+        SeccompAction::Allow,
+        arch,
+    )
+    .map_err(|e| crate::Error::Seccomp(format!("build bridge filter: {e}")))?;
+
+    let main_prog = filter.try_into().map_err(|e: seccompiler::BackendError| {
+        crate::Error::Seccomp(format!("compile bridge filter: {e}"))
+    })?;
+
+    Ok((clone3_prog, main_prog))
+}
+
 /// Relay bytes bidirectionally between a TCP stream and a Unix
 /// domain stream socket.
 ///
@@ -271,6 +499,13 @@ pub fn listen_and_relay(addr: SocketAddr, uds_path: &Path, ready_fd: RawFd) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_seccomp_filters_build() {
+        let (clone3_prog, main_prog) = build_bridge_filters().unwrap();
+        assert!(!clone3_prog.is_empty());
+        assert!(!main_prog.is_empty());
+    }
 
     #[test]
     fn loopback_up_smoke_test() {
