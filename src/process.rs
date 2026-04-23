@@ -49,6 +49,10 @@ pub struct Process {
     /// Saved DACLs for restoration during cleanup.
     #[cfg(windows)]
     pub(crate) saved_dacls: Vec<crate::platform::windows::SavedDacl>,
+    /// Passt network proxy handle (micro-VM only). Kept alive for
+    /// the VM's lifetime; killed on cleanup/drop.
+    #[cfg(all(target_os = "linux", feature = "microvm"))]
+    pub(crate) passt: Option<crate::platform::microvm_net::PasstHandle>,
     /// Audit context for emitting lifecycle events.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) audit_ctx: Option<AuditContext>,

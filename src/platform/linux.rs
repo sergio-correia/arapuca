@@ -543,6 +543,8 @@ impl Sandbox for Linux {
             tmp_dir,
             cgroup_path,
             cgroup_mgr: self.cgroup_mgr.clone(),
+            #[cfg(feature = "microvm")]
+            passt: None,
             audit_ctx,
             final_stats: None,
         })

@@ -169,8 +169,23 @@ impl Sandbox for MicroVm {
             })?;
         }
 
+        // Start networking if allowed (use_netns=false means allow network).
+        let passt = if !cfg.profile.use_netns {
+            match super::microvm_net::start_passt() {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    log::warn!("passt not available, VM will have no network: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let net_fd = passt.as_ref().map(|p| p.parent_fd);
+
         // Fork and launch the VM in the child.
-        launch_vm(
+        let mut process = launch_vm(
             vm_cfg,
             &overlay_path,
             &ci_dir,
@@ -178,9 +193,15 @@ impl Sandbox for MicroVm {
             &cfg.profile.read_paths,
             &cfg.profile.write_paths,
             &cfg.env,
+            net_fd,
             &tmp_dir,
             audit_ctx,
-        )
+        )?;
+
+        // Store passt in the Process for deterministic cleanup.
+        process.passt = passt;
+
+        Ok(process)
     }
 
     fn available(&self) -> crate::Result<()> {
@@ -218,6 +239,7 @@ fn launch_vm(
     read_paths: &[PathBuf],
     write_paths: &[PathBuf],
     env: &[(String, String)],
+    net_fd: Option<i32>,
     tmp_dir: &std::path::Path,
     audit_ctx: Option<AuditContext>,
 ) -> crate::Result<Process> {
@@ -241,6 +263,7 @@ fn launch_vm(
             read_paths,
             write_paths,
             env,
+            net_fd,
         );
     }
 
@@ -259,6 +282,7 @@ fn launch_vm(
         cgroup_path: None,
         #[cfg(target_os = "linux")]
         cgroup_mgr: None,
+        passt: None,
         audit_ctx,
         final_stats: None,
     })
@@ -266,6 +290,7 @@ fn launch_vm(
 
 /// Execute the VM in the current process (called from the forked child).
 /// This function never returns — it replaces the process with the VM.
+#[allow(clippy::too_many_arguments)]
 fn exec_vm(
     vm_cfg: &MicroVmConfig,
     overlay_path: &std::path::Path,
@@ -274,6 +299,7 @@ fn exec_vm(
     read_paths: &[PathBuf],
     write_paths: &[PathBuf],
     env: &[(String, String)],
+    net_fd: Option<i32>,
 ) -> ! {
     if let Err(e) = exec_vm_inner(
         vm_cfg,
@@ -283,6 +309,7 @@ fn exec_vm(
         read_paths,
         write_paths,
         env,
+        net_fd,
     ) {
         eprintln!("arapuca: microvm: {e}");
     }
@@ -290,6 +317,7 @@ fn exec_vm(
     unsafe { libc::_exit(1) }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_vm_inner(
     vm_cfg: &MicroVmConfig,
     overlay_path: &std::path::Path,
@@ -298,6 +326,7 @@ fn exec_vm_inner(
     read_paths: &[PathBuf],
     write_paths: &[PathBuf],
     env: &[(String, String)],
+    net_fd: Option<i32>,
 ) -> crate::Result<()> {
     // SAFETY: all krun_sys calls operate on a context ID and take
     // C strings. The context is process-local (this is the forked
@@ -384,6 +413,24 @@ fn exec_vm_inner(
         let ret = unsafe { krun_sys::krun_add_virtiofs(ctx, tag.as_ptr(), host.as_ptr()) };
         if ret < 0 {
             return Err(Error::MicroVm(format!("krun_add_virtiofs (rw{i}) failed")));
+        }
+    }
+
+    // Configure networking if a passt FD was provided.
+    if let Some(fd) = net_fd {
+        let mut mac = super::microvm_net::random_mac();
+        let ret = unsafe {
+            krun_sys::krun_add_net_unixstream(
+                ctx,
+                std::ptr::null(),
+                fd,
+                mac.as_mut_ptr(),
+                krun_sys::COMPAT_NET_FEATURES,
+                0,
+            )
+        };
+        if ret < 0 {
+            return Err(Error::MicroVm("krun_add_net_unixstream failed".into()));
         }
     }
 

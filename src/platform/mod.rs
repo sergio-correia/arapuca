@@ -17,6 +17,8 @@ mod darwin;
 mod linux;
 #[cfg(all(target_os = "linux", feature = "microvm"))]
 mod microvm;
+#[cfg(all(target_os = "linux", feature = "microvm"))]
+pub(crate) mod microvm_net;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod other;
 #[cfg(target_os = "windows")]
