@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use crate::ResourceUsage;
-use crate::audit::AuditContext;
+use crate::audit::{AuditContext, AuditEvent};
 
 /// A running sandboxed subprocess.
 pub struct Process {
@@ -40,10 +40,8 @@ pub struct Process {
     #[cfg(windows)]
     pub(crate) saved_dacls: Vec<crate::platform::windows::SavedDacl>,
     /// Audit context for emitting lifecycle events.
-    #[allow(dead_code)]
     pub(crate) audit_ctx: Option<AuditContext>,
     /// Resource stats captured in wait() while cgroup still exists.
-    #[allow(dead_code)]
     pub(crate) final_stats: Option<ResourceUsage>,
 }
 
@@ -63,9 +61,46 @@ impl Process {
     /// Wait for the process to exit and return the exit status.
     #[cfg(not(windows))]
     pub fn wait(&mut self) -> crate::Result<std::process::ExitStatus> {
-        self.child
+        let pid = self.child.id();
+        let status = self
+            .child
             .wait()
-            .map_err(|e| crate::Error::Process(format!("wait: {e}")))
+            .map_err(|e| crate::Error::Process(format!("wait: {e}")))?;
+
+        // Capture stats while cgroup still exists (before cleanup
+        // destroys it). Eliminates the TOCTOU gap.
+        self.final_stats = Some(self.resource_stats());
+        let oom = self.oom_count();
+
+        if let Some(ref ctx) = self.audit_ctx {
+            use std::os::unix::process::ExitStatusExt;
+            // Post-exit: can't abort, so discard mandatory emit errors.
+            if let Err(e) = ctx.emit(AuditEvent::ProcessExited {
+                timestamp: ctx.timestamp(),
+                pid,
+                exit_code: status.code(),
+                signal: status.signal(),
+                oom_kill_count: oom,
+            }) {
+                log::error!("audit emit failed: {e}");
+            }
+
+            if let Some(ref stats) = self.final_stats {
+                if let Err(e) = ctx.emit(AuditEvent::ResourceUsage {
+                    timestamp: ctx.timestamp(),
+                    memory_current_bytes: stats.memory_current_bytes,
+                    memory_peak_bytes: stats.memory_peak_bytes,
+                    cpu_seconds: stats.cpu_usage_seconds,
+                    pid_count: stats.pid_count,
+                    io_read_bytes: stats.io_read_bytes,
+                    io_write_bytes: stats.io_write_bytes,
+                }) {
+                    log::error!("audit emit failed: {e}");
+                }
+            }
+        }
+
+        Ok(status)
     }
 
     /// Wait for the process to exit and return the exit status.
@@ -103,7 +138,22 @@ impl Process {
             )));
         }
 
-        Ok(std::process::ExitStatus::from_raw(exit_code))
+        let status = std::process::ExitStatus::from_raw(exit_code);
+        let pid = self.process_id;
+
+        if let Some(ref ctx) = self.audit_ctx {
+            if let Err(e) = ctx.emit(AuditEvent::ProcessExited {
+                timestamp: ctx.timestamp(),
+                pid,
+                exit_code: Some(exit_code as i32),
+                signal: None,
+                oom_kill_count: 0,
+            }) {
+                log::error!("audit emit failed: {e}");
+            }
+        }
+
+        Ok(status)
     }
 
     /// Read resource usage from the agent's cgroup.
@@ -134,23 +184,51 @@ impl Process {
     ///
     /// Must only be called after `wait()` returns.
     pub fn cleanup(self) {
+        let mut cgroup_destroyed = false;
         #[cfg(target_os = "linux")]
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
-            let _ = mgr.destroy(path);
+            cgroup_destroyed = mgr.destroy(path).is_ok();
         }
+
+        #[cfg(windows)]
+        let mut dacls_restored = true;
+        #[cfg(windows)]
+        let mut container_deleted = false;
         #[cfg(windows)]
         {
             for saved in &self.saved_dacls {
                 if let Err(e) = crate::platform::windows::restore_dacl(saved) {
                     log::warn!("failed to restore DACL: {e}");
+                    dacls_restored = false;
                 }
             }
             if let Some(ref name) = self.container_name {
-                let _ = crate::platform::windows::delete_app_container(name);
+                container_deleted = crate::platform::windows::delete_app_container(name).is_ok();
             }
         }
-        if self.tmp_dir.exists() {
-            let _ = std::fs::remove_dir_all(&self.tmp_dir);
+
+        let tmpdir_removed = if self.tmp_dir.exists() {
+            std::fs::remove_dir_all(&self.tmp_dir).is_ok()
+        } else {
+            true
+        };
+
+        if let Some(ref ctx) = self.audit_ctx {
+            if let Err(e) = ctx.emit(AuditEvent::SandboxCleanup {
+                timestamp: ctx.timestamp(),
+                cgroup_destroyed,
+                tmpdir_removed,
+                #[cfg(windows)]
+                dacls_restored: Some(dacls_restored),
+                #[cfg(not(windows))]
+                dacls_restored: None,
+                #[cfg(windows)]
+                container_deleted: Some(container_deleted),
+                #[cfg(not(windows))]
+                container_deleted: None,
+            }) {
+                log::error!("audit emit failed: {e}");
+            }
         }
     }
 }
