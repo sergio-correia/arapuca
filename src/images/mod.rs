@@ -4,10 +4,12 @@
 //! resolution for micro-VM root filesystem images.
 
 pub mod cache;
+pub mod cloudinit;
 #[cfg(feature = "microvm")]
 pub mod download;
 pub mod fedora;
 pub mod metadata;
+pub mod overlay;
 pub mod provider;
 
 pub use cache::CachedImage;
