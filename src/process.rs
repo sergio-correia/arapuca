@@ -184,6 +184,7 @@ impl Process {
     ///
     /// Must only be called after `wait()` returns.
     pub fn cleanup(self) {
+        #[allow(unused_mut)]
         let mut cgroup_destroyed = false;
         #[cfg(target_os = "linux")]
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
