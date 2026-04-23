@@ -112,11 +112,21 @@ impl Sandbox for MicroVm {
             .as_ref()
             .map(|v| v.iter().map(|s| s.as_str()).collect());
 
+        let wf_refs: Vec<crate::images::cloudinit::WriteFile<'_>> = vm_cfg
+            .write_files
+            .iter()
+            .map(|gf| crate::images::cloudinit::WriteFile {
+                path: &gf.path,
+                content: &gf.content,
+                permissions: gf.permissions.as_deref(),
+            })
+            .collect();
+
         let ci_cfg = crate::images::cloudinit::CloudInitConfig {
             hostname: &cfg.task_id,
             user: "agent",
             virtiofs_mounts: mount_refs,
-            write_files: vec![],
+            write_files: wf_refs,
             runcmd: runcmd_refs,
         };
 

@@ -36,7 +36,9 @@ mod validate;
 pub use process::Process;
 
 pub use error::Error;
-pub use profile::{Config, ImageSource, Isolation, MicroVmConfig, Profile, ResourceUsage};
+pub use profile::{
+    Config, GuestFile, ImageSource, Isolation, MicroVmConfig, Profile, ResourceUsage,
+};
 pub use validate::{reject_cgroup_paths, sanitize_task_id};
 
 /// Result type for arapuca operations.

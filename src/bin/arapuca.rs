@@ -482,9 +482,6 @@ fn vm_run(args: &[String]) {
                     eprintln!("invalid --write-file: {spec} (expected host:guest)");
                     std::process::exit(125);
                 }
-                // TODO: plumb write_files through to cloud-init
-                // generation in MicroVm::launch(). For now, warn.
-                eprintln!("warning: --write-file is not yet wired to the VM launch path");
             }
             "--timeout" => {
                 i += 1;
@@ -567,11 +564,31 @@ fn vm_run(args: &[String]) {
 
     let task = task_id.unwrap_or_else(|| format!("vm-{}", std::process::id()));
 
+    // Read host files and build GuestFile entries.
+    let guest_files: Vec<arapuca::GuestFile> = write_files
+        .iter()
+        .map(|(host, guest)| {
+            let content = match std::fs::read_to_string(host) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("arapuca: cannot read {host}: {e}");
+                    std::process::exit(125);
+                }
+            };
+            arapuca::GuestFile {
+                path: guest.clone(),
+                content,
+                permissions: None,
+            }
+        })
+        .collect();
+
     let profile = arapuca::Profile {
         isolation: arapuca::Isolation::MicroVm(arapuca::MicroVmConfig {
             image: image_source,
             cpus,
             mem_mb,
+            write_files: guest_files,
         }),
         read_paths,
         write_paths,

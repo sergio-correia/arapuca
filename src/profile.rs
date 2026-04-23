@@ -39,6 +39,20 @@ pub struct MicroVmConfig {
     pub cpus: u32,
     /// RAM in MB.
     pub mem_mb: u32,
+    /// Files to inject into the guest via cloud-init write_files.
+    /// Each entry: (guest_path, content, optional permissions).
+    pub write_files: Vec<GuestFile>,
+}
+
+/// A file to inject into a micro-VM guest.
+#[derive(Debug, Clone)]
+pub struct GuestFile {
+    /// Absolute path in the guest.
+    pub path: String,
+    /// File content.
+    pub content: String,
+    /// File permissions (e.g., "0644"). Defaults to "0644" if None.
+    pub permissions: Option<String>,
 }
 
 /// Source for a micro-VM root filesystem image.

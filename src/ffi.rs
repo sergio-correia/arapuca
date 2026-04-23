@@ -267,6 +267,7 @@ pub unsafe extern "C" fn arapuca_profile_set_isolation_microvm(
         },
         cpus,
         mem_mb,
+        write_files: vec![],
     });
     0
 }
@@ -307,6 +308,7 @@ pub unsafe extern "C" fn arapuca_profile_set_isolation_microvm_path(
         image: crate::ImageSource::Path(PathBuf::from(path)),
         cpus,
         mem_mb,
+        write_files: vec![],
     });
     0
 }
