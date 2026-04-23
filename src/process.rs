@@ -40,8 +40,10 @@ pub struct Process {
     #[cfg(windows)]
     pub(crate) saved_dacls: Vec<crate::platform::windows::SavedDacl>,
     /// Audit context for emitting lifecycle events.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) audit_ctx: Option<AuditContext>,
     /// Resource stats captured in wait() while cgroup still exists.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) final_stats: Option<ResourceUsage>,
 }
 
