@@ -109,7 +109,7 @@ impl Sandbox for Linux {
         }
 
         // Append caller-supplied env vars (filtered for safety).
-        env_vars.extend(crate::env::filter_caller_env(&cfg.env));
+        env_vars.extend(crate::env::filter_caller_env(&cfg.env).passed);
 
         command.env_clear();
         for (k, v) in &env_vars {

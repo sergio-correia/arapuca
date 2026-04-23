@@ -873,7 +873,7 @@ fn rollback_appcontainer(
 }
 
 fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = crate::env::filter_caller_env(&cfg.env);
+    let mut env: Vec<(String, String)> = crate::env::filter_caller_env(&cfg.env).passed;
 
     if let Some(ref proxy) = cfg.network_proxy_socket {
         env.push((

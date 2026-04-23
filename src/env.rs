@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::audit::{DropReason, DroppedEnvVar};
+
 /// Construct a minimal environment for a sandboxed subprocess.
 ///
 /// Only includes HOME, TMPDIR, PATH, and LANG. This prevents
@@ -21,6 +23,14 @@ pub fn minimal_env(tmp_dir: &Path) -> Vec<(String, String)> {
     ]
 }
 
+/// Result of filtering caller-supplied environment variables.
+pub struct FilterResult {
+    /// Variables that passed the filter.
+    pub passed: Vec<(String, String)>,
+    /// Variables that were dropped, with the reason for each.
+    pub dropped: Vec<DroppedEnvVar>,
+}
+
 /// Filter caller-supplied env vars, dropping dangerous entries.
 ///
 /// Drops vars that could subvert sandbox confinement:
@@ -32,32 +42,63 @@ pub fn minimal_env(tmp_dir: &Path) -> Vec<(String, String)> {
 /// - Interpreter injection: `BASH_ENV`, `ENV`, `PYTHONPATH`,
 ///   `PYTHONSTARTUP`, `NODE_OPTIONS`, `PERL5OPT`, `PERL5LIB`
 /// - `COMSPEC`, `PSModulePath`, `PATHEXT` — Windows shell/exec injection
-pub fn filter_caller_env(env: &[(String, String)]) -> Vec<(String, String)> {
-    const BLOCKED_PREFIXES: &[&str] = &[
-        "ARAPUCA_", "LD_", "DYLD_", "COR_", "CORECLR_", "DOTNET_", "COMPLUS_",
-    ];
-    const BLOCKED_NAMES: &[&str] = &[
-        "AGENT_NETWORK_PROXY",
-        "BASH_ENV",
-        "ENV",
-        "PYTHONPATH",
-        "PYTHONSTARTUP",
-        "NODE_OPTIONS",
-        "PERL5OPT",
-        "PERL5LIB",
-        "COMSPEC",
-        "PSModulePath",
-        "PATHEXT",
-        "__COMPAT_LAYER",
-    ];
+pub fn filter_caller_env(env: &[(String, String)]) -> FilterResult {
+    let mut passed = Vec::new();
+    let mut dropped = Vec::new();
 
-    env.iter()
-        .filter(|(k, _)| {
-            !BLOCKED_PREFIXES.iter().any(|p| k.starts_with(p))
-                && !BLOCKED_NAMES.contains(&k.as_str())
-        })
-        .cloned()
-        .collect()
+    for (k, v) in env {
+        if let Some(reason) = drop_reason(k) {
+            dropped.push(DroppedEnvVar {
+                key: k.clone(),
+                reason,
+            });
+        } else {
+            passed.push((k.clone(), v.clone()));
+        }
+    }
+
+    FilterResult { passed, dropped }
+}
+
+fn drop_reason(key: &str) -> Option<DropReason> {
+    if key.starts_with("ARAPUCA_") {
+        return Some(DropReason::ArapucaPrefix);
+    }
+    if key == "AGENT_NETWORK_PROXY" {
+        return Some(DropReason::LauncherReserved);
+    }
+    if key.starts_with("LD_") {
+        return Some(DropReason::LdPrefix);
+    }
+    if key.starts_with("DYLD_") {
+        return Some(DropReason::DyldPrefix);
+    }
+    if key.starts_with("COR_")
+        || key.starts_with("CORECLR_")
+        || key.starts_with("DOTNET_")
+        || key.starts_with("COMPLUS_")
+    {
+        return Some(DropReason::DotnetPrefix);
+    }
+    if key == "__COMPAT_LAYER" {
+        return Some(DropReason::WindowsShimInjection);
+    }
+    if matches!(
+        key,
+        "BASH_ENV"
+            | "ENV"
+            | "PYTHONPATH"
+            | "PYTHONSTARTUP"
+            | "NODE_OPTIONS"
+            | "PERL5OPT"
+            | "PERL5LIB"
+    ) {
+        return Some(DropReason::InterpreterInjection);
+    }
+    if matches!(key, "COMSPEC" | "PSModulePath" | "PATHEXT") {
+        return Some(DropReason::ShellInjection);
+    }
+    None
 }
 
 /// Create a temporary directory for the sandbox.
@@ -261,7 +302,10 @@ mod tests {
     #[test]
     fn filter_drops_arapuca_prefix() {
         let env = vec![("ARAPUCA_READ_PATHS".into(), "/".into())];
-        assert!(filter_caller_env(&env).is_empty());
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert_eq!(result.dropped.len(), 1);
+        assert_eq!(result.dropped[0].reason, DropReason::ArapucaPrefix);
     }
 
     #[test]
@@ -270,13 +314,23 @@ mod tests {
             ("LD_PRELOAD".into(), "/evil.so".into()),
             ("LD_LIBRARY_PATH".into(), "/tmp".into()),
         ];
-        assert!(filter_caller_env(&env).is_empty());
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert_eq!(result.dropped.len(), 2);
+        assert!(
+            result
+                .dropped
+                .iter()
+                .all(|d| d.reason == DropReason::LdPrefix)
+        );
     }
 
     #[test]
     fn filter_drops_dyld_prefix() {
         let env = vec![("DYLD_INSERT_LIBRARIES".into(), "/evil.dylib".into())];
-        assert!(filter_caller_env(&env).is_empty());
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert_eq!(result.dropped[0].reason, DropReason::DyldPrefix);
     }
 
     #[test]
@@ -294,13 +348,22 @@ mod tests {
             .iter()
             .map(|k| (k.to_string(), "malicious".into()))
             .collect();
-        assert!(filter_caller_env(&env).is_empty());
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert!(
+            result
+                .dropped
+                .iter()
+                .all(|d| d.reason == DropReason::InterpreterInjection)
+        );
     }
 
     #[test]
     fn filter_drops_agent_network_proxy() {
         let env = vec![("AGENT_NETWORK_PROXY".into(), "/tmp/evil.sock".into())];
-        assert!(filter_caller_env(&env).is_empty());
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert_eq!(result.dropped[0].reason, DropReason::LauncherReserved);
     }
 
     #[test]
@@ -309,18 +372,74 @@ mod tests {
             ("MY_TOKEN".into(), "secret123".into()),
             ("JIRA_URL".into(), "https://jira.example.com".into()),
         ];
-        let filtered = filter_caller_env(&env);
-        assert_eq!(filtered.len(), 2);
-        assert_eq!(filtered[0].0, "MY_TOKEN");
-        assert_eq!(filtered[1].0, "JIRA_URL");
+        let result = filter_caller_env(&env);
+        assert_eq!(result.passed.len(), 2);
+        assert_eq!(result.passed[0].0, "MY_TOKEN");
+        assert_eq!(result.passed[1].0, "JIRA_URL");
+        assert!(result.dropped.is_empty());
     }
 
     #[test]
     fn filter_preserves_value_with_equals() {
         let env = vec![("CONFIG".into(), "key=value=extra".into())];
-        let filtered = filter_caller_env(&env);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].1, "key=value=extra");
+        let result = filter_caller_env(&env);
+        assert_eq!(result.passed.len(), 1);
+        assert_eq!(result.passed[0].1, "key=value=extra");
+    }
+
+    #[test]
+    fn filter_drops_dotnet_prefix() {
+        let env = vec![
+            ("DOTNET_EnableDiagnostics".into(), "1".into()),
+            ("CORECLR_PROFILER".into(), "evil".into()),
+            ("COR_ENABLE_PROFILING".into(), "1".into()),
+            ("COMPLUS_ForceENC".into(), "1".into()),
+        ];
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert!(
+            result
+                .dropped
+                .iter()
+                .all(|d| d.reason == DropReason::DotnetPrefix)
+        );
+    }
+
+    #[test]
+    fn filter_drops_shell_injection() {
+        let env = vec![
+            ("COMSPEC".into(), "cmd.exe".into()),
+            ("PATHEXT".into(), ".exe".into()),
+        ];
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert!(
+            result
+                .dropped
+                .iter()
+                .all(|d| d.reason == DropReason::ShellInjection)
+        );
+    }
+
+    #[test]
+    fn filter_drops_compat_layer() {
+        let env = vec![("__COMPAT_LAYER".into(), "RunAsInvoker".into())];
+        let result = filter_caller_env(&env);
+        assert!(result.passed.is_empty());
+        assert_eq!(result.dropped[0].reason, DropReason::WindowsShimInjection);
+    }
+
+    #[test]
+    fn filter_mixed_pass_and_drop() {
+        let env = vec![
+            ("SAFE_VAR".into(), "ok".into()),
+            ("LD_PRELOAD".into(), "/evil.so".into()),
+            ("ANOTHER_SAFE".into(), "ok".into()),
+        ];
+        let result = filter_caller_env(&env);
+        assert_eq!(result.passed.len(), 2);
+        assert_eq!(result.dropped.len(), 1);
+        assert_eq!(result.dropped[0].key, "LD_PRELOAD");
     }
 
     #[test]
