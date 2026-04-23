@@ -74,6 +74,12 @@ be bypassed from userspace.
 - **Environment hardening** — dangerous variables (`ARAPUCA_*`,
   `LD_*`, `DYLD_*`, `.NET`/`COR_*` prefixes, interpreter injection
   vectors, Windows shell variables) are filtered before exec
+- **Structured audit events** — optional, zero-cost-when-unused event
+  emission via a caller-supplied sink. Covers the full sandbox lifecycle:
+  which layers were applied or skipped, env filtering decisions,
+  filesystem/network/seccomp policy, resource usage, and cleanup status.
+  Enables compliance (SOC 2, FedRAMP AU-3), SIEM integration, and
+  forensic reconstruction of sandbox posture
 
 ## Quick Start
 
@@ -431,6 +437,9 @@ cargo build --release --target x86_64-unknown-linux-musl
 # Run tests
 cargo test
 
+# Build with JSON audit callback support (FFI consumers)
+cargo build --release --features serde
+
 # Lint
 cargo clippy -- -D warnings
 cargo fmt --check
@@ -459,10 +468,11 @@ src/
 ├── rlimit.rs           # POSIX resource limits
 ├── cgroup.rs           # Cgroups v2 manager (Linux)
 ├── netns.rs            # Network namespace probe (Linux)
+├── audit.rs            # Structured audit events, sink trait, context
 ├── env.rs              # Minimal environment, temp dirs, path utils
 ├── diskquota.rs        # Disk usage monitoring
 ├── process.rs          # Sandboxed process lifecycle
-├── ffi.rs              # C ABI exports
+├── ffi.rs              # C ABI exports (+ audit callback behind serde)
 ├── platform/
 │   ├── mod.rs          # Sandbox trait + factory
 │   ├── linux.rs        # Linux sandbox (Landlock + seccomp + cgroups)
