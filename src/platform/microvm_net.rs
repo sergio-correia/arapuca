@@ -6,7 +6,18 @@
 
 use std::io;
 use std::os::unix::io::IntoRawFd;
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// Guest network configuration parsed from passt's DHCP output.
+#[allow(dead_code)]
+pub(crate) struct NetworkInfo {
+    pub guest_ip: String,
+    pub router_ip: String,
+    pub dns_servers: Vec<String>,
+}
 
 /// A running passt network proxy.
 pub(crate) struct PasstHandle {
@@ -14,12 +25,9 @@ pub(crate) struct PasstHandle {
     pub child: Child,
     /// Parent end of the socket pair — passed to libkrun.
     pub parent_fd: i32,
-    /// Guest IP address (parsed from passt DHCP output).
+    /// Guest network info (IPs parsed from passt DHCP output).
     #[allow(dead_code)]
-    pub guest_ip: String,
-    /// Router/gateway IP address.
-    #[allow(dead_code)]
-    pub router_ip: String,
+    pub net_info: NetworkInfo,
 }
 
 impl Drop for PasstHandle {
@@ -64,8 +72,23 @@ pub(crate) fn start_passt() -> io::Result<PasstHandle> {
         .arg(child_fd.to_string())
         .arg("--foreground")
         .arg("-4")
+        .arg("--no-map-gw")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+
+    // Clear CLOEXEC on child_fd in the child process so passt
+    // inherits it across exec. Done via pre_exec (not parent-side
+    // fcntl) to avoid leaking the FD if another thread forks
+    // concurrently — important since arapuca is also a library.
+    // SAFETY: fcntl is async-signal-safe; child_fd is valid.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fcntl(child_fd, libc::F_SETFD, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
     let mut child = cmd.spawn().map_err(|e| {
         // SAFETY: both FDs are valid.
@@ -83,21 +106,36 @@ pub(crate) fn start_passt() -> io::Result<PasstHandle> {
         }
     })?;
 
-    // Close the child end in the parent — passt inherited it.
+    // Close the child end in the parent — passt inherited it
+    // (CLOEXEC was cleared in pre_exec).
     // SAFETY: child_fd is valid.
     unsafe { libc::close(child_fd) };
 
-    // Parse DHCP info from passt's stderr with a timeout.
-    let (guest_ip, router_ip) = match child.stderr.take() {
-        Some(stderr) => parse_dhcp_info(stderr),
-        None => ("192.168.127.2".into(), "192.168.127.1".into()),
+    // Parse DHCP info from passt's stderr with a wall-clock timeout.
+    let net_info = match child.stderr.take() {
+        Some(stderr) => match parse_dhcp_info(stderr) {
+            Ok(info) => info,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // SAFETY: parent_fd is valid.
+                unsafe { libc::close(parent_fd) };
+                return Err(e);
+            }
+        },
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            // SAFETY: parent_fd is valid.
+            unsafe { libc::close(parent_fd) };
+            return Err(io::Error::other("passt stderr not available"));
+        }
     };
 
     Ok(PasstHandle {
         child,
         parent_fd,
-        guest_ip,
-        router_ip,
+        net_info,
     })
 }
 
@@ -116,18 +154,44 @@ pub(crate) fn random_mac() -> [u8; 6] {
 }
 
 /// Parse guest and router IPs from passt's DHCP stderr output.
-fn parse_dhcp_info(stderr: std::process::ChildStderr) -> (String, String) {
-    use std::io::BufRead;
+///
+/// Uses a wall-clock timeout to avoid blocking indefinitely if
+/// passt hangs. Both IPs are validated as IPv4 addresses to
+/// prevent injection when embedded in the guest init script.
+fn parse_dhcp_info(stderr: std::process::ChildStderr) -> io::Result<NetworkInfo> {
+    let (tx, rx) = mpsc::channel();
 
-    let reader = std::io::BufReader::new(stderr);
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_dhcp_info_inner(stderr));
+    });
+
+    rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "passt DHCP info not received within 5s",
+        )
+    })?
+}
+
+/// Blocking inner parser — runs in a dedicated thread.
+///
+/// Parses the DHCP section (assign/router) and DNS section
+/// (nameserver IPs) from passt's stderr startup output.
+fn parse_dhcp_info_inner(stderr: std::process::ChildStderr) -> io::Result<NetworkInfo> {
+    use std::io::BufRead;
+    use std::net::Ipv4Addr;
+
+    let reader = io::BufReader::new(stderr);
     let mut guest_ip: Option<String> = None;
     let mut router_ip: Option<String> = None;
+    let mut dns_servers: Vec<String> = Vec::new();
     let mut in_dhcp = false;
+    let mut in_dns = false;
+    let mut done_dhcp = false;
+    let mut done_dns = false;
 
-    // Bound by line count — passt's startup output is small.
-    // If we don't find both IPs in 50 lines, fall back to defaults.
     for (i, line_result) in reader.lines().enumerate() {
-        if i > 50 {
+        if i > 50 || (done_dhcp && done_dns) {
             break;
         }
         let line = match line_result {
@@ -135,30 +199,71 @@ fn parse_dhcp_info(stderr: std::process::ChildStderr) -> (String, String) {
             Err(_) => break,
         };
 
+        let trimmed = line.trim();
+
         if line.contains("DHCP:") {
             in_dhcp = true;
-        } else if in_dhcp {
-            let trimmed = line.trim();
+            in_dns = false;
+            continue;
+        }
+        if line.contains("DNS:") {
+            in_dns = true;
+            in_dhcp = false;
+            done_dhcp = guest_ip.is_some() && router_ip.is_some();
+            continue;
+        }
+
+        // A non-indented line ends the current section.
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            if in_dhcp {
+                done_dhcp = true;
+            }
+            if in_dns {
+                done_dns = true;
+            }
+            in_dhcp = false;
+            in_dns = false;
+            continue;
+        }
+
+        if in_dhcp {
             if trimmed.starts_with("assign:") {
-                if let Some(ip) = trimmed.split(':').nth(1) {
-                    guest_ip = Some(ip.trim().to_string());
+                if let Some(raw) = trimmed.split(':').nth(1) {
+                    let ip: Ipv4Addr = raw.trim().parse().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid guest IP from passt: {}", raw.trim()),
+                        )
+                    })?;
+                    guest_ip = Some(ip.to_string());
                 }
             } else if trimmed.starts_with("router:") {
-                if let Some(ip) = trimmed.split(':').nth(1) {
-                    router_ip = Some(ip.trim().to_string());
+                if let Some(raw) = trimmed.split(':').nth(1) {
+                    let ip: Ipv4Addr = raw.trim().parse().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid router IP from passt: {}", raw.trim()),
+                        )
+                    })?;
+                    router_ip = Some(ip.to_string());
                 }
             }
-            if guest_ip.is_some() && router_ip.is_some() {
-                break;
-            }
-            if trimmed.is_empty() {
-                in_dhcp = false;
+        } else if in_dns {
+            if let Ok(ip) = trimmed.parse::<Ipv4Addr>() {
+                dns_servers.push(ip.to_string());
             }
         }
     }
 
-    (
-        guest_ip.unwrap_or_else(|| "192.168.127.2".into()),
-        router_ip.unwrap_or_else(|| "192.168.127.1".into()),
-    )
+    match (guest_ip, router_ip) {
+        (Some(g), Some(r)) => Ok(NetworkInfo {
+            guest_ip: g,
+            router_ip: r,
+            dns_servers,
+        }),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "passt did not provide both guest and router IPs",
+        )),
+    }
 }
