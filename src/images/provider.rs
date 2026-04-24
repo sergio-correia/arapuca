@@ -70,6 +70,10 @@ pub fn resolve_external(distro: &str, version: &str) -> io::Result<CachedImage> 
     })?;
 
     let arch = std::env::consts::ARCH;
+    eprintln!(
+        "resolving {distro} {version} ({arch}) via {}...",
+        provider.display()
+    );
 
     let output = Command::new(&provider)
         .args(["--resolve", version, arch])

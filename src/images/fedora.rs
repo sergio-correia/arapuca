@@ -37,8 +37,10 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
         return Ok(cached);
     }
 
+    eprintln!("resolving fedora {version} ({arch})...");
     let filename = discover_image_filename(version, arch)?;
     let url = format!("{}{filename}", images_dir_url(version, arch));
+    eprintln!("downloading {filename} (this may take a while)...");
 
     let dir = super::cache::images_dir()?;
     let tmp_path = dir.join(format!("{cache_name}.qcow2.partial"));
@@ -46,11 +48,15 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
     // Clean up partial file on all exit paths.
     let result = (|| {
         super::download::fetch_to_file(&url, &tmp_path)?;
+        eprintln!("caching image...");
         let metadata = fedora_metadata();
         super::cache::store(&cache_name, &tmp_path, &metadata)
     })();
 
     let _ = std::fs::remove_file(&tmp_path);
+    if result.is_ok() {
+        eprintln!("done");
+    }
     result
 }
 
