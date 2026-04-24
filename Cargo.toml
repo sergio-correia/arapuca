@@ -24,7 +24,7 @@ thiserror = "2"
 
 [features]
 serde = ["dep:serde", "dep:serde_json"]
-microvm = ["dep:reqwest", "dep:krun-sys"]
+microvm = ["dep:reqwest", "dep:krun-sys", "dep:openssl"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -48,6 +48,7 @@ seccompiler = "0.5"
 krun-sys = { version = "1.10", optional = true }
 
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false, optional = true }
+openssl = { version = "0.10", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"

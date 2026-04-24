@@ -173,6 +173,7 @@ mod tests {
                 fstype: "ext4".into(),
                 mount_options: None,
                 init: "/sbin/init".into(),
+                sha256: None,
             };
 
             let cached = store("fedora-43-x86_64", &src, &meta).unwrap();
@@ -204,6 +205,7 @@ mod tests {
                 fstype: "ext4".into(),
                 mount_options: None,
                 init: "/sbin/init".into(),
+                sha256: None,
             };
             store("to-remove", &src, &meta).unwrap();
 
@@ -239,6 +241,7 @@ mod tests {
                 fstype: "ext4".into(),
                 mount_options: None,
                 init: "/sbin/init".into(),
+                sha256: None,
             };
             store("alpha", &src, &meta).unwrap();
             store("beta", &src, &meta).unwrap();

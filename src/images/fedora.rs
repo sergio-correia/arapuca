@@ -37,18 +37,53 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
     }
 
     eprintln!("resolving fedora {version} ({arch})...");
-    let filename = discover_image_filename(version, arch)?;
-    let url = format!("{}{filename}", images_dir_url(version, arch));
-    eprintln!("downloading {filename} (this may take a while)...");
+    let (filename, checksum_name) = discover_image_and_checksum(version, arch)?;
+    let base_url = images_dir_url(version, arch);
+    let url = format!("{base_url}{filename}");
+    eprintln!("downloading {filename}...");
 
     let dir = super::cache::images_dir()?;
     let tmp_path = dir.join(format!("{cache_name}.qcow2.partial"));
 
     // Clean up partial file on all exit paths.
     let result = (|| {
-        super::download::fetch_to_file(&url, &tmp_path)?;
+        let sha256 = super::download::fetch_to_file(&url, &tmp_path)?;
+
+        // Verify checksum against the mirror's CHECKSUM file.
+        if let Some(ref cksum_file) = checksum_name {
+            let cksum_url = format!("{base_url}{cksum_file}");
+            match super::download::fetch_text(&cksum_url, 1024 * 1024) {
+                Ok(body) => match super::download::parse_checksum(&body, &filename) {
+                    Some(expected) => {
+                        if sha256 != expected {
+                            return Err(io::Error::other(format!(
+                                "checksum mismatch for {filename}: \
+                                 expected {expected}, got {sha256}"
+                            )));
+                        }
+                        eprintln!("checksum verified (sha256:{sha256})");
+                        eprintln!(
+                            "warning: PGP signature not checked \
+                             — image authenticity is not confirmed"
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "warning: CHECKSUM file found but no SHA256 entry for {filename}"
+                        );
+                    }
+                },
+                Err(e) => {
+                    eprintln!("warning: could not fetch CHECKSUM file: {e}");
+                }
+            }
+        } else {
+            eprintln!("warning: no CHECKSUM file found on mirror");
+        }
+
         eprintln!("caching image...");
-        let metadata = fedora_metadata();
+        let mut metadata = fedora_metadata();
+        metadata.sha256 = Some(sha256);
         super::cache::store(&cache_name, &tmp_path, &metadata)
     })();
 
@@ -59,51 +94,48 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
     result
 }
 
-/// Discover the actual qcow2 filename from the Fedora mirror.
+/// Discover the qcow2 image and CHECKSUM filenames from the Fedora
+/// mirror directory listing.
 ///
 /// The build suffix (e.g., `-1.1`, `-1.14`) and filename format
 /// change between releases, so we scrape the mirror directory
 /// listing rather than hardcoding the suffix.
 #[cfg(feature = "microvm")]
-fn discover_image_filename(version: &str, arch: &str) -> std::io::Result<String> {
+fn discover_image_and_checksum(
+    version: &str,
+    arch: &str,
+) -> std::io::Result<(String, Option<String>)> {
     use std::io;
 
     let dir_url = images_dir_url(version, arch);
+    let body = super::download::fetch_text(&dir_url, 1024 * 1024)?;
 
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| io::Error::other(format!("HTTP client: {e}")))?;
+    let mut image_name = None;
+    let mut checksum_name = None;
 
-    let response = client
-        .get(&dir_url)
-        .send()
-        .map_err(|e| io::Error::other(format!("GET {dir_url}: {e}")))?;
-
-    if !response.status().is_success() {
-        return Err(io::Error::other(format!(
-            "GET {dir_url}: HTTP {}",
-            response.status()
-        )));
-    }
-
-    let body = response
-        .text()
-        .map_err(|e| io::Error::other(format!("reading {dir_url}: {e}")))?;
-
-    // Look for the Generic cloud image filename in the HTML.
     let pattern = "Fedora-Cloud-Base-Generic";
     for segment in body.split('"') {
-        if segment.contains(pattern) && segment.ends_with(".qcow2") && !segment.contains('/') {
-            return Ok(segment.to_string());
+        if segment.contains('/') {
+            continue;
+        }
+        if image_name.is_none() && segment.contains(pattern) && segment.ends_with(".qcow2") {
+            image_name = Some(segment.to_string());
+        }
+        if checksum_name.is_none() && segment.ends_with("-CHECKSUM") {
+            checksum_name = Some(segment.to_string());
+        }
+        if image_name.is_some() && checksum_name.is_some() {
+            break;
         }
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("no Fedora Cloud Base Generic qcow2 found at {dir_url}"),
-    ))
+    match image_name {
+        Some(name) => Ok((name, checksum_name)),
+        None => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no Fedora Cloud Base Generic qcow2 found at {dir_url}"),
+        )),
+    }
 }
 
 /// Base URL for the Fedora cloud images directory.
@@ -121,6 +153,7 @@ pub fn fedora_metadata() -> ImageMetadata {
         fstype: FEDORA_FSTYPE.into(),
         mount_options: Some("subvol=root".into()),
         init: "/sbin/init".into(),
+        sha256: None,
     }
 }
 

@@ -14,6 +14,8 @@ pub struct ImageMetadata {
     pub mount_options: Option<String>,
     /// Init binary to execute (e.g., "/sbin/init").
     pub init: String,
+    /// SHA256 hex digest of the qcow2 file (for integrity verification).
+    pub sha256: Option<String>,
 }
 
 impl ImageMetadata {
@@ -46,10 +48,11 @@ impl ImageMetadata {
                 json_escape(opts)
             ));
         }
-        json.push_str(&format!(
-            ",\n  \"init\": \"{}\"\n}}\n",
-            json_escape(&self.init)
-        ));
+        json.push_str(&format!(",\n  \"init\": \"{}\"", json_escape(&self.init)));
+        if let Some(ref hash) = self.sha256 {
+            json.push_str(&format!(",\n  \"sha256\": \"{}\"", json_escape(hash)));
+        }
+        json.push_str("\n}\n");
         std::fs::write(meta_path, json)
     }
 }
@@ -77,11 +80,14 @@ fn parse_metadata_json(json: &str) -> Result<ImageMetadata, String> {
     let fstype = extract_json_string(json, "fstype").ok_or("missing \"fstype\" field")?;
     let mount_options = extract_json_string(json, "mount_options");
     let init = extract_json_string(json, "init").unwrap_or_else(|| "/sbin/init".to_string());
+    let sha256 = extract_json_string(json, "sha256")
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()));
     Ok(ImageMetadata {
         root_device,
         fstype,
         mount_options,
         init,
+        sha256,
     })
 }
 
@@ -151,6 +157,7 @@ mod tests {
             fstype: "xfs".into(),
             mount_options: None,
             init: "/sbin/init".into(),
+            sha256: None,
         };
         meta.save_sidecar(&qcow2).unwrap();
 
@@ -159,6 +166,29 @@ mod tests {
         assert_eq!(loaded.fstype, "xfs");
         assert!(loaded.mount_options.is_none());
         assert_eq!(loaded.init, "/sbin/init");
+    }
+
+    #[test]
+    fn sidecar_round_trip_with_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let qcow2 = dir.path().join("test.qcow2");
+        std::fs::write(&qcow2, b"fake").unwrap();
+
+        let hash = "e401a4db2e5e04d1967b6729774faa96da629bcf3ba90b67d8d9cce9906bec0f";
+        let meta = ImageMetadata {
+            root_device: "/dev/vda4".into(),
+            fstype: "btrfs".into(),
+            mount_options: Some("subvol=root".into()),
+            init: "/sbin/init".into(),
+            sha256: Some(hash.into()),
+        };
+        meta.save_sidecar(&qcow2).unwrap();
+
+        let loaded = ImageMetadata::load_sidecar(&qcow2).unwrap();
+        assert_eq!(loaded.sha256.as_deref(), Some(hash));
+        assert_eq!(loaded.root_device, "/dev/vda4");
+        assert_eq!(loaded.fstype, "btrfs");
+        assert_eq!(loaded.mount_options.as_deref(), Some("subvol=root"));
     }
 
     #[test]
