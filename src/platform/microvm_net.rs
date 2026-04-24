@@ -12,7 +12,6 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 /// Guest network configuration parsed from passt's DHCP output.
-#[allow(dead_code)]
 pub(crate) struct NetworkInfo {
     pub guest_ip: String,
     pub router_ip: String,
@@ -26,7 +25,6 @@ pub(crate) struct PasstHandle {
     /// Parent end of the socket pair — passed to libkrun.
     pub parent_fd: i32,
     /// Guest network info (IPs parsed from passt DHCP output).
-    #[allow(dead_code)]
     pub net_info: NetworkInfo,
 }
 

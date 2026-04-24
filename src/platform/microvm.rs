@@ -15,6 +15,18 @@ use crate::audit::{
 use crate::platform::Sandbox;
 use crate::{Config, Error, Isolation, MicroVmConfig, Process};
 
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-_./=:@,+".contains(&b))
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Micro-VM sandbox implementation.
 pub struct MicroVm;
 
@@ -39,177 +51,194 @@ impl Sandbox for MicroVm {
 
         let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;
 
-        let audit_ctx = cfg
-            .audit_sink
-            .as_ref()
-            .map(|sink| AuditContext::new(Arc::clone(sink), cfg.audit_verbosity.clone()));
+        // Wrap the rest so tmp_dir is cleaned up on error.
+        let result = (|| -> crate::Result<Process> {
+            let audit_ctx = cfg
+                .audit_sink
+                .as_ref()
+                .map(|sink| AuditContext::new(Arc::clone(sink), cfg.audit_verbosity.clone()));
 
-        // Emit SandboxInit.
-        if let Some(ref ctx) = audit_ctx {
-            let args_field = match ctx.verbosity() {
-                AuditVerbosity::Verbose => {
-                    Some(args.iter().map(|a| sanitize_audit_string(a)).collect())
-                }
-                _ => None,
-            };
-            ctx.emit(AuditEvent::SandboxInit {
-                timestamp: ctx.timestamp(),
-                wall_clock_epoch_ns: ctx.wall_clock_epoch_ns(),
-                schema_version: SCHEMA_VERSION,
-                task_id: sanitize_audit_string(&cfg.task_id),
-                phase: sanitize_audit_string(&cfg.phase),
-                command: sanitize_audit_string(cmd),
-                arg_count: args.len(),
-                args: args_field,
-                principal: cfg.audit_principal.as_deref().map(sanitize_audit_string),
-                correlation_id: cfg
-                    .audit_correlation_id
-                    .as_deref()
-                    .map(sanitize_audit_string),
-            })?;
-        }
-
-        // Resolve the image.
-        let image_source =
-            cfg.profile.isolation.image_source().ok_or_else(|| {
-                Error::MicroVm("MicroVm isolation requires an image source".into())
-            })?;
-        let cached = crate::images::resolve(image_source)?;
-
-        // Create COW overlay so the template stays immutable.
-        let overlay_dir = tmp_dir.join("vm");
-        let overlay_path = crate::images::overlay::create_overlay(&cached.path, &overlay_dir)?;
-
-        // Generate cloud-init datasource.
-        let mut virtiofs_mounts = Vec::new();
-        for (i, path) in cfg.profile.read_paths.iter().enumerate() {
-            virtiofs_mounts.push((format!("ro{i}"), path.to_string_lossy().to_string(), "ro"));
-        }
-        for (i, path) in cfg.profile.write_paths.iter().enumerate() {
-            virtiofs_mounts.push((
-                format!("rw{i}"),
-                path.to_string_lossy().to_string(),
-                "defaults",
-            ));
-        }
-
-        let mount_refs: Vec<(&str, &str, &str)> = virtiofs_mounts
-            .iter()
-            .map(|(t, m, o)| (t.as_str(), m.as_str(), *o))
-            .collect();
-
-        let wf_refs: Vec<crate::images::cloudinit::WriteFile<'_>> = vm_cfg
-            .write_files
-            .iter()
-            .map(|gf| crate::images::cloudinit::WriteFile {
-                path: &gf.path,
-                content: &gf.content,
-                permissions: gf.permissions.as_deref(),
-            })
-            .collect();
-
-        let ci_cfg = crate::images::cloudinit::CloudInitConfig {
-            hostname: &cfg.task_id,
-            user: "agent",
-            virtiofs_mounts: mount_refs,
-            write_files: wf_refs,
-            runcmd: None,
-        };
-
-        let ci_dir = crate::images::cloudinit::generate_datasource(&ci_cfg, &tmp_dir)?;
-
-        // Emit audit events.
-        let mut applied_layers = Vec::new();
-        let mut skipped_layers = Vec::new();
-
-        if let Some(ref ctx) = audit_ctx {
-            ctx.emit(AuditEvent::LayerApplied {
-                timestamp: ctx.timestamp(),
-                layer: SandboxLayer::MicroVm,
-                detail: Some(LayerDetail::MicroVm {
-                    image_path: cached.path.to_string_lossy().into_owned(),
-                    cpus: vm_cfg.cpus,
-                    mem_mb: vm_cfg.mem_mb,
-                }),
-            })?;
-        }
-        applied_layers.push(SandboxLayer::MicroVm);
-
-        // Skip all process-level layers — superseded by VM isolation.
-        for layer in [
-            SandboxLayer::Landlock,
-            SandboxLayer::Seccomp,
-            SandboxLayer::Cgroup,
-            SandboxLayer::NetworkNamespace,
-            SandboxLayer::Rlimit,
-            SandboxLayer::NoNewPrivs,
-            SandboxLayer::Setsid,
-            SandboxLayer::Pdeathsig,
-            SandboxLayer::FdSanitization,
-        ] {
+            // Emit SandboxInit.
             if let Some(ref ctx) = audit_ctx {
-                ctx.emit(AuditEvent::LayerSkipped {
+                let args_field = match ctx.verbosity() {
+                    AuditVerbosity::Verbose => {
+                        Some(args.iter().map(|a| sanitize_audit_string(a)).collect())
+                    }
+                    _ => None,
+                };
+                ctx.emit(AuditEvent::SandboxInit {
                     timestamp: ctx.timestamp(),
-                    layer: layer.clone(),
-                    reason: SkipReason::PlatformUnsupported,
+                    wall_clock_epoch_ns: ctx.wall_clock_epoch_ns(),
+                    schema_version: SCHEMA_VERSION,
+                    task_id: sanitize_audit_string(&cfg.task_id),
+                    phase: sanitize_audit_string(&cfg.phase),
+                    command: sanitize_audit_string(cmd),
+                    arg_count: args.len(),
+                    args: args_field,
+                    principal: cfg.audit_principal.as_deref().map(sanitize_audit_string),
+                    correlation_id: cfg
+                        .audit_correlation_id
+                        .as_deref()
+                        .map(sanitize_audit_string),
                 })?;
             }
-            skipped_layers.push(layer);
-        }
 
-        if let Some(ref ctx) = audit_ctx {
-            ctx.emit(AuditEvent::SandboxReady {
-                timestamp: ctx.timestamp(),
-                applied_layers: applied_layers.clone(),
-                skipped_layers: skipped_layers.clone(),
+            // Resolve the image.
+            let image_source = cfg.profile.isolation.image_source().ok_or_else(|| {
+                Error::MicroVm("MicroVm isolation requires an image source".into())
             })?;
-        }
+            let cached = crate::images::resolve(image_source)?;
 
-        // Start networking if allowed (use_netns=false means allow network).
-        let passt = if !cfg.profile.use_netns {
-            match super::microvm_net::start_passt() {
-                Ok(handle) => Some(handle),
-                Err(e) => {
-                    log::warn!("passt not available, VM will have no network: {e}");
-                    None
+            // Create COW overlay so the template stays immutable.
+            let overlay_dir = tmp_dir.join("vm");
+            let overlay_path = crate::images::overlay::create_overlay(&cached.path, &overlay_dir)?;
+
+            // Generate cloud-init datasource.
+            let mut virtiofs_mounts = Vec::new();
+            for (i, path) in cfg.profile.read_paths.iter().enumerate() {
+                virtiofs_mounts.push((format!("ro{i}"), path.to_string_lossy().to_string(), "ro"));
+            }
+            for (i, path) in cfg.profile.write_paths.iter().enumerate() {
+                virtiofs_mounts.push((
+                    format!("rw{i}"),
+                    path.to_string_lossy().to_string(),
+                    "defaults",
+                ));
+            }
+
+            let mount_refs: Vec<(&str, &str, &str)> = virtiofs_mounts
+                .iter()
+                .map(|(t, m, o)| (t.as_str(), m.as_str(), *o))
+                .collect();
+
+            let wf_refs: Vec<crate::images::cloudinit::WriteFile<'_>> = vm_cfg
+                .write_files
+                .iter()
+                .map(|gf| crate::images::cloudinit::WriteFile {
+                    path: &gf.path,
+                    content: &gf.content,
+                    permissions: gf.permissions.as_deref(),
+                })
+                .collect();
+
+            let ci_cfg = crate::images::cloudinit::CloudInitConfig {
+                hostname: &cfg.task_id,
+                user: "agent",
+                virtiofs_mounts: mount_refs,
+                write_files: wf_refs,
+                runcmd: None,
+            };
+
+            let ci_dir = crate::images::cloudinit::generate_datasource(&ci_cfg, &tmp_dir)?;
+
+            // Emit audit events.
+            let mut applied_layers = Vec::new();
+            let mut skipped_layers = Vec::new();
+
+            if let Some(ref ctx) = audit_ctx {
+                ctx.emit(AuditEvent::LayerApplied {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::MicroVm,
+                    detail: Some(LayerDetail::MicroVm {
+                        image_path: cached.path.to_string_lossy().into_owned(),
+                        cpus: vm_cfg.cpus,
+                        mem_mb: vm_cfg.mem_mb,
+                    }),
+                })?;
+            }
+            applied_layers.push(SandboxLayer::MicroVm);
+
+            // Skip all process-level layers — superseded by VM isolation.
+            for layer in [
+                SandboxLayer::Landlock,
+                SandboxLayer::Seccomp,
+                SandboxLayer::Cgroup,
+                SandboxLayer::NetworkNamespace,
+                SandboxLayer::Rlimit,
+                SandboxLayer::NoNewPrivs,
+                SandboxLayer::Setsid,
+                SandboxLayer::Pdeathsig,
+                SandboxLayer::FdSanitization,
+            ] {
+                if let Some(ref ctx) = audit_ctx {
+                    ctx.emit(AuditEvent::LayerSkipped {
+                        timestamp: ctx.timestamp(),
+                        layer: layer.clone(),
+                        reason: SkipReason::PlatformUnsupported,
+                    })?;
                 }
+                skipped_layers.push(layer);
             }
-        } else {
-            None
-        };
 
-        let net_fd = passt.as_ref().map(|p| p.parent_fd);
+            if let Some(ref ctx) = audit_ctx {
+                ctx.emit(AuditEvent::SandboxReady {
+                    timestamp: ctx.timestamp(),
+                    applied_layers: applied_layers.clone(),
+                    skipped_layers: skipped_layers.clone(),
+                })?;
+            }
 
-        // Fork and launch the VM in the child.
-        // Build the full command string for the init script.
-        let full_cmd = if !cmd.is_empty() {
-            if args.is_empty() {
-                cmd.to_string()
+            // Start networking if allowed (use_netns=false means allow network).
+            let passt = if !cfg.profile.use_netns {
+                match super::microvm_net::start_passt() {
+                    Ok(handle) => Some(handle),
+                    Err(e) => {
+                        log::warn!("passt not available, VM will have no network: {e}");
+                        None
+                    }
+                }
             } else {
-                format!("{cmd} {}", args.join(" "))
-            }
-        } else {
-            String::new()
-        };
+                None
+            };
 
-        let mut process = launch_vm(
-            vm_cfg,
-            &overlay_path,
-            &ci_dir,
-            &cached.metadata,
-            &cfg.profile.read_paths,
-            &cfg.profile.write_paths,
-            &full_cmd,
-            &cfg.env,
-            net_fd,
-            &tmp_dir,
-            audit_ctx,
-        )?;
+            let net_fd = passt.as_ref().map(|p| p.parent_fd);
+            let net_ips = passt.as_ref().map(|p| {
+                (
+                    p.net_info.guest_ip.clone(),
+                    p.net_info.router_ip.clone(),
+                    p.net_info.dns_servers.clone(),
+                )
+            });
 
-        // Store passt in the Process for deterministic cleanup.
-        process.passt = passt;
+            // Fork and launch the VM in the child.
+            // Build the full command string for the init script.
+            // Each component is shell-quoted to prevent injection.
+            let full_cmd = if !cmd.is_empty() {
+                if args.is_empty() {
+                    shell_quote(cmd)
+                } else {
+                    let quoted_args: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
+                    format!("{} {}", shell_quote(cmd), quoted_args.join(" "))
+                }
+            } else {
+                String::new()
+            };
 
-        Ok(process)
+            let mut process = launch_vm(
+                vm_cfg,
+                &overlay_path,
+                &ci_dir,
+                &cached.metadata,
+                &cfg.profile.read_paths,
+                &cfg.profile.write_paths,
+                &full_cmd,
+                &cfg.env,
+                net_fd,
+                net_ips.as_ref(),
+                &tmp_dir,
+                audit_ctx,
+            )?;
+
+            // Store passt in the Process for deterministic cleanup.
+            process.passt = passt;
+
+            Ok(process)
+        })(); // end of tmp_dir cleanup closure
+
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+        result
     }
 
     fn available(&self) -> crate::Result<()> {
@@ -249,10 +278,15 @@ fn launch_vm(
     cmd: &str,
     env: &[(String, String)],
     net_fd: Option<i32>,
+    net_ips: Option<&(String, String, Vec<String>)>,
     tmp_dir: &std::path::Path,
     audit_ctx: Option<AuditContext>,
 ) -> crate::Result<Process> {
-    // SAFETY: single-threaded at this point.
+    // SAFETY: the passt DHCP reader thread may still be alive, but
+    // it only holds a BufReader on passt's stderr pipe and does not
+    // share mutable state with the child path. The child calls only
+    // setsid/prctl (async-signal-safe) then krun_start_enter (which
+    // replaces the process) or _exit.
     let child_pid = unsafe { libc::fork() };
 
     if child_pid < 0 {
@@ -264,6 +298,24 @@ fn launch_vm(
 
     if child_pid == 0 {
         // ── VM child ──────────────────────────────────────────
+        // Apply process-sandbox invariants: setsid, pdeathsig,
+        // NO_NEW_PRIVS, and FD sanitization.
+        // SAFETY: all calls are async-signal-safe.
+        unsafe {
+            libc::setsid();
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+            // Close all FDs except stdin/stdout/stderr and the
+            // passt parent_fd (if networking is enabled).
+            let keep_fd = net_fd.unwrap_or(-1);
+            for fd in 3..1024 {
+                if fd != keep_fd {
+                    libc::close(fd);
+                }
+            }
+        }
+
         exec_vm(
             vm_cfg,
             overlay_path,
@@ -274,6 +326,7 @@ fn launch_vm(
             cmd,
             env,
             net_fd,
+            net_ips,
         );
     }
 
@@ -311,6 +364,7 @@ fn exec_vm(
     cmd: &str,
     env: &[(String, String)],
     net_fd: Option<i32>,
+    net_ips: Option<&(String, String, Vec<String>)>,
 ) -> ! {
     if let Err(e) = exec_vm_inner(
         vm_cfg,
@@ -322,6 +376,7 @@ fn exec_vm(
         cmd,
         env,
         net_fd,
+        net_ips,
     ) {
         eprintln!("arapuca: microvm: {e}");
     }
@@ -340,6 +395,7 @@ fn exec_vm_inner(
     cmd: &str,
     env: &[(String, String)],
     net_fd: Option<i32>,
+    net_ips: Option<&(String, String, Vec<String>)>,
 ) -> crate::Result<()> {
     // SAFETY: all krun_sys calls operate on a context ID and take
     // C strings. The context is process-local (this is the forked
@@ -453,11 +509,11 @@ fn exec_vm_inner(
         }
     }
 
-    // Build an init script that mounts virtio-fs shares, writes
-    // injected files, and runs the user's command. We can't use
-    // /sbin/init (systemd) because libkrun's boot environment
-    // doesn't provide the kernel command line systemd expects.
-    let mut init_script = String::from("#!/bin/sh\n");
+    // Build an init script that mounts virtio-fs shares, configures
+    // networking, and runs the user's command. We can't use /sbin/init
+    // (systemd) because libkrun's boot environment doesn't provide the
+    // kernel command line systemd expects.
+    let mut init_script = String::from("#!/bin/sh\nset -e\n");
 
     // Mount the cloud-init data directory.
     init_script.push_str("mkdir -p /cidata && mount -t virtiofs cidata /cidata\n");
@@ -478,10 +534,26 @@ fn exec_vm_inner(
         ));
     }
 
-    // Write injected files from cloud-init data.
-    // The cloud-init user-data is at /cidata/user-data but we
-    // handle write_files directly in the init script for simplicity.
-    // (cloud-init requires systemd which we're not running.)
+    // Configure networking if passt provided guest/router IPs.
+    if let Some((guest_ip, router_ip, dns_servers)) = net_ips {
+        init_script.push_str("ip link set up dev lo\n");
+        init_script.push_str(&format!("ip addr add {guest_ip}/24 dev eth0\n"));
+        init_script.push_str("ip link set up dev eth0\n");
+        init_script.push_str(&format!("ip route add default via {router_ip}\n"));
+        init_script.push_str("rm -f /etc/resolv.conf\n");
+        if dns_servers.is_empty() {
+            init_script.push_str(&format!(
+                "echo 'nameserver {router_ip}' > /etc/resolv.conf\n"
+            ));
+        } else {
+            for (i, ns) in dns_servers.iter().enumerate() {
+                let redir = if i == 0 { ">" } else { ">>" };
+                init_script.push_str(&format!(
+                    "echo 'nameserver {ns}' {redir} /etc/resolv.conf\n"
+                ));
+            }
+        }
+    }
 
     // Execute the user's command or drop to a shell.
     let user_cmd = if !cmd.is_empty() {
