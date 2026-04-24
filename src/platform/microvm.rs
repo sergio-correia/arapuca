@@ -15,6 +15,10 @@ use crate::audit::{
 use crate::platform::Sandbox;
 use crate::{Config, Error, Isolation, MicroVmConfig, Process};
 
+/// Shell-quote a string for safe interpolation in `/bin/sh` scripts.
+///
+/// Uses POSIX single-quote wrapping: the string is enclosed in single
+/// quotes, with internal single quotes escaped as `'\''`.
 fn shell_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
@@ -520,36 +524,37 @@ fn exec_vm_inner(
 
     // Mount read-only shares.
     for (i, path) in read_paths.iter().enumerate() {
-        let guest_path = path.to_string_lossy();
+        let gp = shell_quote(&path.to_string_lossy());
         init_script.push_str(&format!(
-            "mkdir -p '{guest_path}' && mount -t virtiofs -o ro ro{i} '{guest_path}'\n"
+            "mkdir -p {gp} && mount -t virtiofs -o ro ro{i} {gp}\n"
         ));
     }
 
     // Mount read-write shares.
     for (i, path) in write_paths.iter().enumerate() {
-        let guest_path = path.to_string_lossy();
-        init_script.push_str(&format!(
-            "mkdir -p '{guest_path}' && mount -t virtiofs rw{i} '{guest_path}'\n"
-        ));
+        let gp = shell_quote(&path.to_string_lossy());
+        init_script.push_str(&format!("mkdir -p {gp} && mount -t virtiofs rw{i} {gp}\n"));
     }
 
     // Configure networking if passt provided guest/router IPs.
+    // IPs are validated via Ipv4Addr in microvm_net.rs; shell_quote
+    // is applied here for defense-in-depth.
     if let Some((guest_ip, router_ip, dns_servers)) = net_ips {
+        let gip = shell_quote(guest_ip);
+        let rip = shell_quote(router_ip);
         init_script.push_str("ip link set up dev lo\n");
-        init_script.push_str(&format!("ip addr add {guest_ip}/24 dev eth0\n"));
+        init_script.push_str(&format!("ip addr add {gip}/24 dev eth0\n"));
         init_script.push_str("ip link set up dev eth0\n");
-        init_script.push_str(&format!("ip route add default via {router_ip}\n"));
+        init_script.push_str(&format!("ip route add default via {rip}\n"));
         init_script.push_str("rm -f /etc/resolv.conf\n");
         if dns_servers.is_empty() {
-            init_script.push_str(&format!(
-                "echo 'nameserver {router_ip}' > /etc/resolv.conf\n"
-            ));
+            init_script.push_str(&format!("echo 'nameserver {rip}' > /etc/resolv.conf\n"));
         } else {
             for (i, ns) in dns_servers.iter().enumerate() {
                 let redir = if i == 0 { ">" } else { ">>" };
+                let qns = shell_quote(ns);
                 init_script.push_str(&format!(
-                    "echo 'nameserver {ns}' {redir} /etc/resolv.conf\n"
+                    "echo 'nameserver {qns}' {redir} /etc/resolv.conf\n"
                 ));
             }
         }
@@ -638,5 +643,43 @@ mod tests {
             Ok(()) => eprintln!("microvm: available (KVM + qemu-img)"),
             Err(e) => eprintln!("microvm: not available: {e}"),
         }
+    }
+
+    #[test]
+    fn shell_quote_passthrough() {
+        assert_eq!(shell_quote("hello"), "hello");
+        assert_eq!(shell_quote("/usr/bin/curl"), "/usr/bin/curl");
+        assert_eq!(shell_quote("key=value"), "key=value");
+    }
+
+    #[test]
+    fn shell_quote_empty() {
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn shell_quote_spaces() {
+        assert_eq!(shell_quote("hello world"), "'hello world'");
+    }
+
+    #[test]
+    fn shell_quote_single_quotes() {
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_quote_semicolons() {
+        assert_eq!(shell_quote("a; rm -rf /"), "'a; rm -rf /'");
+    }
+
+    #[test]
+    fn shell_quote_dollar_backtick() {
+        assert_eq!(shell_quote("$(evil)"), "'$(evil)'");
+        assert_eq!(shell_quote("`evil`"), "'`evil`'");
+    }
+
+    #[test]
+    fn shell_quote_newline() {
+        assert_eq!(shell_quote("a\nb"), "'a\nb'");
     }
 }
