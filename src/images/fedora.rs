@@ -5,14 +5,13 @@
 
 use super::metadata::ImageMetadata;
 
-/// Fedora Cloud Base Generic images use this partition layout:
-/// - /dev/vda1: bios_grub (1MB)
-/// - /dev/vda2: /boot (ext4, ~1GB)
-/// - /dev/vda3: / (ext4, rest of disk)
-///
-/// Filesystem is ext4 (not btrfs) on cloud images.
-const FEDORA_ROOT_DEVICE: &str = "/dev/vda3";
-const FEDORA_FSTYPE: &str = "ext4";
+/// Fedora Cloud Base Generic images (F42+) use this partition layout:
+/// - /dev/vda1: BIOS boot (2MB)
+/// - /dev/vda2: EFI System (100MB, vfat)
+/// - /dev/vda3: /boot (1GB, ext4)
+/// - /dev/vda4: / (rest, btrfs)
+const FEDORA_ROOT_DEVICE: &str = "/dev/vda4";
+const FEDORA_FSTYPE: &str = "btrfs";
 
 /// Resolve and cache a Fedora cloud image.
 ///
@@ -146,8 +145,8 @@ mod tests {
     #[test]
     fn metadata_defaults() {
         let meta = fedora_metadata();
-        assert_eq!(meta.root_device, "/dev/vda3");
-        assert_eq!(meta.fstype, "ext4");
+        assert_eq!(meta.root_device, "/dev/vda4");
+        assert_eq!(meta.fstype, "btrfs");
         assert_eq!(meta.init, "/sbin/init");
     }
 }
