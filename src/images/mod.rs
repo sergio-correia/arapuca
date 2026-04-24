@@ -10,6 +10,8 @@ pub mod download;
 pub mod fedora;
 pub mod metadata;
 pub mod overlay;
+#[cfg(feature = "microvm")]
+pub mod probe;
 pub mod provider;
 
 pub use cache::CachedImage;

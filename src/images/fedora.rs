@@ -81,9 +81,19 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
             eprintln!("warning: no CHECKSUM file found on mirror");
         }
 
-        eprintln!("caching image...");
-        let mut metadata = fedora_metadata();
+        eprintln!("detecting image layout...");
+        let mut metadata = match super::probe::probe_image(&tmp_path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("warning: partition probe failed ({e}), using defaults");
+                fedora_metadata()
+            }
+        };
         metadata.sha256 = Some(sha256);
+        eprintln!(
+            "caching image (root={} fs={})...",
+            metadata.root_device, metadata.fstype
+        );
         super::cache::store(&cache_name, &tmp_path, &metadata)
     })();
 
