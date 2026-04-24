@@ -119,6 +119,7 @@ pub fn fedora_metadata() -> ImageMetadata {
     ImageMetadata {
         root_device: FEDORA_ROOT_DEVICE.into(),
         fstype: FEDORA_FSTYPE.into(),
+        mount_options: Some("subvol=root".into()),
         init: "/sbin/init".into(),
     }
 }

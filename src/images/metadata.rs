@@ -8,8 +8,10 @@ use std::path::Path;
 pub struct ImageMetadata {
     /// Root device path (e.g., "/dev/vda1", "/dev/vda4").
     pub root_device: String,
-    /// Filesystem type (e.g., "ext4", "xfs").
+    /// Filesystem type (e.g., "ext4", "xfs", "btrfs").
     pub fstype: String,
+    /// Mount options (e.g., "subvol=root" for btrfs subvolumes).
+    pub mount_options: Option<String>,
     /// Init binary to execute (e.g., "/sbin/init").
     pub init: String,
 }
@@ -33,12 +35,21 @@ impl ImageMetadata {
     /// Save metadata as a sidecar JSON file next to a qcow2 image.
     pub fn save_sidecar(&self, qcow2_path: &Path) -> io::Result<()> {
         let meta_path = sidecar_path(qcow2_path);
-        let json = format!(
-            "{{\n  \"root_device\": \"{}\",\n  \"fstype\": \"{}\",\n  \"init\": \"{}\"\n}}\n",
+        let mut json = format!(
+            "{{\n  \"root_device\": \"{}\",\n  \"fstype\": \"{}\"",
             json_escape(&self.root_device),
             json_escape(&self.fstype),
-            json_escape(&self.init),
         );
+        if let Some(ref opts) = self.mount_options {
+            json.push_str(&format!(
+                ",\n  \"mount_options\": \"{}\"",
+                json_escape(opts)
+            ));
+        }
+        json.push_str(&format!(
+            ",\n  \"init\": \"{}\"\n}}\n",
+            json_escape(&self.init)
+        ));
         std::fs::write(meta_path, json)
     }
 }
@@ -64,10 +75,12 @@ fn parse_metadata_json(json: &str) -> Result<ImageMetadata, String> {
     let root_device =
         extract_json_string(json, "root_device").ok_or("missing \"root_device\" field")?;
     let fstype = extract_json_string(json, "fstype").ok_or("missing \"fstype\" field")?;
+    let mount_options = extract_json_string(json, "mount_options");
     let init = extract_json_string(json, "init").unwrap_or_else(|| "/sbin/init".to_string());
     Ok(ImageMetadata {
         root_device,
         fstype,
+        mount_options,
         init,
     })
 }
@@ -136,6 +149,7 @@ mod tests {
         let meta = ImageMetadata {
             root_device: "/dev/vda3".into(),
             fstype: "xfs".into(),
+            mount_options: None,
             init: "/sbin/init".into(),
         };
         meta.save_sidecar(&qcow2).unwrap();
@@ -143,6 +157,7 @@ mod tests {
         let loaded = ImageMetadata::load_sidecar(&qcow2).unwrap();
         assert_eq!(loaded.root_device, "/dev/vda3");
         assert_eq!(loaded.fstype, "xfs");
+        assert!(loaded.mount_options.is_none());
         assert_eq!(loaded.init, "/sbin/init");
     }
 

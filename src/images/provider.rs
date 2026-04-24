@@ -132,11 +132,14 @@ fn parse_provider_response(json: &str) -> io::Result<CachedImage> {
 
     let init = extract_json_string(json, "init").unwrap_or_else(|| "/sbin/init".to_string());
 
+    let mount_options = extract_json_string(json, "mount_options");
+
     Ok(CachedImage {
         path,
         metadata: ImageMetadata {
             root_device,
             fstype,
+            mount_options,
             init,
         },
     })

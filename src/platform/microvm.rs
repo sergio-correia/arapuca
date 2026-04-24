@@ -376,18 +376,24 @@ fn exec_vm_inner(
         return Err(Error::MicroVm("krun_add_disk2 failed".into()));
     }
 
-    // Set root disk remount.
+    // Set root disk remount (with optional mount options for e.g. btrfs subvolumes).
     let device = CString::new(meta.root_device.as_bytes())
         .map_err(|_| Error::MicroVm("invalid root_device".into()))?;
     let fstype = CString::new(meta.fstype.as_bytes())
         .map_err(|_| Error::MicroVm("invalid fstype".into()))?;
+    let mount_opts = meta
+        .mount_options
+        .as_ref()
+        .map(|o| CString::new(o.as_bytes()))
+        .transpose()
+        .map_err(|_| Error::MicroVm("invalid mount_options".into()))?;
 
     let ret = unsafe {
         krun_sys::krun_set_root_disk_remount(
             ctx,
             device.as_ptr(),
             fstype.as_ptr(),
-            std::ptr::null(),
+            mount_opts.as_ref().map_or(std::ptr::null(), |o| o.as_ptr()),
         )
     };
     if ret < 0 {

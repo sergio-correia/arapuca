@@ -171,6 +171,7 @@ mod tests {
             let meta = ImageMetadata {
                 root_device: "/dev/vda1".into(),
                 fstype: "ext4".into(),
+                mount_options: None,
                 init: "/sbin/init".into(),
             };
 
@@ -201,6 +202,7 @@ mod tests {
             let meta = ImageMetadata {
                 root_device: "/dev/vda1".into(),
                 fstype: "ext4".into(),
+                mount_options: None,
                 init: "/sbin/init".into(),
             };
             store("to-remove", &src, &meta).unwrap();
@@ -235,6 +237,7 @@ mod tests {
             let meta = ImageMetadata {
                 root_device: "/dev/vda1".into(),
                 fstype: "ext4".into(),
+                mount_options: None,
                 init: "/sbin/init".into(),
             };
             store("alpha", &src, &meta).unwrap();
