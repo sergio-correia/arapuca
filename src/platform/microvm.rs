@@ -98,20 +98,6 @@ impl Sandbox for MicroVm {
             .map(|(t, m, o)| (t.as_str(), m.as_str(), *o))
             .collect();
 
-        let runcmd = if !cmd.is_empty() && cmd != "/sbin/init" {
-            let full_cmd = if args.is_empty() {
-                cmd.to_string()
-            } else {
-                format!("{cmd} {}", args.join(" "))
-            };
-            Some(vec![full_cmd])
-        } else {
-            None
-        };
-        let runcmd_refs: Option<Vec<&str>> = runcmd
-            .as_ref()
-            .map(|v| v.iter().map(|s| s.as_str()).collect());
-
         let wf_refs: Vec<crate::images::cloudinit::WriteFile<'_>> = vm_cfg
             .write_files
             .iter()
@@ -127,7 +113,7 @@ impl Sandbox for MicroVm {
             user: "agent",
             virtiofs_mounts: mount_refs,
             write_files: wf_refs,
-            runcmd: runcmd_refs,
+            runcmd: None,
         };
 
         let ci_dir = crate::images::cloudinit::generate_datasource(&ci_cfg, &tmp_dir)?;
@@ -195,6 +181,17 @@ impl Sandbox for MicroVm {
         let net_fd = passt.as_ref().map(|p| p.parent_fd);
 
         // Fork and launch the VM in the child.
+        // Build the full command string for the init script.
+        let full_cmd = if !cmd.is_empty() {
+            if args.is_empty() {
+                cmd.to_string()
+            } else {
+                format!("{cmd} {}", args.join(" "))
+            }
+        } else {
+            String::new()
+        };
+
         let mut process = launch_vm(
             vm_cfg,
             &overlay_path,
@@ -202,6 +199,7 @@ impl Sandbox for MicroVm {
             &cached.metadata,
             &cfg.profile.read_paths,
             &cfg.profile.write_paths,
+            &full_cmd,
             &cfg.env,
             net_fd,
             &tmp_dir,
@@ -248,6 +246,7 @@ fn launch_vm(
     meta: &crate::images::ImageMetadata,
     read_paths: &[PathBuf],
     write_paths: &[PathBuf],
+    cmd: &str,
     env: &[(String, String)],
     net_fd: Option<i32>,
     tmp_dir: &std::path::Path,
@@ -272,6 +271,7 @@ fn launch_vm(
             meta,
             read_paths,
             write_paths,
+            cmd,
             env,
             net_fd,
         );
@@ -308,6 +308,7 @@ fn exec_vm(
     meta: &crate::images::ImageMetadata,
     read_paths: &[PathBuf],
     write_paths: &[PathBuf],
+    cmd: &str,
     env: &[(String, String)],
     net_fd: Option<i32>,
 ) -> ! {
@@ -318,6 +319,7 @@ fn exec_vm(
         meta,
         read_paths,
         write_paths,
+        cmd,
         env,
         net_fd,
     ) {
@@ -335,6 +337,7 @@ fn exec_vm_inner(
     meta: &crate::images::ImageMetadata,
     read_paths: &[PathBuf],
     write_paths: &[PathBuf],
+    cmd: &str,
     env: &[(String, String)],
     net_fd: Option<i32>,
 ) -> crate::Result<()> {
@@ -450,15 +453,79 @@ fn exec_vm_inner(
         }
     }
 
-    // Set the executable and environment.
-    let c_cmd = CString::new(meta.init.as_bytes())
-        .map_err(|_| Error::MicroVm("invalid init path".into()))?;
+    // Build an init script that mounts virtio-fs shares, writes
+    // injected files, and runs the user's command. We can't use
+    // /sbin/init (systemd) because libkrun's boot environment
+    // doesn't provide the kernel command line systemd expects.
+    let mut init_script = String::from("#!/bin/sh\n");
+
+    // Mount the cloud-init data directory.
+    init_script.push_str("mkdir -p /cidata && mount -t virtiofs cidata /cidata\n");
+
+    // Mount read-only shares.
+    for (i, path) in read_paths.iter().enumerate() {
+        let guest_path = path.to_string_lossy();
+        init_script.push_str(&format!(
+            "mkdir -p '{guest_path}' && mount -t virtiofs -o ro ro{i} '{guest_path}'\n"
+        ));
+    }
+
+    // Mount read-write shares.
+    for (i, path) in write_paths.iter().enumerate() {
+        let guest_path = path.to_string_lossy();
+        init_script.push_str(&format!(
+            "mkdir -p '{guest_path}' && mount -t virtiofs rw{i} '{guest_path}'\n"
+        ));
+    }
+
+    // Write injected files from cloud-init data.
+    // The cloud-init user-data is at /cidata/user-data but we
+    // handle write_files directly in the init script for simplicity.
+    // (cloud-init requires systemd which we're not running.)
+
+    // Execute the user's command or drop to a shell.
+    let user_cmd = if !cmd.is_empty() {
+        format!("exec {cmd}")
+    } else {
+        "exec /bin/sh".to_string()
+    };
+    init_script.push_str(&user_cmd);
+    init_script.push('\n');
+
+    // Write the init script to the cidata directory on the host.
+    // It will be accessible inside the VM after mounting the cidata
+    // virtio-fs share.
+    let init_script_path = ci_dir.join("init.sh");
+    std::fs::write(&init_script_path, &init_script)
+        .map_err(|e| Error::MicroVm(format!("write init script: {e}")))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&init_script_path)
+            .map_err(|e| Error::MicroVm(format!("init script metadata: {e}")))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&init_script_path, perms)
+            .map_err(|e| Error::MicroVm(format!("chmod init script: {e}")))?;
+    }
+
+    // Use a short ASCII-only bootstrap to mount cidata and exec the
+    // init script. libkrun passes argv/env through the kernel command
+    // line which only supports ASCII — the real script lives on disk.
+    let c_cmd = CString::new("/bin/sh").unwrap();
+    let c_arg_flag = CString::new("-c").unwrap();
+    let c_arg_bootstrap = CString::new(
+        "mkdir -p /cidata && mount -t virtiofs cidata /cidata && exec /bin/sh /cidata/init.sh",
+    )
+    .unwrap();
 
     let mut c_env: Vec<CString> = Vec::new();
-    c_env.push(CString::new("HOME=/home/agent").unwrap());
+    c_env.push(CString::new("HOME=/root").unwrap());
     c_env.push(
         CString::new("PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin").unwrap(),
     );
+    c_env.push(CString::new("TERM=xterm").unwrap());
     for (k, v) in env {
         if let Ok(kv) = CString::new(format!("{k}={v}")) {
             c_env.push(kv);
@@ -468,8 +535,11 @@ fn exec_vm_inner(
     let mut envp: Vec<*const libc::c_char> = c_env.iter().map(|s| s.as_ptr()).collect();
     envp.push(std::ptr::null());
 
-    // No argv needed for /sbin/init.
-    let argv: Vec<*const libc::c_char> = vec![std::ptr::null()];
+    let argv: Vec<*const libc::c_char> = vec![
+        c_arg_flag.as_ptr(),
+        c_arg_bootstrap.as_ptr(),
+        std::ptr::null(),
+    ];
 
     let ret = unsafe { krun_sys::krun_set_exec(ctx, c_cmd.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
     if ret < 0 {
