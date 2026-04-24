@@ -1,6 +1,6 @@
 .PHONY: build release build-microvm release-microvm test test-unit test-integration lint fmt fmt-check clippy check ci ci-full audit header man clean static
 
-FEATURES ?=
+FEATURES ?= microvm
 
 build:
 	cargo build $(if $(FEATURES),--features $(FEATURES))
