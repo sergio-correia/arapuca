@@ -13,6 +13,8 @@ pub mod overlay;
 #[cfg(feature = "microvm")]
 pub mod probe;
 pub mod provider;
+#[cfg(feature = "microvm")]
+pub mod setup;
 
 pub use cache::CachedImage;
 pub use metadata::ImageMetadata;

@@ -16,6 +16,9 @@ pub struct ImageMetadata {
     pub init: String,
     /// SHA256 hex digest of the qcow2 file (for integrity verification).
     pub sha256: Option<String>,
+    /// SHA256 of the base image this setup layer was built from.
+    /// Only present for setup layers; used to detect stale layers.
+    pub base_sha256: Option<String>,
 }
 
 impl ImageMetadata {
@@ -52,6 +55,9 @@ impl ImageMetadata {
         if let Some(ref hash) = self.sha256 {
             json.push_str(&format!(",\n  \"sha256\": \"{}\"", json_escape(hash)));
         }
+        if let Some(ref hash) = self.base_sha256 {
+            json.push_str(&format!(",\n  \"base_sha256\": \"{}\"", json_escape(hash)));
+        }
         json.push_str("\n}\n");
         std::fs::write(meta_path, json)
     }
@@ -82,12 +88,15 @@ fn parse_metadata_json(json: &str) -> Result<ImageMetadata, String> {
     let init = extract_json_string(json, "init").unwrap_or_else(|| "/sbin/init".to_string());
     let sha256 = extract_json_string(json, "sha256")
         .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+    let base_sha256 = extract_json_string(json, "base_sha256")
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()));
     Ok(ImageMetadata {
         root_device,
         fstype,
         mount_options,
         init,
         sha256,
+        base_sha256,
     })
 }
 
@@ -158,6 +167,7 @@ mod tests {
             mount_options: None,
             init: "/sbin/init".into(),
             sha256: None,
+            base_sha256: None,
         };
         meta.save_sidecar(&qcow2).unwrap();
 
@@ -181,6 +191,7 @@ mod tests {
             mount_options: Some("subvol=root".into()),
             init: "/sbin/init".into(),
             sha256: Some(hash.into()),
+            base_sha256: None,
         };
         meta.save_sidecar(&qcow2).unwrap();
 

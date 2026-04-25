@@ -164,6 +164,7 @@ pub fn fedora_metadata() -> ImageMetadata {
         mount_options: Some("subvol=root".into()),
         init: "/sbin/init".into(),
         sha256: None,
+        base_sha256: None,
     }
 }
 

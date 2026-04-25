@@ -142,6 +142,7 @@ fn parse_provider_response(json: &str) -> io::Result<CachedImage> {
             mount_options,
             init,
             sha256: None,
+            base_sha256: None,
         },
     })
 }

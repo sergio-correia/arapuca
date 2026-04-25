@@ -46,6 +46,7 @@ pub fn probe_image(qcow2_path: &Path) -> io::Result<ImageMetadata> {
         mount_options,
         init: "/sbin/init".into(),
         sha256: None,
+        base_sha256: None,
     })
 }
 
