@@ -147,6 +147,27 @@ fn build_filter() -> crate::Result<BpfProgram> {
         vec![prctl_disable_pdeathsig, prctl_set_dumpable],
     );
 
+    // Block execveat with AT_EMPTY_PATH (fileless execution).
+    // execveat(fd, "", ..., flags) — flags is arg4.
+    let execveat_empty_path = SeccompRule::new(vec![
+        SeccompCondition::new(
+            4,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(libc::AT_EMPTY_PATH as u64),
+            libc::AT_EMPTY_PATH as u64,
+        )
+        .map_err(|e| Error::Seccomp(format!("execveat condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("execveat rule: {e}")))?;
+
+    eperm_rules.insert(libc::SYS_execveat, vec![execveat_empty_path]);
+
+    // NOTE: we do NOT block seccomp(SET_MODE_FILTER) because seccomp
+    // filters stack — new filters can only be more restrictive (kernel
+    // takes the most restrictive action across all filters). Blocking it
+    // would also prevent our own two-phase filter installation since the
+    // EPERM filter is installed before the KILL filter.
+
     let eperm_filter = SeccompFilter::new(
         eperm_rules.into_iter().collect(),
         SeccompAction::Allow,
@@ -208,6 +229,10 @@ fn tier1_kill_syscalls() -> Vec<i64> {
         libc::SYS_fsopen,
         libc::SYS_fsconfig,
         libc::SYS_fsmount,
+        libc::SYS_fspick,
+        libc::SYS_pidfd_open,
+        libc::SYS_pidfd_getfd,
+        libc::SYS_pidfd_send_signal,
     ]
 }
 
@@ -286,5 +311,115 @@ mod tests {
         // Verify the filter compiles without error.
         // We don't apply it here because that would restrict this test process.
         assert!(build_filter().is_ok());
+    }
+
+    /// Fork a child, apply the seccomp filter, run `test_fn`, and
+    /// check the exit status. Returns (exited_normally, exit_code_or_signal).
+    fn run_in_filtered_child(test_fn: fn()) -> (bool, i32) {
+        // SAFETY: fork is safe here — single-threaded test process.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+
+        if pid == 0 {
+            // Child: apply filter and run the test.
+            if let Err(e) = apply() {
+                eprintln!("seccomp apply failed: {e}");
+                unsafe { libc::_exit(99) };
+            }
+            test_fn();
+            unsafe { libc::_exit(0) };
+        }
+
+        // Parent: wait for child and inspect status.
+        let mut wstatus: libc::c_int = 0;
+        // SAFETY: pid is valid from fork.
+        let ret = unsafe { libc::waitpid(pid, &mut wstatus, 0) };
+        assert!(ret > 0, "waitpid failed");
+
+        if libc::WIFEXITED(wstatus) {
+            (true, libc::WEXITSTATUS(wstatus))
+        } else if libc::WIFSIGNALED(wstatus) {
+            (false, libc::WTERMSIG(wstatus))
+        } else {
+            panic!("unexpected wait status: {wstatus}");
+        }
+    }
+
+    #[test]
+    fn tier1_pidfd_open_kills() {
+        let (exited, sig) = run_in_filtered_child(|| {
+            // SAFETY: syscall with valid args.
+            unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+        });
+        assert!(!exited, "child should be killed, not exit normally");
+        assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from seccomp KILL");
+    }
+
+    #[test]
+    fn tier1_fspick_kills() {
+        let (exited, sig) = run_in_filtered_child(|| {
+            let path = b"/\0".as_ptr();
+            // SAFETY: syscall with valid args.
+            unsafe { libc::syscall(libc::SYS_fspick, libc::AT_FDCWD, path, 0) };
+        });
+        assert!(!exited, "child should be killed, not exit normally");
+        assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from seccomp KILL");
+    }
+
+    #[test]
+    fn tier2_execveat_empty_path_eperm() {
+        let (exited, code) = run_in_filtered_child(|| {
+            let empty = b"\0".as_ptr();
+            // SAFETY: syscall with AT_EMPTY_PATH flag.
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_execveat,
+                    -1i32,
+                    empty,
+                    std::ptr::null::<*const libc::c_char>(),
+                    std::ptr::null::<*const libc::c_char>(),
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if ret < 0 && errno == libc::EPERM {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "expected EPERM (exit 42)");
+    }
+
+    #[test]
+    fn tier2_socket_inet_eperm() {
+        let (exited, code) = run_in_filtered_child(|| {
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == libc::EPERM {
+                    unsafe { libc::_exit(42) };
+                }
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "expected EPERM (exit 42)");
+    }
+
+    #[test]
+    fn tier2_socket_unix_allowed() {
+        let (exited, code) = run_in_filtered_child(|| {
+            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            if fd >= 0 {
+                unsafe {
+                    libc::close(fd);
+                    libc::_exit(42);
+                }
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "AF_UNIX socket should be allowed");
     }
 }
