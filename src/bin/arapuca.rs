@@ -210,12 +210,15 @@ fn image_subcommand(args: &[String]) {
         Some("pull") => image_pull(&args[1..]),
         Some("list") => image_list(),
         Some("rm") => image_rm(&args[1..]),
+        #[cfg(feature = "microvm")]
+        Some("setup") => image_setup(&args[1..]),
         _ => {
-            eprintln!("usage: arapuca image <pull|list|rm>");
+            eprintln!("usage: arapuca image <pull|list|rm|setup>");
             eprintln!();
-            eprintln!("  pull <distro>:<version>   download and cache an image");
-            eprintln!("  list                      show cached images");
-            eprintln!("  rm <distro>:<version>     remove a cached image");
+            eprintln!("  pull <distro>:<version>      download and cache an image");
+            eprintln!("  list                         show cached images");
+            eprintln!("  rm <distro>:<version>        remove a cached image");
+            eprintln!("  setup <distro:ver> [flags]   create a setup layer");
             std::process::exit(1);
         }
     }
@@ -273,8 +276,9 @@ fn image_list() {
                 let size = std::fs::metadata(&cached.path)
                     .map(|m| m.len() / (1024 * 1024))
                     .unwrap_or(0);
+                let indent = if name.contains(".setup-") { "  " } else { "" };
                 println!(
-                    "{name}  {size}MB  root={} fs={}",
+                    "{indent}{name}  {size}MB  root={} fs={}",
                     cached.metadata.root_device, cached.metadata.fstype,
                 );
             }
@@ -315,6 +319,201 @@ fn image_rm(args: &[String]) {
         }
         Err(e) => {
             eprintln!("arapuca: image rm failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ─── Image setup ──────────────────────────────────────────────
+
+#[cfg(feature = "microvm")]
+fn image_setup(args: &[String]) {
+    use arapuca::platform::{MicroVm, Sandbox};
+
+    let mut image_spec = None;
+    let mut run_cmd = None;
+    let mut script_path = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--run" => {
+                i += 1;
+                run_cmd = Some(args.get(i).cloned().unwrap_or_default());
+            }
+            "--script" => {
+                i += 1;
+                script_path = Some(args.get(i).cloned().unwrap_or_default());
+            }
+            s if !s.starts_with('-') && image_spec.is_none() => {
+                image_spec = Some(s.to_string());
+            }
+            _ => {
+                eprintln!("unknown flag: {}", args[i]);
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    let spec = match image_spec {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "usage: arapuca image setup <distro:version> --run '<cmd>' | --script <path>"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let script = match (run_cmd, script_path) {
+        (Some(cmd), None) => cmd,
+        (None, Some(path)) => match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("arapuca: cannot read script {path}: {e}");
+                std::process::exit(1);
+            }
+        },
+        (Some(_), Some(_)) => {
+            eprintln!("arapuca: --run and --script are mutually exclusive");
+            std::process::exit(1);
+        }
+        (None, None) => {
+            eprintln!(
+                "usage: arapuca image setup <distro:version> --run '<cmd>' | --script <path>"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let (distro, version) = match spec.split_once(':') {
+        Some((d, v)) if !d.is_empty() && !v.is_empty() => (d, v),
+        _ => {
+            eprintln!("invalid image specifier: {spec} (expected distro:version)");
+            std::process::exit(1);
+        }
+    };
+
+    let image_source = arapuca::ImageSource::Distro {
+        name: distro.into(),
+        version: version.into(),
+    };
+
+    // Resolve the base image (pull if needed).
+    let cached = match arapuca::images::resolve(&image_source) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("arapuca: image resolve failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let arch = std::env::consts::ARCH;
+    let base_name = format!("{distro}-{version}-{arch}");
+    let base_sha256 = cached.metadata.sha256.as_deref();
+
+    // Check if a setup layer already exists.
+    match arapuca::images::setup::lookup(&base_name, &script, base_sha256) {
+        Ok(Some(layer)) => {
+            println!("{}", layer.path.display());
+            eprintln!("setup layer already exists");
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("arapuca: setup lookup failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // Build a minimal config: no host mounts, networking enabled.
+    let profile = arapuca::Profile {
+        isolation: arapuca::Isolation::MicroVm(arapuca::MicroVmConfig {
+            image: image_source.clone(),
+            cpus: 2,
+            mem_mb: 2048,
+            write_files: Vec::new(),
+        }),
+        use_netns: false,
+        ..Default::default()
+    };
+
+    let config = arapuca::Config {
+        profile,
+        socket_dir: std::env::temp_dir(),
+        task_id: format!("setup-{distro}-{version}"),
+        phase: "image-setup".into(),
+        work_dir: None,
+        #[cfg(unix)]
+        stdin: None,
+        #[cfg(unix)]
+        stdout: None,
+        #[cfg(unix)]
+        stderr: None,
+        #[cfg(unix)]
+        extra_fds: Vec::new(),
+        network_proxy_socket: None,
+        env: Vec::new(),
+        audit_sink: None,
+        audit_verbosity: arapuca::audit::AuditVerbosity::Standard,
+        audit_principal: None,
+        audit_correlation_id: None,
+    };
+
+    eprintln!("running setup VM...");
+
+    let sandbox = MicroVm::new().unwrap_or_else(|e| {
+        eprintln!("arapuca: microvm: {e}");
+        std::process::exit(125);
+    });
+
+    // Launch setup VM with the setup script as the command.
+    let mut process = match sandbox.launch(&config, "/bin/sh", &["-c", &script]) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("arapuca: setup VM launch failed: {e}");
+            std::process::exit(125);
+        }
+    };
+
+    let status = match process.wait() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("arapuca: setup VM wait failed: {e}");
+            std::process::exit(125);
+        }
+    };
+
+    let exit_code = status.code().unwrap_or(1);
+
+    // Save the overlay path before cleanup destroys the temp dir.
+    let vm_overlay = process.tmp_dir().join("vm").join("disk.qcow2");
+
+    if exit_code != 0 {
+        process.cleanup();
+        eprintln!("arapuca: setup command failed (exit {exit_code})");
+        eprintln!("no setup layer was created");
+        std::process::exit(exit_code);
+    }
+
+    // Success — cache the overlay as a setup layer.
+    let result = arapuca::images::setup::store(
+        &base_name,
+        &script,
+        &vm_overlay,
+        &cached.metadata,
+        base_sha256,
+    );
+    process.cleanup();
+
+    match result {
+        Ok(layer) => {
+            eprintln!("setup layer created");
+            println!("{}", layer.path.display());
+        }
+        Err(e) => {
+            eprintln!("arapuca: failed to cache setup layer: {e}");
             std::process::exit(1);
         }
     }

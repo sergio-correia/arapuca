@@ -77,6 +77,11 @@ impl Process {
         self.process_id
     }
 
+    /// Path to the process's temporary directory.
+    pub fn tmp_dir(&self) -> &std::path::Path {
+        &self.tmp_dir
+    }
+
     /// Wait for the process to exit and return the exit status.
     #[cfg(not(windows))]
     pub fn wait(&mut self) -> crate::Result<std::process::ExitStatus> {
