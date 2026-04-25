@@ -28,11 +28,14 @@ be bypassed from userspace.
 - **Micro-VM isolation** (optional, `microvm` feature) — runs the
   subprocess inside a lightweight KVM virtual machine via libkrun.
   Strongest isolation: separate kernel, address space, and device
-  model. Includes image management (`arapuca image pull/list/rm`),
+  model. Includes image management (`arapuca image pull/list/rm/setup`),
   Fedora cloud images out of the box, external provider protocol
-  for other distros, cloud-init guest configuration with
-  `write_files` support, COW overlays, and optional networking
-  via passt
+  for other distros, auto-detection of partition layout and filesystem
+  type from qcow2 images, SHA256 checksum verification on download,
+  setup layers for caching pre-configured images (e.g., with tools
+  pre-installed), cloud-init guest configuration with `write_files`
+  support, COW overlays, and optional networking via passt with
+  `--no-map-gw` to prevent guest access to host localhost
 
 ### macOS
 
@@ -145,6 +148,14 @@ cargo build --release --features microvm
 # - File injection via cloud-init (--write-file)
 # - Signal forwarding (Ctrl-C → SIGTERM, second → SIGKILL)
 # - Exit code 125 for infrastructure errors
+
+# Create a setup layer with pre-installed tools
+./target/release/arapuca image setup fedora:42 \
+  --run 'dnf install -y git python3'
+
+# Future vm run uses the setup layer — no install needed
+./target/release/arapuca vm run --image fedora:42 \
+  -- git --version
 
 # Manage cached images
 ./target/release/arapuca image list
@@ -515,7 +526,8 @@ cargo fmt --check
 - Rust 1.85+ (edition 2024)
 - **Linux**: kernel 5.13+ (Landlock) — degrades gracefully on older
   kernels; cgroups v2 with delegated controllers (for resource limits)
-- **Linux (microvm feature)**: libkrun + libkrunfw, qemu-img, and
+- **Linux (microvm feature)**: libkrun + libkrunfw, qemu-img,
+  qemu-nbd (for image probing), OpenSSL development headers, and
   optionally passt (for VM networking). KVM (`/dev/kvm`) required.
 - **macOS**: `sandbox-exec` (ships with macOS, deprecated but functional
   through macOS 15)
@@ -544,10 +556,12 @@ src/
 ├── images/
 │   ├── mod.rs          # Image resolution dispatcher
 │   ├── cache.rs        # Image cache (XDG_DATA_HOME/arapuca/images/)
-│   ├── metadata.rs     # Image metadata (root device, fstype, init)
+│   ├── metadata.rs     # Image metadata (root device, fstype, checksums)
 │   ├── fedora.rs       # Built-in Fedora cloud image provider
 │   ├── provider.rs     # External provider protocol (arapuca-images-*)
-│   ├── download.rs     # HTTP download via reqwest (microvm feature)
+│   ├── download.rs     # HTTP download with progress bar + SHA256
+│   ├── probe.rs        # Auto-detect partition layout from qcow2
+│   ├── setup.rs        # Setup layers (cached pre-configured overlays)
 │   ├── overlay.rs      # COW qcow2 overlay creation (qemu-img)
 │   └── cloudinit.rs    # Cloud-init NoCloud datasource generation
 ├── platform/
