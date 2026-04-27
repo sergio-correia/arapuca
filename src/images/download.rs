@@ -16,6 +16,7 @@ pub fn fetch_to_file(url: &str, dest: &Path) -> io::Result<String> {
     log::info!("downloading {url}");
 
     let client = reqwest::blocking::Client::builder()
+        .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(1800))
         .build()
@@ -85,6 +86,7 @@ pub fn fetch_text(url: &str, max_bytes: usize) -> io::Result<String> {
     use std::io::Read;
 
     let client = reqwest::blocking::Client::builder()
+        .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(60))
         .build()
