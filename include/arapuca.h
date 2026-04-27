@@ -21,6 +21,76 @@
 #define arapuca_BRIDGE_PORT 18080
 
 /**
+ * Stdin channel (host → guest).
+ */
+#define arapuca_CHANNEL_STDIN 0
+
+/**
+ * Stdout channel (guest → host).
+ */
+#define arapuca_CHANNEL_STDOUT 1
+
+/**
+ * Stderr channel (guest → host).
+ */
+#define arapuca_CHANNEL_STDERR 2
+
+/**
+ * Control channel (bidirectional).
+ */
+#define arapuca_CHANNEL_CONTROL 3
+
+/**
+ * Frame header: 1 byte channel + 4 bytes length.
+ */
+#define arapuca_FRAME_HEADER_SIZE 5
+
+/**
+ * Maximum control message payload (64 KiB).
+ */
+#define arapuca_MAX_CONTROL_PAYLOAD (64 * 1024)
+
+/**
+ * Maximum data frame payload (1 MiB).
+ */
+#define arapuca_MAX_DATA_PAYLOAD (1024 * 1024)
+
+/**
+ * Maximum EXEC JSON payload (64 KiB).
+ */
+#define arapuca_MAX_EXEC_PAYLOAD (64 * 1024)
+
+/**
+ * Nonce size for socket authentication (256-bit).
+ */
+#define arapuca_NONCE_SIZE 32
+
+/**
+ * Default vsock port for the agent.
+ */
+#define arapuca_AGENT_VSOCK_PORT 1024
+
+/**
+ * Maximum concurrent connections per agent.
+ */
+#define arapuca_MAX_CONNECTIONS 16
+
+/**
+ * Maximum concurrent exec sessions per agent.
+ */
+#define arapuca_MAX_SESSIONS 32
+
+/**
+ * Maximum elements in a JSON string array (args, env).
+ */
+#define arapuca_MAX_ARRAY_ELEMENTS 4096
+
+/**
+ * Idle connection timeout in seconds.
+ */
+#define arapuca_IDLE_TIMEOUT_SECS 30
+
+/**
  * Opaque launch config.
  */
 typedef struct arapuca_ArapucaConfig arapuca_ArapucaConfig;

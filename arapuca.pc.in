@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=@LIBDIR@
+includedir=${prefix}/include
+
+Name: arapuca
+Description: Cross-platform process sandbox
+URL: https://github.com/sergio-correia/arapuca
+Version: @VERSION@
+Libs: -L${libdir} -larapuca @NATIVE_LIBS@
+Cflags: -I${includedir}
