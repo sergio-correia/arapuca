@@ -163,6 +163,9 @@ pub struct ExecRequest {
     pub args: Vec<String>,
     pub env: Vec<String>,
     pub user: String,
+    pub tty: bool,
+    pub rows: u16,
+    pub cols: u16,
 }
 
 impl ControlMessage {
@@ -273,6 +276,12 @@ impl ExecRequest {
         json_encode_string_array(&self.env, &mut out);
         out.push_str(",\"user\":");
         json_encode_string(&self.user, &mut out);
+        if self.tty {
+            out.push_str(",\"tty\":true");
+            if self.rows > 0 && self.cols > 0 {
+                out.push_str(&format!(",\"rows\":{},\"cols\":{}", self.rows, self.cols));
+            }
+        }
         out.push('}');
         out
     }
@@ -286,6 +295,9 @@ impl ExecRequest {
         let mut args = None;
         let mut env = None;
         let mut user = None;
+        let mut tty = None;
+        let mut rows = None;
+        let mut cols = None;
         let mut first = true;
 
         loop {
@@ -310,18 +322,16 @@ impl ExecRequest {
                 "args" if args.is_none() => args = Some(p.parse_string_array()?),
                 "env" if env.is_none() => env = Some(p.parse_string_array()?),
                 "user" if user.is_none() => user = Some(p.parse_string()?),
-                "cmd" | "args" | "env" | "user" => {
+                "tty" if tty.is_none() => tty = Some(p.parse_bool()?),
+                "rows" if rows.is_none() => rows = Some(p.parse_u16()?),
+                "cols" if cols.is_none() => cols = Some(p.parse_u16()?),
+                "cmd" | "args" | "env" | "user" | "tty" | "rows" | "cols" => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("duplicate field in EXEC: {key}"),
                     ));
                 }
-                other => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unknown field in EXEC: {other}"),
-                    ));
-                }
+                _ => p.skip_value()?,
             }
         }
 
@@ -332,6 +342,9 @@ impl ExecRequest {
             args: args.unwrap_or_default(),
             env: env.unwrap_or_default(),
             user: user.unwrap_or_else(|| "root".to_string()),
+            tty: tty.unwrap_or(false),
+            rows: rows.unwrap_or(0),
+            cols: cols.unwrap_or(0),
         })
     }
 }
@@ -568,6 +581,13 @@ impl<'a> JsonParser<'a> {
         self.input[start..self.pos]
             .parse()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid number"))
+    }
+
+    /// Parse a JSON number as u16 (rejects values > 65535).
+    pub(crate) fn parse_u16(&mut self) -> io::Result<u16> {
+        let val = self.parse_u64()?;
+        u16::try_from(val)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "number exceeds u16 range"))
     }
 
     /// Parse a JSON boolean.
@@ -876,6 +896,9 @@ mod tests {
             args: vec!["-l".to_string()],
             env: vec!["TERM=xterm".to_string(), "HOME=/root".to_string()],
             user: "root".to_string(),
+            tty: false,
+            rows: 0,
+            cols: 0,
         });
         let serialized = msg.serialize();
         let parsed = ControlMessage::parse(&serialized).unwrap();
@@ -889,6 +912,9 @@ mod tests {
             args: vec![],
             env: vec![],
             user: "nobody".to_string(),
+            tty: false,
+            rows: 0,
+            cols: 0,
         });
         let parsed = ControlMessage::parse(&msg.serialize()).unwrap();
         assert_eq!(parsed, msg);
@@ -901,6 +927,9 @@ mod tests {
             args: vec!["-c".to_string(), "echo \"hello\nworld\"".to_string()],
             env: vec!["MSG=it's a \"test\"".to_string()],
             user: "root".to_string(),
+            tty: false,
+            rows: 0,
+            cols: 0,
         });
         let parsed = ControlMessage::parse(&msg.serialize()).unwrap();
         assert_eq!(parsed, msg);
@@ -913,6 +942,9 @@ mod tests {
             args: vec!["café".to_string(), "日本語".to_string()],
             env: vec![],
             user: "root".to_string(),
+            tty: false,
+            rows: 0,
+            cols: 0,
         });
         let parsed = ControlMessage::parse(&msg.serialize()).unwrap();
         assert_eq!(parsed, msg);
@@ -992,6 +1024,9 @@ mod tests {
             args: vec!["C:\\Users\\test".to_string()],
             env: vec![],
             user: "root".to_string(),
+            tty: false,
+            rows: 0,
+            cols: 0,
         };
         let json = req.to_json();
         let parsed = ExecRequest::from_json(&json).unwrap();
@@ -1008,10 +1043,10 @@ mod tests {
     }
 
     #[test]
-    fn json_parse_unknown_field_rejected() {
-        let json = r#"{"cmd":"/bin/ls","bogus":"val"}"#;
-        let err = ExecRequest::from_json(json).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    fn json_parse_unknown_field_skipped() {
+        let json = r#"{"cmd":"/bin/ls","bogus":"val","args":[],"env":[]}"#;
+        let req = ExecRequest::from_json(json).unwrap();
+        assert_eq!(req.cmd, "/bin/ls");
     }
 
     #[test]
@@ -1047,5 +1082,63 @@ mod tests {
         let json = r#"{"cmd":"/bin/a","args":[],"args":[],"env":[],"user":"root"}"#;
         let err = ExecRequest::from_json(json).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ── TTY fields ────────────────────────────────────────────
+
+    #[test]
+    fn control_exec_tty_roundtrip() {
+        let msg = ControlMessage::Exec(ExecRequest {
+            cmd: "/bin/bash".to_string(),
+            args: vec!["-l".to_string()],
+            env: vec![],
+            user: "root".to_string(),
+            tty: true,
+            rows: 24,
+            cols: 80,
+        });
+        let parsed = ControlMessage::parse(&msg.serialize()).unwrap();
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn control_exec_tty_default_false() {
+        let json = r#"{"cmd":"/bin/ls","args":[],"env":[]}"#;
+        let req = ExecRequest::from_json(json).unwrap();
+        assert!(!req.tty);
+        assert_eq!(req.rows, 0);
+        assert_eq!(req.cols, 0);
+    }
+
+    #[test]
+    fn control_exec_tty_zero_dimensions() {
+        let msg = ControlMessage::Exec(ExecRequest {
+            cmd: "/bin/bash".to_string(),
+            args: vec![],
+            env: vec![],
+            user: "root".to_string(),
+            tty: true,
+            rows: 0,
+            cols: 0,
+        });
+        let parsed = ControlMessage::parse(&msg.serialize()).unwrap();
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn control_exec_non_tty_omits_tty_fields() {
+        let req = ExecRequest {
+            cmd: "/bin/ls".to_string(),
+            args: vec![],
+            env: vec![],
+            user: "root".to_string(),
+            tty: false,
+            rows: 0,
+            cols: 0,
+        };
+        let json = req.to_json();
+        assert!(!json.contains("tty"));
+        assert!(!json.contains("rows"));
+        assert!(!json.contains("cols"));
     }
 }

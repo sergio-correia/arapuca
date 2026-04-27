@@ -51,6 +51,9 @@ pub fn exec(
         args: args.to_vec(),
         env: env.to_vec(),
         user: user.to_string(),
+        tty: false,
+        rows: 0,
+        cols: 0,
     };
     protocol::write_control(&mut stream, &ControlMessage::Exec(req))?;
 
