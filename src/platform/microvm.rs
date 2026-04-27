@@ -15,11 +15,23 @@ use crate::audit::{
 use crate::platform::Sandbox;
 use crate::{Config, Error, Isolation, MicroVmConfig, Process};
 
+/// Optional parameters for persistent VM launches (vsock + agent).
+pub(crate) struct PersistentVmOpts<'a> {
+    /// Directory containing the agent binary (mounted read-only at /agent).
+    pub agent_bin_dir: &'a std::path::Path,
+    /// Host-side Unix socket path for the vsock-mapped agent port.
+    pub agent_sock_path: &'a std::path::Path,
+    /// Nonce bytes to write to cidata for agent authentication.
+    pub nonce: &'a [u8; crate::vm::protocol::NONCE_SIZE],
+    /// Max lifetime in seconds (written to cidata for the agent).
+    pub max_lifetime: Option<u64>,
+}
+
 /// Shell-quote a string for safe interpolation in `/bin/sh` scripts.
 ///
 /// Uses POSIX single-quote wrapping: the string is enclosed in single
 /// quotes, with internal single quotes escaped as `'\''`.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
@@ -331,6 +343,7 @@ fn launch_vm(
             env,
             net_fd,
             net_ips,
+            None,
         );
     }
 
@@ -358,7 +371,7 @@ fn launch_vm(
 /// Execute the VM in the current process (called from the forked child).
 /// This function never returns — it replaces the process with the VM.
 #[allow(clippy::too_many_arguments)]
-fn exec_vm(
+pub(crate) fn exec_vm(
     vm_cfg: &MicroVmConfig,
     overlay_path: &std::path::Path,
     ci_dir: &std::path::Path,
@@ -369,6 +382,7 @@ fn exec_vm(
     env: &[(String, String)],
     net_fd: Option<i32>,
     net_ips: Option<&(String, String, Vec<String>)>,
+    persistent: Option<&PersistentVmOpts<'_>>,
 ) -> ! {
     if let Err(e) = exec_vm_inner(
         vm_cfg,
@@ -381,6 +395,7 @@ fn exec_vm(
         env,
         net_fd,
         net_ips,
+        persistent,
     ) {
         eprintln!("arapuca: microvm: {e}");
     }
@@ -400,6 +415,7 @@ fn exec_vm_inner(
     env: &[(String, String)],
     net_fd: Option<i32>,
     net_ips: Option<&(String, String, Vec<String>)>,
+    persistent: Option<&PersistentVmOpts<'_>>,
 ) -> crate::Result<()> {
     // SAFETY: all krun_sys calls operate on a context ID and take
     // C strings. The context is process-local (this is the forked
@@ -513,6 +529,59 @@ fn exec_vm_inner(
         }
     }
 
+    // For persistent VMs: add agent-bin virtiofs share and vsock port.
+    if let Some(opts) = persistent {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // Read-only virtiofs share for the agent binary.
+        let agent_tag = CString::new("agent-bin").unwrap();
+        let agent_path = CString::new(opts.agent_bin_dir.as_os_str().as_bytes())
+            .map_err(|_| Error::MicroVm("invalid agent bin path".into()))?;
+        let ret =
+            unsafe { krun_sys::krun_add_virtiofs(ctx, agent_tag.as_ptr(), agent_path.as_ptr()) };
+        if ret < 0 {
+            return Err(Error::MicroVm(
+                "krun_add_virtiofs (agent-bin) failed".into(),
+            ));
+        }
+
+        // Disable the implicit vsock/TSI device and add an explicit
+        // one with no TSI features (prevents uncontrolled guest→host).
+        let ret = unsafe { krun_sys::krun_disable_implicit_vsock(ctx) };
+        if ret < 0 {
+            return Err(Error::MicroVm("krun_disable_implicit_vsock failed".into()));
+        }
+        let ret = unsafe { krun_sys::krun_add_vsock(ctx, 0) };
+        if ret < 0 {
+            return Err(Error::MicroVm("krun_add_vsock failed".into()));
+        }
+
+        // Map guest vsock port → host Unix socket (guest listens).
+        let sock_path = CString::new(opts.agent_sock_path.as_os_str().as_bytes())
+            .map_err(|_| Error::MicroVm("invalid agent socket path".into()))?;
+        let ret = unsafe {
+            krun_sys::krun_add_vsock_port2(
+                ctx,
+                crate::vm::protocol::AGENT_VSOCK_PORT,
+                sock_path.as_ptr(),
+                true, // listen=true: guest listens, host connects
+            )
+        };
+        if ret < 0 {
+            return Err(Error::MicroVm("krun_add_vsock_port2 failed".into()));
+        }
+
+        // Write nonce and max_lifetime to cidata for the agent.
+        let nonce_path = ci_dir.join("nonce");
+        std::fs::write(&nonce_path, opts.nonce)
+            .map_err(|e| Error::MicroVm(format!("write nonce: {e}")))?;
+        if let Some(lt) = opts.max_lifetime {
+            let lt_path = ci_dir.join("max_lifetime");
+            std::fs::write(&lt_path, lt.to_string())
+                .map_err(|e| Error::MicroVm(format!("write max_lifetime: {e}")))?;
+        }
+    }
+
     // Build an init script that mounts virtio-fs shares, configures
     // networking, and runs the user's command. We can't use /sbin/init
     // (systemd) because libkrun's boot environment doesn't provide the
@@ -560,14 +629,23 @@ fn exec_vm_inner(
         }
     }
 
-    // Execute the user's command or drop to a shell.
-    let user_cmd = if !cmd.is_empty() {
-        format!("exec {cmd}")
+    // For persistent VMs: mount agent-bin share and start the agent.
+    // For ephemeral VMs: exec the user's command directly.
+    if persistent.is_some() {
+        init_script.push_str("mkdir -p /agent && mount -t virtiofs -o ro agent-bin /agent\n");
+        init_script.push_str("mount -o remount,ro /cidata\n");
+        init_script.push_str("/agent/arapuca-agent &\n");
+        init_script.push_str("AGENT_PID=$!\n");
+        init_script.push_str("wait $AGENT_PID\n");
     } else {
-        "exec /bin/sh".to_string()
-    };
-    init_script.push_str(&user_cmd);
-    init_script.push('\n');
+        let user_cmd = if !cmd.is_empty() {
+            format!("exec {cmd}")
+        } else {
+            "exec /bin/sh".to_string()
+        };
+        init_script.push_str(&user_cmd);
+        init_script.push('\n');
+    }
 
     // Write the init script to the cidata directory on the host.
     // It will be accessible inside the VM after mounting the cidata
