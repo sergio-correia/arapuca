@@ -336,7 +336,7 @@ impl ExecRequest {
     }
 }
 
-fn json_encode_string(s: &str, out: &mut String) {
+pub(crate) fn json_encode_string(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -367,32 +367,32 @@ fn json_encode_string_array(arr: &[String], out: &mut String) {
 
 // ─── JSON parser ──────────────────────────────────────────────
 
-struct JsonParser<'a> {
+pub(crate) struct JsonParser<'a> {
     input: &'a str,
     pos: usize,
 }
 
 impl<'a> JsonParser<'a> {
-    fn new(input: &'a str) -> Self {
+    pub(crate) fn new(input: &'a str) -> Self {
         Self { input, pos: 0 }
     }
 
-    fn peek(&self) -> Option<u8> {
+    pub(crate) fn peek(&self) -> Option<u8> {
         self.input.as_bytes().get(self.pos).copied()
     }
 
-    fn advance(&mut self) {
+    pub(crate) fn advance(&mut self) {
         self.pos += 1;
     }
 
-    fn skip_ws(&mut self) {
+    pub(crate) fn skip_ws(&mut self) {
         let bytes = self.input.as_bytes();
         while self.pos < bytes.len() && bytes[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
     }
 
-    fn expect_byte(&mut self, expected: u8) -> io::Result<()> {
+    pub(crate) fn expect_byte(&mut self, expected: u8) -> io::Result<()> {
         match self.peek() {
             Some(c) if c == expected => {
                 self.advance();
@@ -409,7 +409,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_string(&mut self) -> io::Result<String> {
+    pub(crate) fn parse_string(&mut self) -> io::Result<String> {
         self.expect_byte(b'"')?;
         let mut s = String::new();
         let bytes = self.input.as_bytes();
@@ -550,6 +550,110 @@ impl<'a> JsonParser<'a> {
                 }
             }
         }
+    }
+
+    /// Parse a JSON number (unsigned integer).
+    pub(crate) fn parse_u64(&mut self) -> io::Result<u64> {
+        let bytes = self.input.as_bytes();
+        let start = self.pos;
+        while self.pos < bytes.len() && bytes[self.pos].is_ascii_digit() {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected number",
+            ));
+        }
+        self.input[start..self.pos]
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid number"))
+    }
+
+    /// Parse a JSON boolean.
+    pub(crate) fn parse_bool(&mut self) -> io::Result<bool> {
+        if self.input[self.pos..].starts_with("true") {
+            self.pos += 4;
+            Ok(true)
+        } else if self.input[self.pos..].starts_with("false") {
+            self.pos += 5;
+            Ok(false)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected boolean",
+            ))
+        }
+    }
+
+    /// Skip a JSON value (string, number, boolean, array, or object).
+    pub(crate) fn skip_value(&mut self) -> io::Result<()> {
+        match self.peek() {
+            Some(b'"') => {
+                self.parse_string()?;
+            }
+            Some(b'[') => {
+                self.advance();
+                self.skip_ws();
+                if self.peek() != Some(b']') {
+                    loop {
+                        self.skip_ws();
+                        self.skip_value()?;
+                        self.skip_ws();
+                        match self.peek() {
+                            Some(b',') => self.advance(),
+                            Some(b']') => break,
+                            _ => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "expected ',' or ']'",
+                                ));
+                            }
+                        }
+                    }
+                }
+                self.advance(); // ']'
+            }
+            Some(b'{') => {
+                self.advance();
+                self.skip_ws();
+                if self.peek() != Some(b'}') {
+                    loop {
+                        self.skip_ws();
+                        self.parse_string()?; // key
+                        self.skip_ws();
+                        self.expect_byte(b':')?;
+                        self.skip_ws();
+                        self.skip_value()?;
+                        self.skip_ws();
+                        match self.peek() {
+                            Some(b',') => self.advance(),
+                            Some(b'}') => break,
+                            _ => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "expected ',' or '}'",
+                                ));
+                            }
+                        }
+                    }
+                }
+                self.advance(); // '}'
+            }
+            Some(b) if b == b't' || b == b'f' => {
+                self.parse_bool()?;
+            }
+            Some(b) if b.is_ascii_digit() => {
+                self.parse_u64()?;
+            }
+            Some(b'n') if self.input[self.pos..].starts_with("null") => {
+                self.pos += 4;
+            }
+            _ => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "expected value"));
+            }
+        }
+        Ok(())
     }
 }
 
