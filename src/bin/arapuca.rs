@@ -526,6 +526,7 @@ fn vm_subcommand(args: &[String]) {
     match args.first().map(|s| s.as_str()) {
         Some("run") => vm_run(&args[1..]),
         Some("start") => vm_start(&args[1..]),
+        Some("exec") => vm_exec(&args[1..]),
         Some("list") | Some("ls") => vm_list(),
         _ => {
             eprintln!("usage: arapuca vm <command>");
@@ -533,6 +534,7 @@ fn vm_subcommand(args: &[String]) {
             eprintln!("commands:");
             eprintln!("  run [flags] -- command [args...]   run a command in an ephemeral VM");
             eprintln!("  start [flags]                      start a persistent VM");
+            eprintln!("  exec <name> [flags] -- cmd [args]  exec in a running VM");
             eprintln!("  list                               list VMs");
             std::process::exit(1);
         }
@@ -712,6 +714,123 @@ fn vm_list() {
             std::process::exit(1);
         }
     }
+}
+
+#[cfg(feature = "microvm")]
+fn vm_exec(args: &[String]) {
+    let vm_name = match args.first() {
+        Some(name) if !name.starts_with('-') => name.clone(),
+        _ => {
+            eprintln!("usage: arapuca vm exec <name> [--env K=V] [--user U] -- cmd [args]");
+            std::process::exit(125);
+        }
+    };
+
+    let rest = &args[1..];
+    let mut env_vars: Vec<String> = Vec::new();
+    let mut user = "root".to_string();
+
+    let sep_pos = rest.iter().position(|a| a == "--");
+    let flag_args = match sep_pos {
+        Some(pos) => &rest[..pos],
+        None => rest,
+    };
+    let cmd_args: &[String] = match sep_pos {
+        Some(pos) if pos + 1 < rest.len() => &rest[pos + 1..],
+        _ => {
+            eprintln!("usage: arapuca vm exec <name> [flags] -- command [args...]");
+            std::process::exit(125);
+        }
+    };
+
+    let mut i = 0;
+    while i < flag_args.len() {
+        match flag_args[i].as_str() {
+            "--env" => {
+                i += 1;
+                let kv = flag_args.get(i).unwrap_or_else(|| {
+                    eprintln!("--env requires KEY=VALUE");
+                    std::process::exit(125);
+                });
+                env_vars.push(kv.clone());
+            }
+            "--user" => {
+                i += 1;
+                user = flag_args
+                    .get(i)
+                    .unwrap_or_else(|| {
+                        eprintln!("--user requires a value");
+                        std::process::exit(125);
+                    })
+                    .clone();
+            }
+            other => {
+                eprintln!("unknown flag: {other}");
+                std::process::exit(125);
+            }
+        }
+        i += 1;
+    }
+
+    if !arapuca::vm::state::is_running(&vm_name).unwrap_or(false) {
+        eprintln!("arapuca: VM '{vm_name}' is not running");
+        std::process::exit(1);
+    }
+
+    let config = match arapuca::vm::state::VmConfig::load(&vm_name) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("arapuca: cannot load VM config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let sock_path = match arapuca::vm::state::agent_sock_path(&vm_name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("arapuca: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Filter dangerous env vars before sending to the agent.
+    // Both caller env and explicit --env values are filtered.
+    let caller_env: Vec<(String, String)> = std::env::vars().collect();
+    let filtered = arapuca::env::filter_caller_env(&caller_env);
+    let explicit_env: Vec<(String, String)> = env_vars
+        .iter()
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect();
+    let filtered_explicit = arapuca::env::filter_caller_env(&explicit_env);
+    let filtered_env: Vec<String> = filtered
+        .passed
+        .into_iter()
+        .chain(filtered_explicit.passed)
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+
+    let cmd = cmd_args[0].as_str();
+    let cmd_rest: Vec<String> = cmd_args[1..].to_vec();
+
+    let exit_code = match arapuca::vm::exec::exec(
+        &sock_path,
+        &config.nonce,
+        cmd,
+        &cmd_rest,
+        &filtered_env,
+        &user,
+    ) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("arapuca: vm exec failed: {e}");
+            125
+        }
+    };
+
+    std::process::exit(exit_code);
 }
 
 #[cfg(feature = "microvm")]

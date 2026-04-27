@@ -4,6 +4,7 @@
 //! access via vsock-based host↔guest communication.
 
 pub mod daemon;
+pub mod exec;
 pub mod protocol;
 pub mod state;
 
