@@ -588,6 +588,23 @@ fn exec_vm_inner(
     // kernel command line systemd expects.
     let mut init_script = String::from("#!/bin/sh\nset -e\n");
 
+    // Mount pseudo-filesystems (no systemd to do this for us).
+    init_script.push_str("mount -t proc proc /proc\n");
+    init_script.push_str("mount -t sysfs sysfs /sys\n");
+    init_script.push_str("mkdir -p /dev/pts\n");
+    init_script
+        .push_str("mount -t devpts devpts /dev/pts -o newinstance,ptmxmode=0666,nosuid,noexec\n");
+    init_script.push_str("ln -sf pts/ptmx /dev/ptmx\n");
+    init_script.push_str("mount -t tmpfs tmpfs /run\n");
+    init_script.push_str("mkdir -p /run/lock\n");
+
+    // Workaround: libkrun's kernel lacks CONFIG_AUDIT, which makes
+    // Fedora's sudo (compiled with --with-linux-audit) refuse to run.
+    // Shadow it with a wrapper that delegates to su.
+    init_script.push_str(
+        "printf '#!/bin/sh\\nexec su -c \"$*\"\\n' > /usr/local/bin/sudo && chmod 755 /usr/local/bin/sudo\n",
+    );
+
     // Mount the cloud-init data directory.
     init_script.push_str("mkdir -p /cidata && mount -t virtiofs cidata /cidata\n");
 
