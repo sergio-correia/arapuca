@@ -45,13 +45,19 @@ pub fn lookup(name: &str) -> io::Result<Option<CachedImage>> {
 }
 
 /// Store an image in the cache by moving/copying it from `src_path`.
+///
+/// Uses copy-to-tmp + atomic rename so a concurrent reader (e.g. a
+/// running VM overlay) keeps the old inode open and is never corrupted
+/// by a partial write.
 pub fn store(name: &str, src_path: &Path, metadata: &ImageMetadata) -> io::Result<CachedImage> {
     validate_name(name)?;
     let dir = images_dir()?;
     let dest = dir.join(format!("{name}.qcow2"));
 
     if src_path != dest {
-        std::fs::copy(src_path, &dest)?;
+        let tmp = dir.join(format!("{name}.qcow2.tmp"));
+        std::fs::copy(src_path, &tmp)?;
+        std::fs::rename(&tmp, &dest)?;
     }
     metadata.save_sidecar(&dest)?;
 
