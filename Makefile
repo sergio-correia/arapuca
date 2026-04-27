@@ -1,19 +1,30 @@
-.PHONY: build release build-microvm release-microvm test test-unit test-integration lint fmt fmt-check clippy check ci ci-full audit header man clean static
+.PHONY: build release build-microvm release-microvm agent agent-release test test-unit test-integration lint fmt fmt-check clippy check ci ci-full audit header man clean static
 
 FEATURES ?= microvm
 
 build:
 	cargo build $(if $(FEATURES),--features $(FEATURES))
+	cargo build --features vm-agent --bin arapuca-agent
 
 release:
 	cargo build --release $(if $(FEATURES),--features $(FEATURES))
+	cargo build --release --features vm-agent --bin arapuca-agent
 
 # Build with micro-VM support (requires libkrun).
 build-microvm:
 	cargo build --features microvm
+	cargo build --features vm-agent --bin arapuca-agent
 
 release-microvm:
 	cargo build --release --features microvm
+	cargo build --release --features vm-agent --bin arapuca-agent
+
+# Build the guest agent only (no libkrun dependency).
+agent:
+	cargo build --features vm-agent --bin arapuca-agent
+
+agent-release:
+	cargo build --release --features vm-agent --bin arapuca-agent
 
 test:
 	cargo test $(if $(FEATURES),--features $(FEATURES))
@@ -37,6 +48,7 @@ fmt-check:
 clippy:
 	cargo clippy -- -D warnings
 	$(if $(FEATURES),cargo clippy --features $(FEATURES) -- -D warnings)
+	cargo clippy --features vm-agent --bin arapuca-agent -- -D warnings
 
 # Full pre-commit / CI gate: format, lint, unit tests.
 check: fmt-check clippy test-unit
