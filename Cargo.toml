@@ -15,6 +15,11 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 name = "arapuca"
 path = "src/bin/arapuca.rs"
 
+[[bin]]
+name = "arapuca-agent"
+path = "src/bin/arapuca-agent.rs"
+required-features = ["vm-agent"]
+
 [dependencies]
 log = "0.4"
 serde = { version = "1", features = ["derive"], optional = true }
@@ -24,6 +29,7 @@ thiserror = "2"
 
 [features]
 serde = ["dep:serde", "dep:serde_json"]
+vm-agent = []
 microvm = ["dep:reqwest", "dep:krun-sys", "dep:openssl", "dep:gpt", "dep:nbd"]
 
 [target.'cfg(unix)'.dependencies]
