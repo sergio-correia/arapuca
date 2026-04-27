@@ -2,6 +2,7 @@ prefix=@PREFIX@
 exec_prefix=${prefix}
 libdir=@LIBDIR@
 includedir=${prefix}/include
+features=@INSTALL_FEATURES@
 
 Name: arapuca
 Description: Cross-platform process sandbox

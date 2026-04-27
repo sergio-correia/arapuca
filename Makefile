@@ -96,11 +96,14 @@ static:
 
 # Install static library, header, and pkg-config file.
 # Runs its own cargo rustc to both build and capture native-static-libs
-# in one invocation. Does NOT use $(FEATURES) — the installed library
-# is the core sandbox only (no microvm/krun deps).
+# in one invocation. Override INSTALL_FEATURES to include optional
+# features (e.g., make install INSTALL_FEATURES=microvm).
+INSTALL_FEATURES ?=
 install: header
 	touch src/lib.rs
-	cargo rustc --release --lib -- --print native-static-libs 2>&1 \
+	cargo rustc --release --lib \
+	    $(if $(INSTALL_FEATURES),--features $(INSTALL_FEATURES)) \
+	    -- --print native-static-libs 2>&1 \
 	    | grep 'native-static-libs:' \
 	    | sed 's/.*native-static-libs: //' > target/native-static-libs.txt
 	test -s target/native-static-libs.txt || \
@@ -113,6 +116,7 @@ install: header
 	    -e 's|@LIBDIR@|$(LIBDIR)|g' \
 	    -e 's|@VERSION@|$(VERSION)|g' \
 	    -e "s|@NATIVE_LIBS@|$$(cat target/native-static-libs.txt)|g" \
+	    -e 's|@INSTALL_FEATURES@|$(INSTALL_FEATURES)|g' \
 	    arapuca.pc.in > $(DESTDIR)$(LIBDIR)/pkgconfig/arapuca.pc
 
 uninstall:
