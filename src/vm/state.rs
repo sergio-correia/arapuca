@@ -138,6 +138,21 @@ pub fn acquire_lock(name: &str) -> io::Result<RawFd> {
     Ok(raw_fd)
 }
 
+/// Update the PID metadata in a held lockfile.
+///
+/// Called from the daemon (grandchild) after double-fork, since
+/// the daemon has a different PID than the parent that acquired
+/// the lock.
+pub fn update_lock_pid(lock_fd: RawFd) -> io::Result<()> {
+    use std::os::fd::FromRawFd;
+    let mut lock_file = unsafe { fs::File::from_raw_fd(lock_fd) };
+    lock_file.set_len(0)?;
+    write!(lock_file, "{}", std::process::id())?;
+    lock_file.flush()?;
+    std::mem::forget(lock_file);
+    Ok(())
+}
+
 /// Check if a VM is running by probing its lockfile.
 ///
 /// Returns `true` if the lockfile exists and is held (flock fails

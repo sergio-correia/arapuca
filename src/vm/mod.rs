@@ -154,6 +154,10 @@ pub fn start(opts: &StartOpts) -> crate::Result<StartResult> {
         }
         daemon::DaemonResult::Daemon => {
             // ── Daemon process ────────────────────────────────
+            // Update lockfile with the daemon's actual PID (the
+            // double-fork gave us a new PID).
+            let _ = state::update_lock_pid(lock_fd);
+
             let persistent_opts = PersistentVmOpts {
                 agent_bin_dir: &agent_bin_dir,
                 agent_sock_path: &agent_sock,
