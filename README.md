@@ -29,8 +29,9 @@ be bypassed from userspace.
   subprocess inside a lightweight KVM virtual machine via libkrun.
   Strongest isolation: separate kernel, address space, and device
   model. Includes image management (`arapuca image pull/list/rm/setup`),
-  Fedora cloud images out of the box, external provider protocol
-  for other distros, auto-detection of partition layout and filesystem
+  Fedora and CentOS Stream cloud images out of the box, external
+  provider protocol for other distros, auto-detection of partition
+  layout and filesystem
   type from qcow2 images, SHA256 checksum verification on download,
   setup layers for caching pre-configured images (e.g., with tools
   pre-installed), cloud-init guest configuration with `write_files`
@@ -132,6 +133,10 @@ cargo build --release --features microvm
 # Pull a Fedora cloud image (~500MB, cached for reuse)
 ./target/release/arapuca image pull fedora:42
 
+# Pull a CentOS Stream image
+./target/release/arapuca image pull centos:9
+./target/release/arapuca image pull centos:10
+
 # Run a command in a micro-VM
 ./target/release/arapuca vm run --image fedora:42 \
   -v /home/user/project:/home/agent/work \
@@ -164,6 +169,12 @@ cargo build --release --features microvm
 # Manage cached images
 ./target/release/arapuca image list
 ./target/release/arapuca image rm fedora:42
+
+# Check for upstream image updates (downloads only if changed)
+./target/release/arapuca image pull --check centos:9
+
+# Force re-download regardless of cache
+./target/release/arapuca image pull --force centos:9
 ```
 
 ### Persistent VMs
@@ -610,6 +621,7 @@ src/
 │   ├── cache.rs        # Image cache (XDG_DATA_HOME/arapuca/images/)
 │   ├── metadata.rs     # Image metadata (root device, fstype, checksums)
 │   ├── fedora.rs       # Built-in Fedora cloud image provider
+│   ├── centos.rs       # Built-in CentOS Stream cloud image provider
 │   ├── provider.rs     # External provider protocol (arapuca-images-*)
 │   ├── download.rs     # HTTP download with progress bar + SHA256
 │   ├── probe.rs        # Auto-detect partition layout from qcow2
