@@ -32,6 +32,8 @@ pub mod rlimit;
 #[cfg(target_os = "linux")]
 pub mod seccomp;
 mod validate;
+#[cfg(target_os = "linux")]
+pub mod vm;
 
 pub use process::Process;
 
