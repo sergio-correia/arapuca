@@ -152,7 +152,7 @@ impl Sandbox for Other {
         }
 
         Ok(Process {
-            child,
+            child: crate::process::ChildHandle::Managed(child),
             tmp_dir,
             audit_ctx,
             final_stats: None,

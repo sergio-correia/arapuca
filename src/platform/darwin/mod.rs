@@ -315,7 +315,7 @@ impl Sandbox for Darwin {
         Self::start_parent_watchdog(pid);
 
         Ok(Process {
-            child,
+            child: crate::process::ChildHandle::Managed(child),
             tmp_dir,
             audit_ctx: None,
             final_stats: None,
