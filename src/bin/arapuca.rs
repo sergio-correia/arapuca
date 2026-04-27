@@ -527,7 +527,11 @@ fn vm_subcommand(args: &[String]) {
         Some("run") => vm_run(&args[1..]),
         Some("start") => vm_start(&args[1..]),
         Some("exec") => vm_exec(&args[1..]),
+        Some("stop") => vm_stop(&args[1..]),
         Some("list") | Some("ls") => vm_list(),
+        Some("rm") | Some("remove") => vm_rm(&args[1..]),
+        Some("prune") => vm_prune(),
+        Some("reset") => vm_reset(&args[1..]),
         _ => {
             eprintln!("usage: arapuca vm <command>");
             eprintln!();
@@ -535,7 +539,11 @@ fn vm_subcommand(args: &[String]) {
             eprintln!("  run [flags] -- command [args...]   run a command in an ephemeral VM");
             eprintln!("  start [flags]                      start a persistent VM");
             eprintln!("  exec <name> [flags] -- cmd [args]  exec in a running VM");
+            eprintln!("  stop <name> [--force] [--timeout N] stop a VM");
             eprintln!("  list                               list VMs");
+            eprintln!("  rm <name>                          remove a stopped VM");
+            eprintln!("  prune                              clean up stale VM state");
+            eprintln!("  reset <name>                       recreate overlay from base");
             std::process::exit(1);
         }
     }
@@ -831,6 +839,237 @@ fn vm_exec(args: &[String]) {
     };
 
     std::process::exit(exit_code);
+}
+
+#[cfg(feature = "microvm")]
+fn vm_stop(args: &[String]) {
+    let mut name: Option<String> = None;
+    let mut force = false;
+    let mut timeout_secs: u64 = 10;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--force" | "-f" => force = true,
+            "--timeout" => {
+                i += 1;
+                timeout_secs = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("--timeout requires a positive integer");
+                    std::process::exit(125);
+                });
+            }
+            s if !s.starts_with('-') && name.is_none() => {
+                name = Some(s.to_string());
+            }
+            other => {
+                eprintln!("unknown flag: {other}");
+                std::process::exit(125);
+            }
+        }
+        i += 1;
+    }
+
+    let vm_name = name.unwrap_or_else(|| {
+        eprintln!("usage: arapuca vm stop <name> [--force] [--timeout N]");
+        std::process::exit(125);
+    });
+
+    if !arapuca::vm::state::is_running(&vm_name).unwrap_or(false) {
+        eprintln!("VM '{vm_name}' is not running");
+        std::process::exit(1);
+    }
+
+    // Try graceful shutdown via the agent.
+    if !force {
+        if let Ok(config) = arapuca::vm::state::VmConfig::load(&vm_name) {
+            if let Ok(sock_path) = arapuca::vm::state::agent_sock_path(&vm_name) {
+                if graceful_shutdown(&sock_path, &config.nonce, &vm_name, timeout_secs) {
+                    kill_passt_from_config(&config);
+                    println!("stopped {vm_name}");
+                    return;
+                }
+                eprintln!("graceful shutdown timed out, sending SIGKILL");
+            }
+        }
+    }
+
+    // Force kill: send SIGKILL to the VM PID.
+    if let Ok(Some(pid)) = arapuca::vm::state::read_lock_pid(&vm_name) {
+        // SAFETY: pid is from the lockfile, verified running above.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+
+    if let Ok(config) = arapuca::vm::state::VmConfig::load(&vm_name) {
+        kill_passt_from_config(&config);
+    }
+
+    // Wait briefly for the lock to be released.
+    for _ in 0..50 {
+        if !arapuca::vm::state::is_running(&vm_name).unwrap_or(true) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    println!("stopped {vm_name}");
+}
+
+#[cfg(feature = "microvm")]
+fn graceful_shutdown(
+    sock_path: &std::path::Path,
+    nonce: &[u8; arapuca::vm::protocol::NONCE_SIZE],
+    vm_name: &str,
+    timeout_secs: u64,
+) -> bool {
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let mut stream = match UnixStream::connect(sock_path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+    if arapuca::vm::protocol::write_nonce(&mut stream, nonce).is_err() {
+        return false;
+    }
+    match arapuca::vm::protocol::read_control(&mut stream) {
+        Ok(arapuca::vm::protocol::ControlMessage::Hello { .. }) => {}
+        _ => return false,
+    }
+    if arapuca::vm::protocol::write_control(
+        &mut stream,
+        &arapuca::vm::protocol::ControlMessage::Shutdown,
+    )
+    .is_err()
+    {
+        return false;
+    }
+
+    // Wait for the VM to exit (lockfile released).
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if !arapuca::vm::state::is_running(vm_name).unwrap_or(true) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+#[cfg(feature = "microvm")]
+fn kill_passt_from_config(config: &arapuca::vm::state::VmConfig) {
+    if let Some(passt_pid) = config.passt_pid {
+        let comm = format!("/proc/{passt_pid}/comm");
+        if let Ok(c) = std::fs::read_to_string(&comm) {
+            if c.trim() == "passt" {
+                // SAFETY: passt_pid verified via /proc/comm.
+                unsafe { libc::kill(passt_pid as i32, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+#[cfg(feature = "microvm")]
+fn vm_rm(args: &[String]) {
+    let name = match args.first() {
+        Some(n) => n,
+        None => {
+            eprintln!("usage: arapuca vm rm <name>");
+            std::process::exit(125);
+        }
+    };
+
+    match arapuca::vm::state::remove_vm(name) {
+        Ok(()) => println!("removed {name}"),
+        Err(e) => {
+            eprintln!("arapuca: vm rm: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(feature = "microvm")]
+fn vm_prune() {
+    match arapuca::vm::state::prune_stale() {
+        Ok(pruned) => {
+            if pruned.is_empty() {
+                println!("nothing to prune");
+            } else {
+                for name in &pruned {
+                    println!("pruned {name}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("arapuca: vm prune: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(feature = "microvm")]
+fn vm_reset(args: &[String]) {
+    let name = match args.first() {
+        Some(n) => n,
+        None => {
+            eprintln!("usage: arapuca vm reset <name>");
+            std::process::exit(125);
+        }
+    };
+
+    if arapuca::vm::state::is_running(name).unwrap_or(false) {
+        eprintln!("arapuca: VM '{name}' is running, stop it first");
+        std::process::exit(1);
+    }
+
+    // Load config to find the base image.
+    let config = match arapuca::vm::state::VmConfig::load(name) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("arapuca: cannot load VM config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let image_source = parse_image_source(&config.image);
+    let cached = match arapuca::images::resolve(&image_source) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("arapuca: image resolve: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Remove old overlay and create fresh one.
+    let overlay = match arapuca::vm::state::overlay_path(name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("arapuca: {e}");
+            std::process::exit(1);
+        }
+    };
+    if overlay.exists() {
+        if let Err(e) = std::fs::remove_file(&overlay) {
+            eprintln!("arapuca: remove overlay: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    let vm_dir = match arapuca::vm::state::vm_dir(name) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("arapuca: {e}");
+            std::process::exit(1);
+        }
+    };
+    match arapuca::images::overlay::create_overlay(&cached.path, &vm_dir) {
+        Ok(_) => println!("reset {name}"),
+        Err(e) => {
+            eprintln!("arapuca: create overlay: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(feature = "microvm")]
