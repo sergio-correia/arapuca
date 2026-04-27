@@ -35,7 +35,11 @@ be bypassed from userspace.
   setup layers for caching pre-configured images (e.g., with tools
   pre-installed), cloud-init guest configuration with `write_files`
   support, COW overlays, and optional networking via passt with
-  `--no-map-gw` to prevent guest access to host localhost
+  `--no-map-gw` to prevent guest access to host localhost.
+  **Persistent VMs** (`vm start/exec/stop`) — long-running VMs with
+  interactive access via vsock, nonce-based authentication, TTY
+  support with raw terminal mode and SIGWINCH forwarding, persistent
+  overlay disks, and a guest agent injected via read-only virtiofs share
 
 ### macOS
 
@@ -160,6 +164,52 @@ cargo build --release --features microvm
 # Manage cached images
 ./target/release/arapuca image list
 ./target/release/arapuca image rm fedora:42
+```
+
+### Persistent VMs
+
+Start a long-running VM and attach to it later, like
+`podman run -d` + `podman exec`:
+
+```bash
+# Start a persistent VM (returns immediately)
+arapuca vm start --image fedora:42 --net --name myvm
+
+# Execute commands in the running VM
+arapuca vm exec myvm -- echo hello
+arapuca vm exec myvm -- dnf install -y git
+arapuca vm exec myvm -- git --version
+
+# Interactive shell (TTY mode)
+arapuca vm exec myvm -t -- /bin/bash -l
+
+# List running and stopped VMs
+arapuca vm list
+
+# Stop a VM (graceful shutdown, falls back to SIGKILL)
+arapuca vm stop myvm
+
+# Restart — persistent state (installed packages, files) is preserved
+arapuca vm start --name myvm
+
+# Reset overlay to base image (discards all changes)
+arapuca vm reset myvm
+
+# Remove a stopped VM entirely
+arapuca vm rm myvm
+
+# Clean up stale state from crashed VMs
+arapuca vm prune
+```
+
+Persistent VMs use vsock for host-guest communication (no SSH
+needed). A guest agent binary (`arapuca-agent`) is injected via a
+read-only virtiofs share and handles exec requests over a binary
+framing protocol with nonce-based authentication. The agent binary
+is built separately without libkrun:
+
+```bash
+cargo build --features vm-agent --bin arapuca-agent
 ```
 
 ### Environment Variables
@@ -505,7 +555,9 @@ cargo build --release
 
 # Build with micro-VM support (requires libkrun)
 cargo build --features microvm
-# or: make build-microvm
+
+# Build the guest agent (no libkrun dependency)
+cargo build --features vm-agent --bin arapuca-agent
 
 # Static binary (musl, no libc dependency)
 cargo build --release --target x86_64-unknown-linux-musl
