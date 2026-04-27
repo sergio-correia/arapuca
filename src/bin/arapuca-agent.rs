@@ -381,6 +381,27 @@ fn handle_exec(conn_fd: RawFd, req: &ExecRequest) -> i32 {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
+    if req.tty {
+        handle_exec_tty(
+            conn_fd,
+            req,
+            &c_cmd,
+            &argv_ptrs,
+            &envp_ptrs,
+            user_info.as_ref(),
+        )
+    } else {
+        handle_exec_pipes(conn_fd, &c_cmd, &argv_ptrs, &envp_ptrs, user_info.as_ref())
+    }
+}
+
+fn handle_exec_pipes(
+    conn_fd: RawFd,
+    c_cmd: &CString,
+    argv_ptrs: &[*const libc::c_char],
+    envp_ptrs: &[*const libc::c_char],
+    user_info: Option<&UserInfo>,
+) -> i32 {
     let mut stdin_pipe = [0i32; 2];
     let mut stdout_pipe = [0i32; 2];
     let mut stderr_pipe = [0i32; 2];
@@ -404,9 +425,6 @@ fn handle_exec(conn_fd: RawFd, req: &ExecRequest) -> i32 {
         }
     }
 
-    // SAFETY: all pipe fds are valid, pre-fork state is clean.
-    // All allocations completed above — child only uses
-    // async-signal-safe calls.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         unsafe {
@@ -421,9 +439,7 @@ fn handle_exec(conn_fd: RawFd, req: &ExecRequest) -> i32 {
     }
 
     if pid == 0 {
-        // ── Child ─────────────────────────────────────────
-        // Only async-signal-safe calls below (dup2, close,
-        // setgroups, setgid, setuid, prctl, execve, _exit).
+        // ── Child (pipe mode) ─────────────────────────────
         unsafe {
             libc::dup2(stdin_pipe[0], 0);
             libc::dup2(stdout_pipe[1], 1);
@@ -434,32 +450,10 @@ fn handle_exec(conn_fd: RawFd, req: &ExecRequest) -> i32 {
             libc::close(stdout_pipe[1]);
             libc::close(stderr_pipe[0]);
             libc::close(stderr_pipe[1]);
-
-            for fd in 3..1024 {
-                libc::close(fd);
-            }
-
-            if let Some(ref info) = user_info {
-                if libc::setgroups(info.ngroups as libc::size_t, info.groups.as_ptr()) != 0 {
-                    libc::_exit(126);
-                }
-                if libc::setgid(info.gid) != 0 {
-                    libc::_exit(126);
-                }
-                if libc::setuid(info.uid) != 0 {
-                    libc::_exit(126);
-                }
-            }
-
-            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-
-            libc::execve(c_cmd.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
-            libc::_exit(127);
+            exec_child(c_cmd, argv_ptrs, envp_ptrs, user_info);
         }
     }
 
-    // ── Parent ────────────────────────────────────────────
-    // SAFETY: closing the child's pipe ends.
     unsafe {
         libc::close(stdin_pipe[0]);
         libc::close(stdout_pipe[1]);
@@ -469,7 +463,6 @@ fn handle_exec(conn_fd: RawFd, req: &ExecRequest) -> i32 {
     let (exit_code, stdin_closed) =
         forward_io(conn_fd, stdin_pipe[1], stdout_pipe[0], stderr_pipe[0], pid);
 
-    // SAFETY: closing our pipe ends (skip stdin if already closed).
     unsafe {
         if !stdin_closed {
             libc::close(stdin_pipe[1]);
@@ -479,6 +472,120 @@ fn handle_exec(conn_fd: RawFd, req: &ExecRequest) -> i32 {
     }
 
     exit_code
+}
+
+fn handle_exec_tty(
+    conn_fd: RawFd,
+    req: &ExecRequest,
+    c_cmd: &CString,
+    argv_ptrs: &[*const libc::c_char],
+    envp_ptrs: &[*const libc::c_char],
+    user_info: Option<&UserInfo>,
+) -> i32 {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+
+    // SAFETY: openpty with null name/termios/winsize.
+    let ret = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ret != 0 {
+        return 126;
+    }
+
+    // SAFETY: set FD_CLOEXEC on master immediately.
+    unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) };
+
+    // Set initial window size if provided.
+    if req.rows > 0 && req.cols > 0 {
+        let ws: libc::winsize = libc::winsize {
+            ws_row: req.rows,
+            ws_col: req.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: master is a valid PTY fd, ws is stack-local.
+        unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
+    }
+
+    // SAFETY: all pre-fork allocations complete.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        // Fork failed — close both PTY fds.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        return 126;
+    }
+
+    if pid == 0 {
+        // ── Child (TTY mode) ──────────────────────────────
+        // All calls are async-signal-safe.
+        unsafe {
+            libc::close(master);
+            libc::setsid();
+            libc::ioctl(slave, libc::TIOCSCTTY, 0);
+            libc::dup2(slave, 0);
+            libc::dup2(slave, 1);
+            libc::dup2(slave, 2);
+            if slave > 2 {
+                libc::close(slave);
+            }
+            exec_child(c_cmd, argv_ptrs, envp_ptrs, user_info);
+        }
+    }
+
+    // ── Parent (TTY mode) ─────────────────────────────────
+    // SAFETY: parent doesn't need the slave.
+    unsafe { libc::close(slave) };
+
+    let exit_code = forward_io_tty(conn_fd, master, pid);
+
+    // SAFETY: close the master fd.
+    unsafe { libc::close(master) };
+
+    exit_code
+}
+
+/// Shared child exec logic (called after dup2, async-signal-safe only).
+///
+/// # Safety
+/// Must only be called in the forked child after dup2 of stdio fds.
+/// All calls must be async-signal-safe. Never returns.
+unsafe fn exec_child(
+    c_cmd: &CString,
+    argv_ptrs: &[*const libc::c_char],
+    envp_ptrs: &[*const libc::c_char],
+    user_info: Option<&UserInfo>,
+) -> ! {
+    unsafe {
+        for fd in 3..1024 {
+            libc::close(fd);
+        }
+
+        if let Some(info) = user_info {
+            if libc::setgroups(info.ngroups as libc::size_t, info.groups.as_ptr()) != 0 {
+                libc::_exit(126);
+            }
+            if libc::setgid(info.gid) != 0 {
+                libc::_exit(126);
+            }
+            if libc::setuid(info.uid) != 0 {
+                libc::_exit(126);
+            }
+        }
+
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        libc::execve(c_cmd.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+        libc::_exit(127);
+    }
 }
 
 struct UserInfo {
@@ -653,6 +760,121 @@ fn forward_io(
         unsafe { libc::waitpid(child_pid, &mut wstatus, 0) };
     }
     (exit_code_from_wstatus(wstatus), !stdin_open)
+}
+
+/// TTY I/O forwarding: poll master fd + connection fd.
+fn forward_io_tty(conn_fd: RawFd, master_fd: RawFd, child_pid: libc::pid_t) -> i32 {
+    // SAFETY: set master to non-blocking.
+    unsafe { libc::fcntl(master_fd, libc::F_SETFL, libc::O_NONBLOCK) };
+
+    let mut fds = [
+        libc::pollfd {
+            fd: conn_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: master_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    let mut master_done = false;
+    let mut child_exited = false;
+    let mut wstatus = 0i32;
+    let mut grace_deadline: Option<std::time::Instant> = None;
+
+    loop {
+        // SAFETY: poll with valid pollfd array.
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 100) };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+
+        // Forward master output → CHANNEL_STDOUT.
+        if !master_done && (fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0) {
+            master_done = !drain_pipe_to_conn(master_fd, conn_fd, protocol::CHANNEL_STDOUT);
+            if master_done {
+                fds[1].fd = -1;
+            }
+        }
+
+        // Read from connection (stdin data or control).
+        if fds[0].revents & libc::POLLIN != 0 {
+            match protocol::read_frame(&mut FdStream(conn_fd)) {
+                Ok((ch, payload)) => {
+                    if ch == protocol::CHANNEL_STDIN && !payload.is_empty() {
+                        let _ = write_all_fd(master_fd, &payload);
+                    }
+                    // Ignore empty stdin frames in TTY mode (Ctrl-D
+                    // is handled by the PTY line discipline).
+                    if ch == protocol::CHANNEL_CONTROL {
+                        if let Ok(msg) = ControlMessage::parse(&payload) {
+                            match msg {
+                                ControlMessage::Resize { rows, cols } if rows > 0 && cols > 0 => {
+                                    let ws = libc::winsize {
+                                        ws_row: rows,
+                                        ws_col: cols,
+                                        ws_xpixel: 0,
+                                        ws_ypixel: 0,
+                                    };
+                                    // SAFETY: master_fd is a valid PTY.
+                                    unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws) };
+                                }
+                                ControlMessage::Shutdown => {
+                                    unsafe { libc::kill(1, libc::SIGKILL) };
+                                    return 137;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                    break;
+                }
+            }
+        }
+
+        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            unsafe { libc::kill(child_pid, libc::SIGKILL) };
+            break;
+        }
+
+        // Check child status.
+        if !child_exited {
+            let ret = unsafe { libc::waitpid(child_pid, &mut wstatus, libc::WNOHANG) };
+            if ret > 0 {
+                child_exited = true;
+                grace_deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+            }
+        }
+
+        // After child exit: drain remaining master output, then return.
+        // Grace period handles background jobs holding the slave open.
+        if child_exited {
+            if master_done {
+                return exit_code_from_wstatus(wstatus);
+            }
+            if let Some(deadline) = grace_deadline {
+                if std::time::Instant::now() >= deadline {
+                    return exit_code_from_wstatus(wstatus);
+                }
+            }
+        }
+    }
+
+    if !child_exited {
+        unsafe { libc::waitpid(child_pid, &mut wstatus, 0) };
+    }
+    exit_code_from_wstatus(wstatus)
 }
 
 /// Drain available data from a non-blocking pipe and write as framed
