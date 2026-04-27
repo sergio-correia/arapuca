@@ -525,21 +525,211 @@ fn image_setup(args: &[String]) {
 fn vm_subcommand(args: &[String]) {
     match args.first().map(|s| s.as_str()) {
         Some("run") => vm_run(&args[1..]),
+        Some("start") => vm_start(&args[1..]),
+        Some("list") | Some("ls") => vm_list(),
         _ => {
-            eprintln!("usage: arapuca vm run [flags] -- command [args...]");
+            eprintln!("usage: arapuca vm <command>");
             eprintln!();
-            eprintln!("flags:");
-            eprintln!("  --image <distro:version|path>   image to boot (required)");
-            eprintln!("  --cpus <n>                      vCPUs (default: 2)");
-            eprintln!("  --mem <mb>                      RAM in MB (default: 2048)");
-            eprintln!("  -v, --volume <host:guest[:opts]> mount host dir (ro,z,Z)");
-            eprintln!("  --net                           enable networking (passt)");
-            eprintln!("  --env <KEY=VALUE>               set env var in guest");
-            eprintln!("  --write-file <host:guest>       inject file into guest");
-            eprintln!("  --timeout <seconds>             wall-clock limit");
-            eprintln!("  --task-id <id>                  task identifier");
+            eprintln!("commands:");
+            eprintln!("  run [flags] -- command [args...]   run a command in an ephemeral VM");
+            eprintln!("  start [flags]                      start a persistent VM");
+            eprintln!("  list                               list VMs");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(feature = "microvm")]
+fn vm_start(args: &[String]) {
+    let mut image: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut cpus: u32 = 2;
+    let mut mem_mb: u32 = 2048;
+    let mut net = false;
+    let mut volumes: Vec<arapuca::vm::VolumeSpec> = Vec::new();
+    let mut max_lifetime: Option<u64> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--image" => {
+                i += 1;
+                image = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("--image requires a value");
+                            std::process::exit(125);
+                        })
+                        .clone(),
+                );
+            }
+            "--name" => {
+                i += 1;
+                name = Some(
+                    args.get(i)
+                        .unwrap_or_else(|| {
+                            eprintln!("--name requires a value");
+                            std::process::exit(125);
+                        })
+                        .clone(),
+                );
+            }
+            "--cpus" => {
+                i += 1;
+                cpus = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("--cpus requires a positive integer");
+                    std::process::exit(125);
+                });
+                if cpus == 0 {
+                    eprintln!("--cpus must be > 0");
+                    std::process::exit(125);
+                }
+            }
+            "--mem" => {
+                i += 1;
+                mem_mb = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("--mem requires a positive integer");
+                    std::process::exit(125);
+                });
+                if mem_mb == 0 {
+                    eprintln!("--mem must be > 0");
+                    std::process::exit(125);
+                }
+            }
+            "--net" => {
+                net = true;
+            }
+            "-v" | "--volume" => {
+                i += 1;
+                let spec = args.get(i).unwrap_or_else(|| {
+                    eprintln!("-v requires host:guest[:opts]");
+                    std::process::exit(125);
+                });
+                let parts: Vec<&str> = spec.splitn(3, ':').collect();
+                if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+                    eprintln!("invalid volume: {spec} (expected host:guest[:opts])");
+                    std::process::exit(125);
+                }
+                let opts = parts.get(2).unwrap_or(&"").to_lowercase();
+                volumes.push(arapuca::vm::VolumeSpec {
+                    host: parts[0].to_string(),
+                    guest: parts[1].to_string(),
+                    read_only: opts.contains("ro"),
+                });
+            }
+            "--max-lifetime" => {
+                i += 1;
+                max_lifetime =
+                    Some(args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                        eprintln!("--max-lifetime requires a positive integer");
+                        std::process::exit(125);
+                    }));
+            }
+            other => {
+                eprintln!("unknown flag: {other}");
+                eprintln!("run 'arapuca vm start --help' for usage");
+                std::process::exit(125);
+            }
+        }
+        i += 1;
+    }
+
+    // --image is required on first start, optional on restart.
+    let vm_name = name.unwrap_or_else(|| {
+        let mut buf = [0u8; 8];
+        // SAFETY: getrandom with valid buffer and no flags.
+        unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+        format!(
+            "vm-{}",
+            buf.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        )
+    });
+
+    // Check if this is a restart (VM dir exists but not running).
+    let is_restart = arapuca::vm::state::vm_dir(&vm_name)
+        .map(|d| d.exists())
+        .unwrap_or(false);
+
+    let image_source = if let Some(img) = &image {
+        parse_image_source(img)
+    } else if is_restart {
+        match arapuca::vm::state::VmConfig::load(&vm_name) {
+            Ok(cfg) => parse_image_source(&cfg.image),
+            Err(e) => {
+                eprintln!("arapuca: cannot load VM config: {e}");
+                std::process::exit(125);
+            }
+        }
+    } else {
+        eprintln!("--image is required for new VMs");
+        std::process::exit(125);
+    };
+
+    // Default max-lifetime: 24 hours.
+    let max_lifetime = max_lifetime.or(Some(86400));
+
+    let opts = arapuca::vm::StartOpts {
+        name: vm_name,
+        image: image_source,
+        cpus,
+        mem_mb,
+        net,
+        volumes,
+        max_lifetime,
+    };
+
+    match arapuca::vm::start(&opts) {
+        Ok(result) => {
+            println!("{} {}", result.name, result.pid);
+        }
+        Err(e) => {
+            eprintln!("arapuca: vm start failed: {e}");
+            std::process::exit(125);
+        }
+    }
+}
+
+#[cfg(feature = "microvm")]
+fn vm_list() {
+    match arapuca::vm::state::list_vms() {
+        Ok(vms) => {
+            if vms.is_empty() {
+                println!("no VMs");
+                return;
+            }
+            for vm in &vms {
+                let status = if vm.running { "running" } else { "stopped" };
+                let pid = vm.pid.map(|p| p.to_string()).unwrap_or_default();
+                let size_mb = vm.overlay_size_bytes / (1024 * 1024);
+                println!(
+                    "{:<20} {:<10} {:<8} {:<10} {}MB",
+                    vm.name, status, pid, vm.image, size_mb
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("arapuca: vm list failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(feature = "microvm")]
+fn parse_image_source(spec: &str) -> arapuca::ImageSource {
+    if spec.contains('/') || spec.ends_with(".qcow2") || spec.ends_with(".raw") {
+        arapuca::ImageSource::Path(PathBuf::from(spec))
+    } else if let Some((distro, version)) = spec.split_once(':') {
+        if distro.is_empty() || version.is_empty() {
+            eprintln!("invalid image: {spec} (expected distro:version or path)");
+            std::process::exit(125);
+        }
+        arapuca::ImageSource::Distro {
+            name: distro.to_string(),
+            version: version.to_string(),
+        }
+    } else {
+        eprintln!("invalid image: {spec} (expected distro:version or path)");
+        std::process::exit(125);
     }
 }
 
