@@ -913,84 +913,40 @@ fn vm_stop(args: &[String]) {
         std::process::exit(1);
     }
 
-    // Try graceful shutdown via the agent.
-    if !force {
-        if let Ok(config) = arapuca::vm::state::VmConfig::load(&vm_name) {
-            if let Ok(sock_path) = arapuca::vm::state::agent_sock_path(&vm_name) {
-                if graceful_shutdown(&sock_path, &config.nonce, &vm_name, timeout_secs) {
-                    kill_passt_from_config(&config);
-                    println!("stopped {vm_name}");
-                    return;
-                }
-                eprintln!("graceful shutdown timed out, sending SIGKILL");
-            }
-        }
-    }
-
-    // Force kill: send SIGKILL to the VM PID.
+    // Send SIGTERM first (gives krun a chance to clean up), then
+    // SIGKILL after the timeout. Graceful guest-side shutdown via
+    // the agent is not possible with standard libkrun (only
+    // libkrun-efi supports krun_get_shutdown_eventfd).
     if let Ok(Some(pid)) = arapuca::vm::state::read_lock_pid(&vm_name) {
-        // SAFETY: pid is from the lockfile, verified running above.
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+        // SAFETY: pid found via /proc scan, verified running.
+        unsafe { libc::kill(pid as i32, sig) };
+
+        // Wait for the process to exit.
+        for _ in 0..(timeout_secs * 10) {
+            if !arapuca::vm::state::is_running(&vm_name).unwrap_or(true) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Escalate to SIGKILL if still running.
+        if !force && arapuca::vm::state::is_running(&vm_name).unwrap_or(false) {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
 
     if let Ok(config) = arapuca::vm::state::VmConfig::load(&vm_name) {
         kill_passt_from_config(&config);
     }
 
-    // Wait briefly for the lock to be released.
-    for _ in 0..50 {
-        if !arapuca::vm::state::is_running(&vm_name).unwrap_or(true) {
-            println!("stopped {vm_name}");
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    if arapuca::vm::state::is_running(&vm_name).unwrap_or(false) {
+        eprintln!("arapuca: VM '{vm_name}' did not stop");
+        std::process::exit(1);
     }
 
-    eprintln!("arapuca: VM '{vm_name}' did not stop");
-    std::process::exit(1);
-}
-
-#[cfg(feature = "microvm")]
-fn graceful_shutdown(
-    sock_path: &std::path::Path,
-    nonce: &[u8; arapuca::vm::protocol::NONCE_SIZE],
-    vm_name: &str,
-    timeout_secs: u64,
-) -> bool {
-    use std::os::unix::net::UnixStream;
-    use std::time::Duration;
-
-    let mut stream = match UnixStream::connect(sock_path) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-
-    if arapuca::vm::protocol::write_nonce(&mut stream, nonce).is_err() {
-        return false;
-    }
-    match arapuca::vm::protocol::read_control(&mut stream) {
-        Ok(arapuca::vm::protocol::ControlMessage::Hello { .. }) => {}
-        _ => return false,
-    }
-    if arapuca::vm::protocol::write_control(
-        &mut stream,
-        &arapuca::vm::protocol::ControlMessage::Shutdown,
-    )
-    .is_err()
-    {
-        return false;
-    }
-
-    // Wait for the VM to exit (lockfile released).
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        if !arapuca::vm::state::is_running(vm_name).unwrap_or(true) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    false
+    println!("stopped {vm_name}");
 }
 
 #[cfg(feature = "microvm")]
