@@ -330,6 +330,37 @@ fn set_recv_timeout(fd: RawFd, secs: u64) {
     }
 }
 
+// ─── PATH resolution ──────────────────────────────────────────
+
+/// Resolve a command name to an absolute path using the request's
+/// PATH environment variable. Returns None if not found.
+fn resolve_command(cmd: &str, env: &[String]) -> Option<String> {
+    if cmd.contains('/') {
+        return Some(cmd.to_string());
+    }
+
+    let path_val = env
+        .iter()
+        .find_map(|e| e.strip_prefix("PATH="))
+        .unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+
+    for dir in path_val.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = format!("{dir}/{cmd}");
+        let c_path = match CString::new(candidate.as_str()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // SAFETY: c_path is a valid null-terminated string.
+        if unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0 {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 // ─── exec handler ─────────────────────────────────────────────
 
 fn handle_exec(conn_fd: RawFd, req: &ExecRequest) -> i32 {
@@ -347,10 +378,21 @@ fn handle_exec(conn_fd: RawFd, req: &ExecRequest) -> i32 {
         None
     };
 
+    // Resolve command via PATH before fork (allocations and
+    // access() are not async-signal-safe).
+    let resolved_cmd = resolve_command(&req.cmd, &req.env);
+    let cmd_str = match &resolved_cmd {
+        Some(path) => path.as_str(),
+        None => {
+            eprintln!("agent: command not found: {}", req.cmd);
+            return 127;
+        }
+    };
+
     // Build ALL data structures before fork — allocations are not
     // async-signal-safe and can deadlock if another thread holds the
     // allocator lock at fork time.
-    let c_cmd = match CString::new(req.cmd.as_str()) {
+    let c_cmd = match CString::new(cmd_str) {
         Ok(c) => c,
         Err(_) => return 126,
     };

@@ -807,22 +807,44 @@ fn vm_exec(args: &[String]) {
         }
     };
 
-    // Filter dangerous env vars before sending to the agent.
-    // Both caller env and explicit --env values are filtered.
-    let caller_env: Vec<(String, String)> = std::env::vars().collect();
-    let filtered = arapuca::env::filter_caller_env(&caller_env);
-    let explicit_env: Vec<(String, String)> = env_vars
+    // Build a minimal base env (do NOT forward the host environment).
+    // Matches podman/docker exec semantics.
+    let home = if user == "root" {
+        "/root".to_string()
+    } else {
+        format!("/home/{user}")
+    };
+    let term = std::env::var("TERM")
+        .unwrap_or_else(|_| "xterm".to_string())
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c))
+        .take(64)
+        .collect::<String>();
+
+    let mut env_map = std::collections::HashMap::new();
+    env_map.insert("HOME".to_string(), home);
+    env_map.insert(
+        "PATH".to_string(),
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+    );
+    env_map.insert("TERM".to_string(), term);
+    env_map.insert("LANG".to_string(), "C.UTF-8".to_string());
+
+    // Explicit --env values override base vars (filtered for dangerous vars).
+    let explicit: Vec<(String, String)> = env_vars
         .iter()
         .filter_map(|kv| {
             let (k, v) = kv.split_once('=')?;
             Some((k.to_string(), v.to_string()))
         })
         .collect();
-    let filtered_explicit = arapuca::env::filter_caller_env(&explicit_env);
-    let filtered_env: Vec<String> = filtered
-        .passed
+    let filtered = arapuca::env::filter_caller_env(&explicit);
+    for (k, v) in filtered.passed {
+        env_map.insert(k, v);
+    }
+
+    let filtered_env: Vec<String> = env_map
         .into_iter()
-        .chain(filtered_explicit.passed)
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 
