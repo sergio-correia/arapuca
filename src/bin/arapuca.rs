@@ -15,6 +15,8 @@
 //! Usage: arapuca -- command [args...]
 
 use std::ffi::CString;
+#[cfg(feature = "microvm")]
+use std::io::IsTerminal;
 #[cfg(target_os = "linux")]
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -737,6 +739,7 @@ fn vm_exec(args: &[String]) {
     let rest = &args[1..];
     let mut env_vars: Vec<String> = Vec::new();
     let mut user = "root".to_string();
+    let mut tty = false;
 
     let sep_pos = rest.iter().position(|a| a == "--");
     let flag_args = match sep_pos {
@@ -771,6 +774,9 @@ fn vm_exec(args: &[String]) {
                         std::process::exit(125);
                     })
                     .clone();
+            }
+            "-t" | "--tty" => {
+                tty = true;
             }
             other => {
                 eprintln!("unknown flag: {other}");
@@ -820,6 +826,11 @@ fn vm_exec(args: &[String]) {
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 
+    if tty && !std::io::stdin().is_terminal() {
+        eprintln!("arapuca: -t requires a terminal on stdin");
+        std::process::exit(125);
+    }
+
     let cmd = cmd_args[0].as_str();
     let cmd_rest: Vec<String> = cmd_args[1..].to_vec();
 
@@ -830,6 +841,7 @@ fn vm_exec(args: &[String]) {
         &cmd_rest,
         &filtered_env,
         &user,
+        tty,
     ) {
         Ok(code) => code,
         Err(e) => {
