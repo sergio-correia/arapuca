@@ -940,12 +940,14 @@ fn vm_stop(args: &[String]) {
     // Wait briefly for the lock to be released.
     for _ in 0..50 {
         if !arapuca::vm::state::is_running(&vm_name).unwrap_or(true) {
-            break;
+            println!("stopped {vm_name}");
+            return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    println!("stopped {vm_name}");
+    eprintln!("arapuca: VM '{vm_name}' did not stop");
+    std::process::exit(1);
 }
 
 #[cfg(feature = "microvm")]

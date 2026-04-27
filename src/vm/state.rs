@@ -144,9 +144,11 @@ pub fn acquire_lock(name: &str) -> io::Result<RawFd> {
 /// the daemon has a different PID than the parent that acquired
 /// the lock.
 pub fn update_lock_pid(lock_fd: RawFd) -> io::Result<()> {
+    use std::io::Seek;
     use std::os::fd::FromRawFd;
     let mut lock_file = unsafe { fs::File::from_raw_fd(lock_fd) };
     lock_file.set_len(0)?;
+    lock_file.seek(std::io::SeekFrom::Start(0))?;
     write!(lock_file, "{}", std::process::id())?;
     lock_file.flush()?;
     std::mem::forget(lock_file);
