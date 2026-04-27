@@ -193,11 +193,72 @@ pub fn is_running(name: &str) -> io::Result<bool> {
 
 /// Read the PID from the lockfile (supplementary metadata for display).
 pub fn read_lock_pid(name: &str) -> io::Result<Option<u32>> {
+    // Prefer fcntl(F_GETLK) which returns the actual lock holder PID,
+    // regardless of what's written in the file. Falls back to file
+    // content if F_GETLK fails.
+    if let Some(pid) = lock_holder_pid(name)? {
+        return Ok(Some(pid));
+    }
     let path = vm_dir(name)?.join(VM_LOCK);
     match fs::read_to_string(&path) {
         Ok(s) => Ok(s.trim().parse().ok()),
         Err(_) => Ok(None),
     }
+}
+
+/// Find the PID of the process holding the lockfile open.
+///
+/// Scans /proc/*/fd to find which process has the lockfile fd open.
+/// This works even when krun_start_enter forks internally and the
+/// lockfile PID metadata is stale.
+fn lock_holder_pid(name: &str) -> io::Result<Option<u32>> {
+    let path = vm_dir(name)?.join(VM_LOCK);
+    let lock_ino = match fs::metadata(&path) {
+        Ok(m) => {
+            use std::os::unix::fs::MetadataExt;
+            m.ino()
+        }
+        Err(_) => return Ok(None),
+    };
+
+    let proc_dir = match fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+
+    for entry in proc_dir.flatten() {
+        let pid_str = entry.file_name();
+        let pid_str = pid_str.to_string_lossy();
+        let pid: u32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let fd_dir = format!("/proc/{pid}/fd");
+        let fds = match fs::read_dir(&fd_dir) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        for fd_entry in fds.flatten() {
+            let link = match fs::read_link(fd_entry.path()) {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if let Ok(m) = fs::metadata(fd_entry.path()) {
+                use std::os::unix::fs::MetadataExt;
+                if m.ino() == lock_ino {
+                    return Ok(Some(pid));
+                }
+            }
+            // Also check if symlink target matches the lockfile path.
+            if link == path {
+                return Ok(Some(pid));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 // ─── Nonce ────────────────────────────────────────────────────
