@@ -4,6 +4,7 @@
 //! resolution for micro-VM root filesystem images.
 
 pub mod cache;
+pub mod centos;
 pub mod cloudinit;
 #[cfg(feature = "microvm")]
 pub mod download;
@@ -36,6 +37,7 @@ pub fn resolve(source: &crate::ImageSource) -> std::io::Result<CachedImage> {
         }
         crate::ImageSource::Distro { name, version } => match name.as_str() {
             "fedora" => fedora::resolve(version),
+            "centos" | "centos-stream" => centos::resolve(version),
             _ => provider::resolve_external(name, version),
         },
     }
