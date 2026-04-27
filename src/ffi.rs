@@ -1178,7 +1178,7 @@ pub unsafe extern "C" fn arapuca_image_pull(
         name: distro,
         version,
     };
-    match crate::images::resolve(&source) {
+    match crate::images::resolve(&source, &Default::default()) {
         Ok(cached) => match CString::new(cached.path.to_string_lossy().as_bytes()) {
             Ok(cs) => cs.into_raw(),
             Err(e) => {

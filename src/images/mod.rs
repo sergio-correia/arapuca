@@ -20,13 +20,22 @@ pub mod setup;
 pub use cache::CachedImage;
 pub use metadata::ImageMetadata;
 
+/// Options controlling image resolution behavior.
+#[derive(Debug, Default)]
+pub struct ResolveOptions {
+    /// Re-download even if cached.
+    pub force: bool,
+    /// Fetch remote checksum and download only if it differs from cache.
+    pub check: bool,
+}
+
 /// Resolve an image source to a cached image.
 ///
-/// Dispatches to the built-in Fedora provider or an external
+/// Dispatches to the built-in Fedora/CentOS providers or an external
 /// `arapuca-images-{distro}` provider based on the distro name.
 /// For explicit paths, loads the sidecar metadata.
 #[cfg(feature = "microvm")]
-pub fn resolve(source: &crate::ImageSource) -> std::io::Result<CachedImage> {
+pub fn resolve(source: &crate::ImageSource, opts: &ResolveOptions) -> std::io::Result<CachedImage> {
     match source {
         crate::ImageSource::Path(path) => {
             let metadata = ImageMetadata::load_sidecar(path)?;
@@ -36,8 +45,8 @@ pub fn resolve(source: &crate::ImageSource) -> std::io::Result<CachedImage> {
             })
         }
         crate::ImageSource::Distro { name, version } => match name.as_str() {
-            "fedora" => fedora::resolve(version),
-            "centos" | "centos-stream" => centos::resolve(version),
+            "fedora" => fedora::resolve(version, opts),
+            "centos" | "centos-stream" => centos::resolve(version, opts),
             _ => provider::resolve_external(name, version),
         },
     }

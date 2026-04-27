@@ -103,7 +103,7 @@ impl Sandbox for MicroVm {
             let image_source = cfg.profile.isolation.image_source().ok_or_else(|| {
                 Error::MicroVm("MicroVm isolation requires an image source".into())
             })?;
-            let cached = crate::images::resolve(image_source)?;
+            let cached = crate::images::resolve(image_source, &Default::default())?;
 
             // Create COW overlay so the template stays immutable.
             let overlay_dir = tmp_dir.join("vm");

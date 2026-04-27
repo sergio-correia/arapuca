@@ -35,7 +35,7 @@ pub fn start(opts: &StartOpts) -> crate::Result<StartResult> {
     let vm_dir = state::create_vm_dir(name, allow_existing)?;
 
     // Resolve image.
-    let cached = crate::images::resolve(&opts.image)?;
+    let cached = crate::images::resolve(&opts.image, &Default::default())?;
 
     // Create or reuse the persistent overlay.
     let overlay_path = vm_dir.join("disk.qcow2");

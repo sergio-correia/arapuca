@@ -19,7 +19,10 @@ const FEDORA_FSTYPE: &str = "btrfs";
 /// discovers the correct filename from the Fedora mirror,
 /// downloads it, and caches the result.
 #[cfg(feature = "microvm")]
-pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
+pub fn resolve(
+    version: &str,
+    opts: &super::ResolveOptions,
+) -> std::io::Result<super::cache::CachedImage> {
     use std::io;
 
     if version.is_empty() {
@@ -32,8 +35,26 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
     let arch = std::env::consts::ARCH;
     let cache_name = format!("fedora-{version}-{arch}");
 
-    if let Some(cached) = super::cache::lookup(&cache_name)? {
-        return Ok(cached);
+    if !opts.force {
+        if let Some(cached) = super::cache::lookup(&cache_name)? {
+            if opts.check {
+                match check_freshness(version, arch, &cached) {
+                    Ok(true) => {
+                        eprintln!("image is up to date (sha256 matches remote)");
+                        return Ok(cached);
+                    }
+                    Ok(false) => {
+                        eprintln!("remote image has changed, re-downloading...");
+                    }
+                    Err(e) => {
+                        eprintln!("warning: unable to check freshness: {e}");
+                        return Ok(cached);
+                    }
+                }
+            } else {
+                return Ok(cached);
+            }
+        }
     }
 
     eprintln!("resolving fedora {version} ({arch})...");
@@ -45,11 +66,9 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
     let dir = super::cache::images_dir()?;
     let tmp_path = dir.join(format!("{cache_name}.qcow2.partial"));
 
-    // Clean up partial file on all exit paths.
     let result = (|| {
         let sha256 = super::download::fetch_to_file(&url, &tmp_path)?;
 
-        // Verify checksum against the mirror's CHECKSUM file.
         if let Some(ref cksum_file) = checksum_name {
             let cksum_url = format!("{base_url}{cksum_file}");
             match super::download::fetch_text(&cksum_url, 1024 * 1024) {
@@ -89,12 +108,19 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
                 fedora_metadata()
             }
         };
-        metadata.sha256 = Some(sha256);
+        metadata.sha256 = Some(sha256.clone());
         eprintln!(
             "caching image (root={} fs={})...",
             metadata.root_device, metadata.fstype
         );
-        super::cache::store(&cache_name, &tmp_path, &metadata)
+        let cached = super::cache::store(&cache_name, &tmp_path, &metadata)?;
+
+        let orphaned = super::setup::clean_orphaned(&cache_name, Some(&sha256))?;
+        if orphaned > 0 {
+            eprintln!("cleaned {orphaned} orphaned setup layer(s)");
+        }
+
+        Ok(cached)
     })();
 
     let _ = std::fs::remove_file(&tmp_path);
@@ -102,6 +128,35 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
         eprintln!("done");
     }
     result
+}
+
+/// Check whether the remote image checksum differs from the cached one.
+///
+/// Returns `Ok(true)` if up to date, `Ok(false)` if changed.
+#[cfg(feature = "microvm")]
+fn check_freshness(
+    version: &str,
+    arch: &str,
+    cached: &super::cache::CachedImage,
+) -> std::io::Result<bool> {
+    let cached_sha = cached.metadata.sha256.as_deref().ok_or_else(|| {
+        std::io::Error::other("cached image has no sha256 — cannot check freshness")
+    })?;
+
+    let (filename, checksum_name) = discover_image_and_checksum(version, arch)?;
+    let base_url = images_dir_url(version, arch);
+
+    let cksum_file = checksum_name.ok_or_else(|| {
+        std::io::Error::other("no CHECKSUM file found on mirror — cannot check freshness")
+    })?;
+    let cksum_url = format!("{base_url}{cksum_file}");
+    let body = super::download::fetch_text(&cksum_url, 1024 * 1024)?;
+
+    let remote_sha = super::download::parse_checksum(&body, &filename).ok_or_else(|| {
+        std::io::Error::other("no SHA256 entry in CHECKSUM file — cannot check freshness")
+    })?;
+
+    Ok(cached_sha == remote_sha)
 }
 
 /// Discover the qcow2 image and CHECKSUM filenames from the Fedora

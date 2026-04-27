@@ -217,7 +217,8 @@ fn image_subcommand(args: &[String]) {
         _ => {
             eprintln!("usage: arapuca image <pull|list|rm|setup>");
             eprintln!();
-            eprintln!("  pull <distro>:<version>      download and cache an image");
+            eprintln!("  pull [--force|--check] <distro>:<version>");
+            eprintln!("                               download and cache an image");
             eprintln!("  list                         show cached images");
             eprintln!("  rm <distro>:<version>        remove a cached image");
             eprintln!("  setup <distro:ver> [flags]   create a setup layer");
@@ -228,13 +229,34 @@ fn image_subcommand(args: &[String]) {
 
 #[cfg(feature = "microvm")]
 fn image_pull(args: &[String]) {
-    let spec = match args.first() {
+    let mut force = false;
+    let mut check = false;
+    let mut spec = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "--force" => force = true,
+            "--check" => check = true,
+            s if !s.starts_with('-') && spec.is_none() => spec = Some(s),
+            _ => {
+                eprintln!("usage: arapuca image pull [--force|--check] <distro>:<version>");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let spec = match spec {
         Some(s) => s,
         None => {
-            eprintln!("usage: arapuca image pull <distro>:<version>");
+            eprintln!("usage: arapuca image pull [--force|--check] <distro>:<version>");
             std::process::exit(1);
         }
     };
+
+    if force && check {
+        eprintln!("--force and --check are mutually exclusive");
+        std::process::exit(1);
+    }
 
     let (distro, version) = match spec.split_once(':') {
         Some((d, v)) if !d.is_empty() && !v.is_empty() => (d, v),
@@ -248,8 +270,9 @@ fn image_pull(args: &[String]) {
         name: distro.into(),
         version: version.into(),
     };
+    let opts = arapuca::images::ResolveOptions { force, check };
 
-    match arapuca::images::resolve(&source) {
+    match arapuca::images::resolve(&source, &opts) {
         Ok(cached) => {
             println!("{}", cached.path.display());
         }
@@ -403,7 +426,7 @@ fn image_setup(args: &[String]) {
     };
 
     // Resolve the base image (pull if needed).
-    let cached = match arapuca::images::resolve(&image_source) {
+    let cached = match arapuca::images::resolve(&image_source, &Default::default()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("arapuca: image resolve failed: {e}");
@@ -1025,7 +1048,7 @@ fn vm_reset(args: &[String]) {
     };
 
     let image_source = parse_image_source(&config.image);
-    let cached = match arapuca::images::resolve(&image_source) {
+    let cached = match arapuca::images::resolve(&image_source, &Default::default()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("arapuca: image resolve: {e}");

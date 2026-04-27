@@ -14,7 +14,10 @@ const CENTOS_FSTYPE: &str = "xfs";
 /// downloads the `-latest` image from the CentOS mirror and
 /// caches the result.
 #[cfg(feature = "microvm")]
-pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
+pub fn resolve(
+    version: &str,
+    opts: &super::ResolveOptions,
+) -> std::io::Result<super::cache::CachedImage> {
     use std::io;
 
     validate_version(version)?;
@@ -22,8 +25,26 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
     let arch = std::env::consts::ARCH;
     let cache_name = format!("centos-{version}-{arch}");
 
-    if let Some(cached) = super::cache::lookup(&cache_name)? {
-        return Ok(cached);
+    if !opts.force {
+        if let Some(cached) = super::cache::lookup(&cache_name)? {
+            if opts.check {
+                match check_freshness(version, arch, &cached) {
+                    Ok(true) => {
+                        eprintln!("image is up to date (sha256 matches remote)");
+                        return Ok(cached);
+                    }
+                    Ok(false) => {
+                        eprintln!("remote image has changed, re-downloading...");
+                    }
+                    Err(e) => {
+                        eprintln!("warning: unable to check freshness: {e}");
+                        return Ok(cached);
+                    }
+                }
+            } else {
+                return Ok(cached);
+            }
+        }
     }
 
     eprintln!("resolving centos stream {version} ({arch})...");
@@ -71,12 +92,19 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
                 centos_metadata()
             }
         };
-        metadata.sha256 = Some(sha256);
+        metadata.sha256 = Some(sha256.clone());
         eprintln!(
             "caching image (root={} fs={})...",
             metadata.root_device, metadata.fstype
         );
-        super::cache::store(&cache_name, &tmp_path, &metadata)
+        let cached = super::cache::store(&cache_name, &tmp_path, &metadata)?;
+
+        let orphaned = super::setup::clean_orphaned(&cache_name, Some(&sha256))?;
+        if orphaned > 0 {
+            eprintln!("cleaned {orphaned} orphaned setup layer(s)");
+        }
+
+        Ok(cached)
     })();
 
     let _ = std::fs::remove_file(&tmp_path);
@@ -84,6 +112,30 @@ pub fn resolve(version: &str) -> std::io::Result<super::cache::CachedImage> {
         eprintln!("done");
     }
     result
+}
+
+/// Check whether the remote image checksum differs from the cached one.
+///
+/// Returns `Ok(true)` if up to date, `Ok(false)` if changed.
+#[cfg(feature = "microvm")]
+fn check_freshness(
+    version: &str,
+    arch: &str,
+    cached: &super::cache::CachedImage,
+) -> std::io::Result<bool> {
+    let cached_sha = cached.metadata.sha256.as_deref().ok_or_else(|| {
+        std::io::Error::other("cached image has no sha256 — cannot check freshness")
+    })?;
+
+    let filename = image_filename(version, arch);
+    let cksum_url = format!("{}{filename}.SHA256SUM", images_dir_url(version, arch));
+    let body = super::download::fetch_text(&cksum_url, 1024 * 1024)?;
+
+    let remote_sha = super::download::parse_checksum(&body, &filename).ok_or_else(|| {
+        std::io::Error::other("no SHA256 entry in checksum file — cannot check freshness")
+    })?;
+
+    Ok(cached_sha == remote_sha)
 }
 
 #[cfg(any(feature = "microvm", test))]
