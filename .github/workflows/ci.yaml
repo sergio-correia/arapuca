@@ -55,7 +55,7 @@ jobs:
     needs: check-linux
     steps:
       - name: Install deps
-        run: dnf install -y gcc make cargo openssl-devel
+        run: dnf install -y gcc make cargo openssl-devel python3
 
       - uses: actions/checkout@v4
 
