@@ -154,6 +154,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn parse_valid_response() {
         let json = r#"{
   "image": "/data/images/rhel-10.0.qcow2",
@@ -168,6 +169,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn parse_response_default_init() {
         let json = r#"{"image": "/img.qcow2", "root_device": "/dev/vda1", "fstype": "ext4"}"#;
         let cached = parse_provider_response(json).unwrap();
