@@ -24,6 +24,9 @@ use std::path::PathBuf;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // Check for --config flag before other processing.
+    let (config_path, args) = extract_config_flag(args);
+
     // Dispatch subcommands before the sandbox path.
     if args.get(1).is_some_and(|a| a == "image") {
         image_subcommand(&args[2..]);
@@ -66,6 +69,20 @@ fn main() {
         }
     }
 
+    // Load TOML configuration if requested or available.
+    let toml_config = if let Some(path) = config_path {
+        match arapuca::config::ArapucaConfig::load_from_path(&path) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                eprintln!("arapuca: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Try to load from default locations (user/project).
+        arapuca::config::ArapucaConfig::load().ok()
+    };
+
     // Apply sandbox restrictions. Fail-closed: exit non-zero if any
     // step fails. The subprocess never runs unsandboxed.
 
@@ -73,8 +90,22 @@ fn main() {
     // 2. Seccomp BPF syscall filter (Linux only).
     #[cfg(target_os = "linux")]
     {
-        let read_paths = env_paths("ARAPUCA_READ_PATHS");
-        let write_paths = env_paths("ARAPUCA_WRITE_PATHS");
+        let (read_paths, write_paths) = if let Some(ref cfg) = toml_config {
+            // TOML config takes precedence, but env vars can still override.
+            let read = if std::env::var("ARAPUCA_READ_PATHS").is_ok() {
+                env_paths("ARAPUCA_READ_PATHS")
+            } else {
+                cfg.sandbox.read_paths.clone()
+            };
+            let write = if std::env::var("ARAPUCA_WRITE_PATHS").is_ok() {
+                env_paths("ARAPUCA_WRITE_PATHS")
+            } else {
+                cfg.sandbox.write_paths.clone()
+            };
+            (read, write)
+        } else {
+            (env_paths("ARAPUCA_READ_PATHS"), env_paths("ARAPUCA_WRITE_PATHS"))
+        };
 
         let profile = arapuca::Profile {
             read_paths,
@@ -1806,4 +1837,23 @@ fn which(cmd: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Extract --config flag from arguments, returning (config_path, remaining_args).
+fn extract_config_flag(args: Vec<String>) -> (Option<PathBuf>, Vec<String>) {
+    let mut config_path = None;
+    let mut remaining = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        if args[i] == "--config" && i + 1 < args.len() {
+            config_path = Some(PathBuf::from(&args[i + 1]));
+            i += 2; // Skip both --config and its value.
+        } else {
+            remaining.push(args[i].clone());
+            i += 1;
+        }
+    }
+
+    (config_path, remaining)
 }

@@ -38,6 +38,10 @@ pub enum Error {
     #[error("validation: {0}")]
     Validation(String),
 
+    /// Configuration error (invalid TOML, missing required fields, etc.).
+    #[error("config: {0}")]
+    Config(String),
+
     /// System call failed.
     #[error("syscall {name}: {source}")]
     Syscall {

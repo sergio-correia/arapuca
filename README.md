@@ -109,10 +109,23 @@ The simplest integration: wrap any command with `arapuca`.
 # Build
 cargo build --release
 
-# Run a command with filesystem restrictions
+# Run a command with filesystem restrictions (environment variables)
 ARAPUCA_READ_PATHS="/usr:/lib:/lib64:/bin:/etc:/dev" \
 ARAPUCA_WRITE_PATHS="/tmp/workspace" \
 ./target/release/arapuca -- python3 agent.py
+
+# Or use a TOML configuration file (recommended)
+cat > arapuca.toml <<EOF
+[sandbox]
+read_paths = ["/usr", "/lib", "/lib64", "/bin", "/etc", "/dev"]
+write_paths = ["/tmp/workspace"]
+
+[resources]
+max_memory_mb = 2048
+max_pids = 256
+EOF
+
+./target/release/arapuca --config arapuca.toml -- /usr/bin/python3 agent.py
 
 # The sandboxed process:
 # - Can only read files under /usr, /lib, /bin, /etc, /dev
@@ -223,7 +236,54 @@ is built separately without libkrun:
 cargo build --features vm-agent --bin arapuca-agent
 ```
 
-### Environment Variables
+### Configuration
+
+Arapuca supports configuration via TOML files, environment variables, or
+CLI flags. TOML configuration is recommended for complex setups.
+
+#### TOML Configuration Files
+
+Create a configuration file at one of these locations:
+
+- **User config**: `~/.config/arapuca/config.toml`
+- **Project config**: `./arapuca.toml` or `./.arapuca.toml`
+- **Custom path**: Use `--config <path>` flag
+
+**Configuration precedence** (highest to lowest):
+1. Command-line flags
+2. Project config (`./arapuca.toml` or `./.arapuca.toml`)
+3. User config (`~/.config/arapuca/config.toml`)
+4. Environment variables (`ARAPUCA_*`)
+5. Default values
+
+**Example configuration** (`arapuca.toml`):
+
+```toml
+[sandbox]
+read_paths = ["/usr", "/lib", "/etc", "/bin"]
+write_paths = ["/tmp/workspace"]
+
+[resources]
+max_memory_mb = 2048
+max_pids = 256
+max_cpu_pct = 200
+
+[microvm]
+image = "fedora:42"
+cpus = 4
+mem_mb = 4096
+
+[[microvm.volume]]
+host = "/home/user/project"
+guest = "/workspace"
+read_only = false
+```
+
+See [`config.example.toml`](config.example.toml) for all available options.
+
+#### Environment Variables (legacy)
+
+Environment variables continue to work for backward compatibility:
 
 | Variable | Description |
 |----------|-------------|
@@ -236,6 +296,10 @@ cargo build --features vm-agent --bin arapuca-agent
 
 All `ARAPUCA_*` variables are stripped from the environment before
 exec — the sandboxed process cannot inspect its own configuration.
+
+**Note**: TOML configuration is recommended over environment variables
+for better structure, validation, and support for complex features like
+volumes and file injection.
 
 ### Rust Library
 

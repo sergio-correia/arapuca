@@ -15,6 +15,7 @@ pub mod audit;
 pub mod bridge;
 #[cfg(target_os = "linux")]
 pub mod cgroup;
+pub mod config;
 pub mod diskquota;
 pub mod env;
 mod error;

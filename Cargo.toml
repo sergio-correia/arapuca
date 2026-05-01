@@ -22,13 +22,15 @@ required-features = ["vm-agent"]
 
 [dependencies]
 log = "0.4"
-serde = { version = "1", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
+toml = "0.8"
+dirs = "5"
 tempfile = "3"
 thiserror = "2"
 
 [features]
-serde = ["dep:serde", "dep:serde_json"]
+serde = ["dep:serde_json"]
 vm-agent = []
 microvm = ["dep:reqwest", "dep:krun-sys", "dep:openssl", "dep:gpt", "dep:nbd"]
 

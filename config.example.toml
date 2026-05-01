@@ -1,0 +1,201 @@
+# Arapuca TOML Configuration Example
+#
+# This file demonstrates all available configuration options.
+# Copy this file to one of:
+#   - ~/.config/arapuca/config.toml (user config)
+#   - ./arapuca.toml or ./.arapuca.toml (project config)
+#   - Custom path via --config flag
+#
+# Configuration precedence (highest to lowest):
+#   1. Command-line flags
+#   2. Project config (./arapuca.toml or ./.arapuca.toml)
+#   3. User config (~/.config/arapuca/config.toml)
+#   4. Environment variables (ARAPUCA_*)
+#   5. Default values
+
+# ─── General Configuration ─────────────────────────────────────
+
+[general]
+# Task identifier (defaults to auto-generated)
+# Validated: ^[a-zA-Z0-9-]+$, max 128 chars
+task_id = "my-task"
+
+# Working directory for subprocess (defaults to current directory)
+work_dir = "/path/to/workdir"
+
+# Socket directory (defaults to temp dir, created with mode 0700)
+socket_dir = "/tmp/sockets"
+
+# Phase identifier (opaque to arapuca — passed through to caller)
+phase = "execution"
+
+# ─── Sandbox Configuration ─────────────────────────────────────
+
+[sandbox]
+# Isolation type: "process" (default) or "microvm"
+# - "process": Landlock + seccomp + cgroups + netns (Linux)
+#              Seatbelt (macOS), AppContainer (Windows)
+# - "microvm": KVM micro-VM via libkrun (requires microvm feature)
+isolation = "process"
+
+# Allow execve (for git, test runners, etc.)
+allow_exec = true
+
+# Use network namespace isolation (Linux only)
+# When true, blocks all direct IP access (AF_INET/AF_INET6)
+use_netns = true
+
+# Readable paths (filesystem allowlist)
+# On Linux: enforced via Landlock
+# On macOS: enforced via Seatbelt
+# On Windows: enforced via AppContainer
+read_paths = [
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/etc",
+    "/bin",
+    "/sbin",
+    "/dev"
+]
+
+# Writable paths (filesystem allowlist)
+write_paths = [
+    "/tmp/workspace",
+    "/var/tmp"
+]
+
+# ─── Resource Limits ───────────────────────────────────────────
+
+[resources]
+# Memory limit in MB (0 = no limit)
+# Enforced via cgroups v2 on Linux, Job Objects on Windows
+max_memory_mb = 2048
+
+# CPU percentage limit (200 = 2 cores, 0 = no limit)
+# Enforced via cgroups v2 on Linux, Job Objects on Windows
+max_cpu_pct = 200
+
+# Maximum number of processes (0 = no limit)
+# Enforced via cgroups v2 on Linux, RLIMIT_NPROC on Unix
+max_pids = 256
+
+# Maximum file size in MB (0 = no limit)
+# Enforced via RLIMIT_FSIZE on Unix
+max_file_size_mb = 1024
+
+# ─── Network Configuration ─────────────────────────────────────
+
+[network]
+# Path to network proxy Unix socket
+# The subprocess receives AGENT_NETWORK_PROXY env var pointing here
+proxy_socket = "/tmp/sockets/proxy.sock"
+
+# Proxy bridge configuration: "port:uds_path"
+# Forks a TCP-to-UDS relay before seccomp, sets HTTP_PROXY
+proxy_bridge = "8080:/tmp/sockets/bridge.sock"
+
+# ─── Micro-VM Configuration ────────────────────────────────────
+# Required when sandbox.isolation = "microvm"
+# Requires the 'microvm' feature (cargo build --features microvm)
+
+[microvm]
+# Image source: "distro:version" or absolute path to qcow2/raw
+# Built-in providers: fedora:42, centos:9, centos:10
+# Custom images: /path/to/image.qcow2
+image = "fedora:42"
+
+# Number of vCPUs
+cpus = 2
+
+# RAM in MB
+mem_mb = 2048
+
+# Enable VM networking via passt (default: false)
+# When false, the VM has no network access
+enable_network = false
+
+# VM timeout in seconds (for vm run, default: none)
+timeout = 600
+
+# VM name (for persistent VMs with vm start/exec/stop)
+name = "my-vm"
+
+# Maximum VM lifetime in seconds (for persistent VMs)
+# Default: 86400 (24 hours)
+max_lifetime = 86400
+
+# Volume mounts: host:guest[:ro]
+# Multiple volumes can be specified using [[microvm.volume]] sections
+# Read-write mounts allow the VM to modify host files
+[[microvm.volume]]
+host = "/home/user/project"
+guest = "/workspace"
+read_only = false
+
+[[microvm.volume]]
+host = "/home/user/tools"
+guest = "/tools"
+read_only = true
+
+# File injection via cloud-init write_files
+# Files are read from the host and injected into the guest at boot
+# Maximum file size: 1MB per file
+[[microvm.write_file]]
+host_path = "./config.yaml"
+guest_path = "/etc/app/config.yaml"
+permissions = "0644"
+
+[[microvm.write_file]]
+host_path = "./secrets.env"
+guest_path = "/etc/secrets"
+permissions = "0400"
+
+# ─── Environment Variables ─────────────────────────────────────
+# Additional env vars for the subprocess (filtered for safety)
+# Dangerous vars (ARAPUCA_*, LD_*, DYLD_*, etc.) are silently dropped
+
+[env]
+MY_VAR = "value"
+DEBUG = "true"
+API_URL = "http://localhost:8080"
+
+# ─── Audit Configuration ───────────────────────────────────────
+
+[audit]
+# Audit verbosity: "minimal", "standard" (default), or "verbose"
+# Controls how much detail audit events include
+verbosity = "standard"
+
+# Principal identity for audit records (e.g., user email)
+principal = "user@example.com"
+
+# Correlation ID for distributed tracing
+correlation_id = "req-12345"
+
+# ─── VM Exec Configuration ─────────────────────────────────────
+# Defaults for 'arapuca vm exec' command
+
+[vm.exec]
+# Default user for vm exec (defaults to "root")
+user = "agent"
+
+# Enable TTY mode
+tty = false
+
+# Additional env vars specific to vm exec
+# These are merged with the base environment
+[vm.exec.env]
+TERM = "xterm-256color"
+LANG = "en_US.UTF-8"
+
+# ─── VM Stop Configuration ─────────────────────────────────────
+# Defaults for 'arapuca vm stop' command
+
+[vm.stop]
+# Force kill (SIGKILL instead of SIGTERM)
+force = false
+
+# Timeout for graceful shutdown in seconds
+# After this timeout, escalates to SIGKILL
+timeout = 10
