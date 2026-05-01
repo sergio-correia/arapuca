@@ -124,6 +124,8 @@ ARAPUCA_WRITE_PATHS="/tmp/workspace" \
 
 ### Micro-VM (requires `microvm` feature)
 
+> **Note:** Build equires development packages for `llvm`, `clang`, and `libkrun`.
+
 Run a command inside a lightweight KVM virtual machine:
 
 ```bash
