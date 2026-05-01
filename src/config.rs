@@ -9,11 +9,37 @@
 //! - Custom path: via `--config` CLI flag
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{GuestFile, ImageSource, Isolation, MicroVmConfig, Profile};
+
+/// Validation severity level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ValidationLevel {
+    Error,
+    Warning,
+    Info,
+}
+
+/// A validation issue found in configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationIssue {
+    pub level: ValidationLevel,
+    pub location: String,
+    pub message: String,
+    pub suggestion: Option<String>,
+}
+
+/// Options for config validation.
+#[derive(Debug, Clone, Default)]
+pub struct ValidateOptions {
+    pub strict: bool,
+    pub check_paths: bool,
+    pub check_images: bool,
+}
 
 /// Root TOML configuration structure.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -187,7 +213,7 @@ fn default_cpus() -> u32 {
 }
 
 fn default_mem() -> u32 {
-    2048
+    4096
 }
 
 fn default_permissions() -> String {
@@ -454,6 +480,602 @@ impl ArapucaConfig {
             )))
         }
     }
+
+    /// Validate configuration, returning all issues found.
+    pub fn validate(&self, opts: &ValidateOptions) -> Vec<ValidationIssue> {
+        let mut issues = Vec::new();
+
+        // Structure validation
+        issues.extend(self.validate_structure());
+
+        // Value validation
+        issues.extend(self.validate_values());
+
+        // Cross-field validation
+        issues.extend(self.validate_consistency());
+
+        // Optional: filesystem checks
+        if opts.check_paths {
+            issues.extend(self.validate_paths());
+        }
+
+        // Optional: image checks
+        if opts.check_images {
+            issues.extend(self.validate_images());
+        }
+
+        issues
+    }
+
+    fn validate_structure(&self) -> Vec<ValidationIssue> {
+        let mut issues = Vec::new();
+
+        // Required fields for microvm
+        if self.sandbox.isolation == "microvm" {
+            if self.microvm.is_none() {
+                issues.push(ValidationIssue {
+                    level: ValidationLevel::Error,
+                    location: "[microvm]".into(),
+                    message: "isolation=microvm requires [microvm] section".into(),
+                    suggestion: Some(
+                        "Add [microvm] section with image, cpus, and mem_mb".into(),
+                    ),
+                });
+            }
+        }
+
+        // Invalid isolation type
+        if self.sandbox.isolation != "process" && self.sandbox.isolation != "microvm" {
+            issues.push(ValidationIssue {
+                level: ValidationLevel::Error,
+                location: "sandbox.isolation".into(),
+                message: format!(
+                    "invalid isolation type: '{}' (expected 'process' or 'microvm')",
+                    self.sandbox.isolation
+                ),
+                suggestion: Some("isolation = \"process\"".into()),
+            });
+        }
+
+        issues
+    }
+
+    fn validate_values(&self) -> Vec<ValidationIssue> {
+        let mut issues = Vec::new();
+
+        // MicroVM numeric ranges
+        if let Some(ref vm) = self.microvm {
+            if vm.cpus == 0 {
+                issues.push(ValidationIssue {
+                    level: ValidationLevel::Error,
+                    location: "microvm.cpus".into(),
+                    message: "must be > 0".into(),
+                    suggestion: Some("cpus = 2".into()),
+                });
+            }
+
+            if vm.mem_mb == 0 {
+                issues.push(ValidationIssue {
+                    level: ValidationLevel::Error,
+                    location: "microvm.mem_mb".into(),
+                    message: "must be > 0".into(),
+                    suggestion: Some("mem_mb = 2048".into()),
+                });
+            } else if vm.mem_mb < 128 {
+                issues.push(ValidationIssue {
+                    level: ValidationLevel::Warning,
+                    location: "microvm.mem_mb".into(),
+                    message: format!(
+                        "{}MB is very low, minimum 128MB recommended",
+                        vm.mem_mb
+                    ),
+                    suggestion: Some("mem_mb = 2048".into()),
+                });
+            }
+
+            // Check volume paths
+            for (idx, vol) in vm.volume.iter().enumerate() {
+                if !vol.guest.starts_with('/') {
+                    issues.push(ValidationIssue {
+                        level: ValidationLevel::Error,
+                        location: format!("microvm.volume[{}].guest", idx),
+                        message: format!(
+                            "guest path must be absolute: '{}'",
+                            vol.guest
+                        ),
+                        suggestion: Some(format!("guest = \"{}\"", vol.guest)),
+                    });
+                }
+            }
+
+            // Check write_file paths
+            for (idx, wf) in vm.write_file.iter().enumerate() {
+                if !wf.guest_path.starts_with('/') {
+                    issues.push(ValidationIssue {
+                        level: ValidationLevel::Error,
+                        location: format!("microvm.write_file[{}].guest_path", idx),
+                        message: format!(
+                            "guest path must be absolute: '{}'",
+                            wf.guest_path
+                        ),
+                        suggestion: Some(format!("guest_path = \"{}\"", wf.guest_path)),
+                    });
+                }
+            }
+        }
+
+        // Resource limits sanity
+        if self.resources.max_memory_mb > 0 {
+            if let Ok(system_mem) = get_system_memory_mb() {
+                if self.resources.max_memory_mb > system_mem {
+                    issues.push(ValidationIssue {
+                        level: ValidationLevel::Warning,
+                        location: "resources.max_memory_mb".into(),
+                        message: format!(
+                            "{}MB exceeds system memory ({}MB)",
+                            self.resources.max_memory_mb, system_mem
+                        ),
+                        suggestion: Some(format!("max_memory_mb = {}", system_mem / 2)),
+                    });
+                }
+            }
+        }
+
+        // Audit verbosity
+        if !matches!(
+            self.audit.verbosity.as_str(),
+            "minimal" | "standard" | "verbose"
+        ) {
+            issues.push(ValidationIssue {
+                level: ValidationLevel::Error,
+                location: "audit.verbosity".into(),
+                message: format!(
+                    "invalid verbosity: '{}' (expected 'minimal', 'standard', or 'verbose')",
+                    self.audit.verbosity
+                ),
+                suggestion: Some("verbosity = \"standard\"".into()),
+            });
+        }
+
+        issues
+    }
+
+    fn validate_consistency(&self) -> Vec<ValidationIssue> {
+        let mut issues = Vec::new();
+
+        // Check for path overlaps (write_path shouldn't contain read_path)
+        for (widx, write_path) in self.sandbox.write_paths.iter().enumerate() {
+            for (ridx, read_path) in self.sandbox.read_paths.iter().enumerate() {
+                if read_path.starts_with(write_path) && read_path != write_path {
+                    issues.push(ValidationIssue {
+                        level: ValidationLevel::Info,
+                        location: format!("sandbox.read_paths[{}]", ridx),
+                        message: format!(
+                            "{} is redundant (covered by write_paths[{}]: {})",
+                            read_path.display(),
+                            widx,
+                            write_path.display()
+                        ),
+                        suggestion: None,
+                    });
+                }
+            }
+        }
+
+        issues
+    }
+
+    fn validate_paths(&self) -> Vec<ValidationIssue> {
+        let mut issues = Vec::new();
+
+        for (idx, path) in self.sandbox.read_paths.iter().enumerate() {
+            if !path.exists() {
+                issues.push(ValidationIssue {
+                    level: ValidationLevel::Warning,
+                    location: format!("sandbox.read_paths[{}]", idx),
+                    message: format!("path does not exist: {}", path.display()),
+                    suggestion: Some(
+                        "Create the directory or remove from config".into(),
+                    ),
+                });
+            }
+        }
+
+        for (idx, path) in self.sandbox.write_paths.iter().enumerate() {
+            if !path.exists() {
+                issues.push(ValidationIssue {
+                    level: ValidationLevel::Warning,
+                    location: format!("sandbox.write_paths[{}]", idx),
+                    message: format!("path does not exist: {}", path.display()),
+                    suggestion: Some(
+                        "Create the directory or remove from config".into(),
+                    ),
+                });
+            }
+        }
+
+        // Check microvm volume host paths
+        if let Some(ref vm) = self.microvm {
+            for (idx, vol) in vm.volume.iter().enumerate() {
+                let host_path = Path::new(&vol.host);
+                if !host_path.exists() {
+                    issues.push(ValidationIssue {
+                        level: ValidationLevel::Warning,
+                        location: format!("microvm.volume[{}].host", idx),
+                        message: format!("path does not exist: {}", vol.host),
+                        suggestion: Some(
+                            "Create the directory or remove this volume".into(),
+                        ),
+                    });
+                }
+            }
+
+            // Check write_file host paths
+            for (idx, wf) in vm.write_file.iter().enumerate() {
+                let host_path = Path::new(&wf.host_path);
+                if !host_path.exists() {
+                    issues.push(ValidationIssue {
+                        level: ValidationLevel::Error,
+                        location: format!("microvm.write_file[{}].host_path", idx),
+                        message: format!("file does not exist: {}", wf.host_path),
+                        suggestion: Some("Create the file or remove this entry".into()),
+                    });
+                }
+            }
+        }
+
+        issues
+    }
+
+    fn validate_images(&self) -> Vec<ValidationIssue> {
+        let mut issues = Vec::new();
+
+        if let Some(ref vm) = self.microvm {
+            // Parse the image source
+            if let Ok(image_source) = self.parse_image_source(&vm.image) {
+                match image_source {
+                    ImageSource::Path(ref path) => {
+                        if !path.exists() {
+                            issues.push(ValidationIssue {
+                                level: ValidationLevel::Error,
+                                location: "microvm.image".into(),
+                                message: format!(
+                                    "image file does not exist: {}",
+                                    path.display()
+                                ),
+                                suggestion: Some(
+                                    "Provide a valid path or use distro:version format"
+                                        .into(),
+                                ),
+                            });
+                        }
+                    }
+                    ImageSource::Distro { ref name, .. } => {
+                        // Check if it's a known distro
+                        if !matches!(name.as_str(), "fedora" | "centos") {
+                            issues.push(ValidationIssue {
+                                level: ValidationLevel::Warning,
+                                location: "microvm.image".into(),
+                                message: format!(
+                                    "unknown distro: '{}' (built-in: fedora, centos)",
+                                    name
+                                ),
+                                suggestion: Some(
+                                    "Use a known distro or provide a file path".into(),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        issues
+    }
+
+    /// Create config from environment variables only.
+    pub fn from_env_only() -> Self {
+        let mut config = Self::default();
+        config.merge_from_env();
+        config
+    }
+}
+
+/// Get system memory in MB (best effort).
+fn get_system_memory_mb() -> crate::Result<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo")
+            .map_err(|e| crate::Error::Io(e))?;
+        for line in meminfo.lines() {
+            if let Some(mem) = line.strip_prefix("MemTotal:") {
+                let kb: u64 = mem
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                return Ok(kb / 1024);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Fallback: assume 8GB
+        return Ok(8192);
+    }
+    Ok(0)
+}
+
+// ─── TOML Generation ───────────────────────────────────────────────
+
+/// Style for generating TOML output.
+#[derive(Debug, Clone, Copy)]
+pub enum TomlStyle {
+    /// Only include non-default settings
+    Minimal,
+    /// Include all options with comments
+    Full,
+}
+
+/// Template for config generation.
+#[derive(Debug, Clone, Copy)]
+pub enum ConfigTemplate {
+    Process,
+    MicroVm,
+    Strict,
+}
+
+/// Generate TOML configuration string.
+pub fn generate_toml(config: &ArapucaConfig, style: TomlStyle) -> String {
+    match style {
+        TomlStyle::Minimal => generate_minimal_toml(config),
+        TomlStyle::Full => generate_full_toml(config),
+    }
+}
+
+/// Generate minimal TOML (only non-default values).
+fn generate_minimal_toml(config: &ArapucaConfig) -> String {
+    let mut output = String::new();
+    output.push_str("# Generated by arapuca config init\n");
+    output.push_str("# Configuration based on current environment\n\n");
+
+    // General section
+    if has_non_default_general(config) {
+        output.push_str("[general]\n");
+        if let Some(ref task_id) = config.general.task_id {
+            output.push_str(&format!("task_id = \"{}\"\n", task_id));
+        }
+        if let Some(ref work_dir) = config.general.work_dir {
+            output.push_str(&format!("work_dir = \"{}\"\n", work_dir.display()));
+        }
+        if let Some(ref socket_dir) = config.general.socket_dir {
+            output.push_str(&format!("socket_dir = \"{}\"\n", socket_dir.display()));
+        }
+        if let Some(ref phase) = config.general.phase {
+            output.push_str(&format!("phase = \"{}\"\n", phase));
+        }
+        output.push('\n');
+    }
+
+    // Sandbox section
+    if has_non_default_sandbox(config) {
+        output.push_str("[sandbox]\n");
+        if config.sandbox.isolation != "process" {
+            output.push_str(&format!("isolation = \"{}\"\n", config.sandbox.isolation));
+        }
+        if !config.sandbox.read_paths.is_empty() {
+            output.push_str(&format!(
+                "read_paths = {}\n",
+                format_path_array(&config.sandbox.read_paths)
+            ));
+        }
+        if !config.sandbox.write_paths.is_empty() {
+            output.push_str(&format!(
+                "write_paths = {}\n",
+                format_path_array(&config.sandbox.write_paths)
+            ));
+        }
+        if !config.sandbox.allow_exec {
+            output.push_str("allow_exec = false\n");
+        }
+        if !config.sandbox.use_netns {
+            output.push_str("use_netns = false\n");
+        }
+        output.push('\n');
+    }
+
+    // Resources section
+    if has_non_default_resources(config) {
+        output.push_str("[resources]\n");
+        if config.resources.max_memory_mb > 0 {
+            output.push_str(&format!(
+                "max_memory_mb = {}\n",
+                config.resources.max_memory_mb
+            ));
+        }
+        if config.resources.max_cpu_pct > 0 {
+            output.push_str(&format!("max_cpu_pct = {}\n", config.resources.max_cpu_pct));
+        }
+        if config.resources.max_pids > 0 {
+            output.push_str(&format!("max_pids = {}\n", config.resources.max_pids));
+        }
+        if config.resources.max_file_size_mb > 0 {
+            output.push_str(&format!(
+                "max_file_size_mb = {}\n",
+                config.resources.max_file_size_mb
+            ));
+        }
+        output.push('\n');
+    }
+
+    // Network section
+    if config.network.proxy_socket.is_some() || config.network.proxy_bridge.is_some() {
+        output.push_str("[network]\n");
+        if let Some(ref proxy_socket) = config.network.proxy_socket {
+            output.push_str(&format!(
+                "proxy_socket = \"{}\"\n",
+                proxy_socket.display()
+            ));
+        }
+        if let Some(ref proxy_bridge) = config.network.proxy_bridge {
+            output.push_str(&format!("proxy_bridge = \"{}\"\n", proxy_bridge));
+        }
+        output.push('\n');
+    }
+
+    // MicroVM section
+    if let Some(ref vm) = config.microvm {
+        output.push_str("[microvm]\n");
+        output.push_str(&format!("image = \"{}\"\n", vm.image));
+        output.push_str(&format!("cpus = {}\n", vm.cpus));
+        output.push_str(&format!("mem_mb = {}\n", vm.mem_mb));
+        if vm.enable_network {
+            output.push_str("enable_network = true\n");
+        }
+        if let Some(timeout) = vm.timeout {
+            output.push_str(&format!("timeout = {}\n", timeout));
+        }
+        if let Some(ref name) = vm.name {
+            output.push_str(&format!("name = \"{}\"\n", name));
+        }
+        output.push('\n');
+
+        // Volumes
+        for vol in &vm.volume {
+            output.push_str("[[microvm.volume]]\n");
+            output.push_str(&format!("host = \"{}\"\n", vol.host));
+            output.push_str(&format!("guest = \"{}\"\n", vol.guest));
+            if vol.read_only {
+                output.push_str("read_only = true\n");
+            }
+            output.push('\n');
+        }
+
+        // Write files
+        for wf in &vm.write_file {
+            output.push_str("[[microvm.write_file]]\n");
+            output.push_str(&format!("host_path = \"{}\"\n", wf.host_path));
+            output.push_str(&format!("guest_path = \"{}\"\n", wf.guest_path));
+            if wf.permissions != "0644" {
+                output.push_str(&format!("permissions = \"{}\"\n", wf.permissions));
+            }
+            output.push('\n');
+        }
+    }
+
+    // Environment variables
+    if !config.env.is_empty() {
+        output.push_str("[env]\n");
+        for (key, value) in &config.env {
+            output.push_str(&format!("{} = \"{}\"\n", key, value));
+        }
+        output.push('\n');
+    }
+
+    output
+}
+
+/// Generate full TOML (all options with comments).
+fn generate_full_toml(_config: &ArapucaConfig) -> String {
+    // For now, just return the example config
+    // In a real implementation, we'd merge current values with the template
+    include_str!("../config.example.toml").to_string()
+}
+
+/// Generate config from template.
+pub fn generate_from_template(template: ConfigTemplate) -> ArapucaConfig {
+    match template {
+        ConfigTemplate::Process => ArapucaConfig {
+            sandbox: SandboxConfig {
+                isolation: "process".into(),
+                read_paths: vec![
+                    PathBuf::from("/usr"),
+                    PathBuf::from("/lib"),
+                    PathBuf::from("/lib64"),
+                    PathBuf::from("/bin"),
+                    PathBuf::from("/etc"),
+                ],
+                write_paths: vec![PathBuf::from("/tmp")],
+                allow_exec: true,
+                use_netns: true,
+            },
+            resources: ResourcesConfig {
+                max_memory_mb: 2048,
+                max_pids: 256,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ConfigTemplate::MicroVm => ArapucaConfig {
+            sandbox: SandboxConfig {
+                isolation: "microvm".into(),
+                ..Default::default()
+            },
+            microvm: Some(TomlMicroVmConfig {
+                image: "fedora:44".into(),
+                cpus: 2,
+                mem_mb: 4096,
+                enable_network: false,
+                timeout: None,
+                name: Some("arapuca-vm".into()),
+                max_lifetime: Some(86400),
+                volume: vec![],
+                write_file: vec![],
+            }),
+            ..Default::default()
+        },
+        ConfigTemplate::Strict => ArapucaConfig {
+            sandbox: SandboxConfig {
+                isolation: "process".into(),
+                read_paths: vec![
+                    PathBuf::from("/usr"),
+                    PathBuf::from("/lib"),
+                    PathBuf::from("/lib64"),
+                ],
+                write_paths: vec![],
+                allow_exec: false,
+                use_netns: true,
+            },
+            resources: ResourcesConfig {
+                max_memory_mb: 1024,
+                max_cpu_pct: 100,
+                max_pids: 64,
+                max_file_size_mb: 100,
+            },
+            ..Default::default()
+        },
+    }
+}
+
+fn has_non_default_general(config: &ArapucaConfig) -> bool {
+    config.general.task_id.is_some()
+        || config.general.work_dir.is_some()
+        || config.general.socket_dir.is_some()
+        || config.general.phase.is_some()
+}
+
+fn has_non_default_sandbox(config: &ArapucaConfig) -> bool {
+    config.sandbox.isolation != "process"
+        || !config.sandbox.read_paths.is_empty()
+        || !config.sandbox.write_paths.is_empty()
+        || !config.sandbox.allow_exec
+        || !config.sandbox.use_netns
+}
+
+fn has_non_default_resources(config: &ArapucaConfig) -> bool {
+    config.resources.max_memory_mb > 0
+        || config.resources.max_cpu_pct > 0
+        || config.resources.max_pids > 0
+        || config.resources.max_file_size_mb > 0
+}
+
+fn format_path_array(paths: &[PathBuf]) -> String {
+    let formatted: Vec<String> = paths
+        .iter()
+        .map(|p| format!("\"{}\"", p.display()))
+        .collect();
+    format!("[{}]", formatted.join(", "))
 }
 
 #[cfg(test)]
@@ -521,5 +1143,137 @@ permissions = "0644"
         assert_eq!(base.sandbox.read_paths, vec![PathBuf::from("/lib")]);
         assert_eq!(base.resources.max_memory_mb, 1024);
         assert_eq!(base.resources.max_pids, 128);
+    }
+
+    #[test]
+    fn test_validate_microvm_missing_section() {
+        let config = ArapucaConfig {
+            sandbox: SandboxConfig {
+                isolation: "microvm".into(),
+                ..Default::default()
+            },
+            microvm: None,
+            ..Default::default()
+        };
+
+        let issues = config.validate(&ValidateOptions::default());
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].level, ValidationLevel::Error);
+        assert!(issues[0].message.contains("requires [microvm] section"));
+    }
+
+    #[test]
+    fn test_validate_microvm_zero_cpus() {
+        let config = ArapucaConfig {
+            sandbox: SandboxConfig {
+                isolation: "microvm".into(),
+                ..Default::default()
+            },
+            microvm: Some(TomlMicroVmConfig {
+                image: "fedora:42".into(),
+                cpus: 0,
+                mem_mb: 2048,
+                enable_network: false,
+                timeout: None,
+                name: None,
+                max_lifetime: None,
+                volume: vec![],
+                write_file: vec![],
+            }),
+            ..Default::default()
+        };
+
+        let issues = config.validate(&ValidateOptions::default());
+        let errors: Vec<_> = issues
+            .iter()
+            .filter(|i| i.level == ValidationLevel::Error)
+            .collect();
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|i| i.location == "microvm.cpus"));
+    }
+
+    #[test]
+    fn test_validate_invalid_isolation() {
+        let config = ArapucaConfig {
+            sandbox: SandboxConfig {
+                isolation: "invalid".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let issues = config.validate(&ValidateOptions::default());
+        assert!(!issues.is_empty());
+        assert_eq!(issues[0].level, ValidationLevel::Error);
+        assert!(issues[0].message.contains("invalid isolation type"));
+    }
+
+    #[test]
+    fn test_generate_minimal_toml() {
+        let config = ArapucaConfig {
+            sandbox: SandboxConfig {
+                read_paths: vec![PathBuf::from("/usr"), PathBuf::from("/lib")],
+                write_paths: vec![PathBuf::from("/tmp")],
+                ..Default::default()
+            },
+            resources: ResourcesConfig {
+                max_memory_mb: 2048,
+                max_pids: 256,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let toml = generate_toml(&config, TomlStyle::Minimal);
+        assert!(toml.contains("read_paths = [\"/usr\", \"/lib\"]"));
+        assert!(toml.contains("write_paths = [\"/tmp\"]"));
+        assert!(toml.contains("max_memory_mb = 2048"));
+        assert!(toml.contains("max_pids = 256"));
+    }
+
+    #[test]
+    fn test_generate_from_env() {
+        // SAFETY: Single-threaded test environment, no other code reads these vars.
+        unsafe {
+            std::env::set_var("ARAPUCA_READ_PATHS", "/usr:/lib");
+            std::env::set_var("ARAPUCA_WRITE_PATHS", "/tmp");
+        }
+
+        let config = ArapucaConfig::from_env_only();
+        assert_eq!(config.sandbox.read_paths.len(), 2);
+        assert_eq!(config.sandbox.write_paths.len(), 1);
+
+        // SAFETY: Cleanup, single-threaded test.
+        unsafe {
+            std::env::remove_var("ARAPUCA_READ_PATHS");
+            std::env::remove_var("ARAPUCA_WRITE_PATHS");
+        }
+    }
+
+    #[test]
+    fn test_template_process() {
+        let config = generate_from_template(ConfigTemplate::Process);
+        assert_eq!(config.sandbox.isolation, "process");
+        assert!(!config.sandbox.read_paths.is_empty());
+        assert_eq!(config.resources.max_memory_mb, 2048);
+    }
+
+    #[test]
+    fn test_template_microvm() {
+        let config = generate_from_template(ConfigTemplate::MicroVm);
+        assert_eq!(config.sandbox.isolation, "microvm");
+        assert!(config.microvm.is_some());
+        let vm = config.microvm.unwrap();
+        assert_eq!(vm.image, "fedora:42");
+        assert_eq!(vm.cpus, 2);
+    }
+
+    #[test]
+    fn test_template_strict() {
+        let config = generate_from_template(ConfigTemplate::Strict);
+        assert_eq!(config.sandbox.isolation, "process");
+        assert!(!config.sandbox.allow_exec);
+        assert!(config.sandbox.write_paths.is_empty());
+        assert_eq!(config.resources.max_pids, 64);
     }
 }

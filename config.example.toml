@@ -18,16 +18,16 @@
 [general]
 # Task identifier (defaults to auto-generated)
 # Validated: ^[a-zA-Z0-9-]+$, max 128 chars
-task_id = "my-task"
+# task_id = "my-task"
 
 # Working directory for subprocess (defaults to current directory)
-work_dir = "/path/to/workdir"
+# work_dir = "/path/to/workdir"
 
 # Socket directory (defaults to temp dir, created with mode 0700)
-socket_dir = "/tmp/sockets"
+# socket_dir = "/tmp/sockets"
 
 # Phase identifier (opaque to arapuca — passed through to caller)
-phase = "execution"
+# phase = "execution"
 
 # ─── Sandbox Configuration ─────────────────────────────────────
 
@@ -36,7 +36,7 @@ phase = "execution"
 # - "process": Landlock + seccomp + cgroups + netns (Linux)
 #              Seatbelt (macOS), AppContainer (Windows)
 # - "microvm": KVM micro-VM via libkrun (requires microvm feature)
-isolation = "process"
+# isolation = "process"
 
 # Allow execve (for git, test runners, etc.)
 allow_exec = true
@@ -101,15 +101,15 @@ proxy_bridge = "8080:/tmp/sockets/bridge.sock"
 
 [microvm]
 # Image source: "distro:version" or absolute path to qcow2/raw
-# Built-in providers: fedora:42, centos:9, centos:10
+# Built-in providers: fedora:44, centos:9, centos:10
 # Custom images: /path/to/image.qcow2
-image = "fedora:42"
+image = "fedora:44"
 
 # Number of vCPUs
 cpus = 2
 
 # RAM in MB
-mem_mb = 2048
+mem_mb = 4096
 
 # Enable VM networking via passt (default: false)
 # When false, the VM has no network access
@@ -119,7 +119,7 @@ enable_network = false
 timeout = 600
 
 # VM name (for persistent VMs with vm start/exec/stop)
-name = "my-vm"
+name = "arapuca-vm"
 
 # Maximum VM lifetime in seconds (for persistent VMs)
 # Default: 86400 (24 hours)
@@ -129,36 +129,24 @@ max_lifetime = 86400
 # Multiple volumes can be specified using [[microvm.volume]] sections
 # Read-write mounts allow the VM to modify host files
 [[microvm.volume]]
-host = "/home/user/project"
-guest = "/workspace"
+host = "."
+guest = "/home/root/work"
 read_only = false
-
-[[microvm.volume]]
-host = "/home/user/tools"
-guest = "/tools"
-read_only = true
 
 # File injection via cloud-init write_files
 # Files are read from the host and injected into the guest at boot
 # Maximum file size: 1MB per file
-[[microvm.write_file]]
-host_path = "./config.yaml"
-guest_path = "/etc/app/config.yaml"
-permissions = "0644"
-
-[[microvm.write_file]]
-host_path = "./secrets.env"
-guest_path = "/etc/secrets"
-permissions = "0400"
+# [[microvm.write_file]]
+# host_path = "./config.yaml"
+# guest_path = "/etc/app/config.yaml"
+# permissions = "0644"
 
 # ─── Environment Variables ─────────────────────────────────────
 # Additional env vars for the subprocess (filtered for safety)
 # Dangerous vars (ARAPUCA_*, LD_*, DYLD_*, etc.) are silently dropped
 
 [env]
-MY_VAR = "value"
-DEBUG = "true"
-API_URL = "http://localhost:8080"
+# MY_VAR = "value"
 
 # ─── Audit Configuration ───────────────────────────────────────
 
@@ -168,10 +156,10 @@ API_URL = "http://localhost:8080"
 verbosity = "standard"
 
 # Principal identity for audit records (e.g., user email)
-principal = "user@example.com"
+# principal = "user@example.com"
 
 # Correlation ID for distributed tracing
-correlation_id = "req-12345"
+# correlation_id = "req-12345"
 
 # ─── VM Exec Configuration ─────────────────────────────────────
 # Defaults for 'arapuca vm exec' command
@@ -185,9 +173,9 @@ tty = false
 
 # Additional env vars specific to vm exec
 # These are merged with the base environment
-[vm.exec.env]
-TERM = "xterm-256color"
-LANG = "en_US.UTF-8"
+# [vm.exec.env]
+# TERM = "xterm-256color"
+# LANG = "en_US.UTF-8"
 
 # ─── VM Stop Configuration ─────────────────────────────────────
 # Defaults for 'arapuca vm stop' command

@@ -28,6 +28,10 @@ fn main() {
     let (config_path, args) = extract_config_flag(args);
 
     // Dispatch subcommands before the sandbox path.
+    if args.get(1).is_some_and(|a| a == "config") {
+        config_subcommand(&args[2..]);
+        return;
+    }
     if args.get(1).is_some_and(|a| a == "image") {
         image_subcommand(&args[2..]);
         return;
@@ -233,6 +237,432 @@ fn main() {
         eprintln!("arapuca: binary not yet supported on this platform");
         std::process::exit(1);
     }
+}
+
+// ─── Config subcommands ────────────────────────────────────────
+
+fn config_subcommand(args: &[String]) {
+    match args.first().map(|s| s.as_str()) {
+        Some("init") => config_init(&args[1..]),
+        Some("validate") => config_validate(&args[1..]),
+        _ => {
+            eprintln!("usage: arapuca config <init|validate>");
+            eprintln!();
+            eprintln!("  init       Generate arapuca.toml from current environment");
+            eprintln!("  validate   Validate configuration file");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_init_help() {
+    eprintln!("Generate arapuca.toml configuration file");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("    arapuca config init [OPTIONS]");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("    -o, --output <path>         Output path (default: ./arapuca.toml)");
+    eprintln!("    -f, --force                 Overwrite existing file");
+    eprintln!("    --style <minimal|full>      Output style (default: minimal)");
+    eprintln!("                                  minimal: Only non-default settings");
+    eprintln!("                                  full: All options with comments");
+    eprintln!("    --from-env                  Only include ARAPUCA_* environment variables");
+    eprintln!("    --template <type>           Generate from template:");
+    eprintln!("                                  process: Basic process sandboxing");
+    eprintln!("                                  microvm: VM-based isolation");
+    eprintln!("                                  strict: Maximum security restrictions");
+    eprintln!("    --dry-run                   Print to stdout instead of writing file");
+    eprintln!("    -h, --help                  Print this help message");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("    # Generate minimal config from current environment");
+    eprintln!("    arapuca config init");
+    eprintln!();
+    eprintln!("    # Generate from environment variables only");
+    eprintln!("    ARAPUCA_READ_PATHS=/usr:/lib arapuca config init --from-env");
+    eprintln!();
+    eprintln!("    # Generate microvm template");
+    eprintln!("    arapuca config init --template microvm");
+    eprintln!();
+    eprintln!("    # Preview without writing");
+    eprintln!("    arapuca config init --dry-run");
+    eprintln!();
+    eprintln!("    # Generate full config with all options");
+    eprintln!("    arapuca config init --style full -o my-config.toml");
+}
+
+fn print_validate_help() {
+    eprintln!("Validate arapuca configuration file");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("    arapuca config validate [PATH] [OPTIONS]");
+    eprintln!();
+    eprintln!("ARGUMENTS:");
+    eprintln!("    [PATH]                      Path to config file (default: ./arapuca.toml)");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("    --strict                    Treat warnings as errors");
+    eprintln!("    --format <text|json>        Output format (default: text)");
+    eprintln!("    --check-paths               Verify that filesystem paths exist");
+    eprintln!("    --check-images              Verify that microvm images are available");
+    eprintln!("    -h, --help                  Print this help message");
+    eprintln!();
+    eprintln!("VALIDATION LEVELS:");
+    eprintln!("    error                       Invalid configuration (will fail at runtime)");
+    eprintln!("    warning                     Valid but potentially problematic");
+    eprintln!("    info                        Informational messages");
+    eprintln!();
+    eprintln!("EXIT CODES:");
+    eprintln!("    0                           Valid configuration");
+    eprintln!("    1                           Invalid configuration or warnings in strict mode");
+    eprintln!("    3                           Failed to parse configuration file");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("    # Validate default config");
+    eprintln!("    arapuca config validate");
+    eprintln!();
+    eprintln!("    # Validate specific file");
+    eprintln!("    arapuca config validate ~/.config/arapuca/config.toml");
+    eprintln!();
+    eprintln!("    # Validate with path checking");
+    eprintln!("    arapuca config validate --check-paths --strict");
+    eprintln!();
+    eprintln!("    # JSON output for CI");
+    eprintln!("    arapuca config validate --format json");
+}
+
+fn config_init(args: &[String]) {
+    use arapuca::config::{generate_from_template, generate_toml};
+    use arapuca::config::{ConfigTemplate, TomlStyle};
+
+    let mut output = PathBuf::from("./arapuca.toml");
+    let mut force = false;
+    let mut style = TomlStyle::Minimal;
+    let mut from_env = false;
+    let mut template: Option<ConfigTemplate> = None;
+    let mut dry_run = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_init_help();
+                std::process::exit(0);
+            }
+            "-o" | "--output" => {
+                i += 1;
+                output = PathBuf::from(args.get(i).unwrap_or_else(|| {
+                    eprintln!("--output requires a path");
+                    std::process::exit(1);
+                }));
+            }
+            "-f" | "--force" => force = true,
+            "--style" => {
+                i += 1;
+                let style_str = args.get(i).unwrap_or_else(|| {
+                    eprintln!("--style requires 'minimal' or 'full'");
+                    std::process::exit(1);
+                });
+                style = match style_str.as_str() {
+                    "minimal" => TomlStyle::Minimal,
+                    "full" => TomlStyle::Full,
+                    _ => {
+                        eprintln!("invalid style: {style_str} (expected 'minimal' or 'full')");
+                        std::process::exit(1);
+                    }
+                };
+            }
+            "--from-env" => from_env = true,
+            "--template" => {
+                i += 1;
+                let template_str = args.get(i).unwrap_or_else(|| {
+                    eprintln!("--template requires 'process', 'microvm', or 'strict'");
+                    std::process::exit(1);
+                });
+                template = Some(match template_str.as_str() {
+                    "process" => ConfigTemplate::Process,
+                    "microvm" => ConfigTemplate::MicroVm,
+                    "strict" => ConfigTemplate::Strict,
+                    _ => {
+                        eprintln!("invalid template: {template_str}");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            "--dry-run" => dry_run = true,
+            other => {
+                eprintln!("unknown flag: {other}");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    // Load configuration
+    let config = if from_env {
+        arapuca::config::ArapucaConfig::from_env_only()
+    } else if let Some(tmpl) = template {
+        generate_from_template(tmpl)
+    } else {
+        match arapuca::config::ArapucaConfig::load() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("arapuca: failed to load config: {e}");
+                eprintln!("(continuing with defaults)");
+                arapuca::config::ArapucaConfig::default()
+            }
+        }
+    };
+
+    // Generate TOML
+    let toml_content = generate_toml(&config, style);
+
+    // Output
+    if dry_run {
+        print!("{}", toml_content);
+    } else {
+        if output.exists() && !force {
+            eprintln!(
+                "arapuca: file exists: {} (use --force to overwrite)",
+                output.display()
+            );
+            std::process::exit(1);
+        }
+
+        if let Err(e) = std::fs::write(&output, &toml_content) {
+            eprintln!("arapuca: failed to write {}: {}", output.display(), e);
+            std::process::exit(1);
+        }
+
+        eprintln!("Created {}", output.display());
+    }
+}
+
+fn config_validate(args: &[String]) {
+    use arapuca::config::{ValidateOptions, ValidationLevel};
+
+    let mut config_path: Option<PathBuf> = None;
+    let mut strict = false;
+    let mut format = OutputFormat::Text;
+    let mut check_paths = false;
+    let mut check_images = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_validate_help();
+                std::process::exit(0);
+            }
+            "--strict" => strict = true,
+            "--format" => {
+                i += 1;
+                let format_str = args.get(i).unwrap_or_else(|| {
+                    eprintln!("--format requires 'text' or 'json'");
+                    std::process::exit(1);
+                });
+                format = match format_str.as_str() {
+                    "text" => OutputFormat::Text,
+                    "json" => OutputFormat::Json,
+                    _ => {
+                        eprintln!("invalid format: {format_str} (expected 'text' or 'json')");
+                        std::process::exit(1);
+                    }
+                };
+            }
+            "--check-paths" => check_paths = true,
+            "--check-images" => check_images = true,
+            s if !s.starts_with('-') && config_path.is_none() => {
+                config_path = Some(PathBuf::from(s));
+            }
+            other => {
+                eprintln!("unknown flag: {other}");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    let path = config_path.unwrap_or_else(|| PathBuf::from("./arapuca.toml"));
+
+    if format == OutputFormat::Text {
+        eprintln!("Validating: {}\n", path.display());
+    }
+
+    // Load configuration
+    let config = match arapuca::config::ArapucaConfig::load_from_path(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            if format == OutputFormat::Text {
+                eprintln!("✗ Failed to parse configuration:");
+                eprintln!("  {}\n", e);
+            } else {
+                println!(
+                    r#"{{"valid":false,"file":"{}","error":"{}"}}"#,
+                    path.display(),
+                    e.to_string().replace('\"', "\\\"")
+                );
+            }
+            std::process::exit(3);
+        }
+    };
+
+    // Validate
+    let opts = ValidateOptions {
+        strict,
+        check_paths,
+        check_images,
+    };
+    let issues = config.validate(&opts);
+
+    // Output results
+    match format {
+        OutputFormat::Text => print_text_validation(&issues),
+        OutputFormat::Json => print_json_validation(&path, &issues),
+    }
+
+    // Exit code
+    let errors = issues
+        .iter()
+        .filter(|i| i.level == ValidationLevel::Error)
+        .count();
+    let warnings = issues
+        .iter()
+        .filter(|i| i.level == ValidationLevel::Warning)
+        .count();
+
+    if errors > 0 {
+        std::process::exit(1);
+    } else if warnings > 0 && strict {
+        std::process::exit(1);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+fn print_text_validation(issues: &[arapuca::config::ValidationIssue]) {
+    use arapuca::config::ValidationLevel;
+
+    if issues.is_empty() {
+        eprintln!("✓ Configuration is valid\n");
+        return;
+    }
+
+    let errors: Vec<_> = issues
+        .iter()
+        .filter(|i| i.level == ValidationLevel::Error)
+        .collect();
+    let warnings: Vec<_> = issues
+        .iter()
+        .filter(|i| i.level == ValidationLevel::Warning)
+        .collect();
+    let infos: Vec<_> = issues
+        .iter()
+        .filter(|i| i.level == ValidationLevel::Info)
+        .collect();
+
+    if !errors.is_empty() {
+        eprintln!("Errors:");
+        for issue in &errors {
+            eprintln!("  [{}] {}", issue.location, issue.message);
+            if let Some(ref suggestion) = issue.suggestion {
+                eprintln!("    Suggestion: {}", suggestion);
+            }
+        }
+        eprintln!();
+    }
+
+    if !warnings.is_empty() {
+        eprintln!("Warnings:");
+        for issue in &warnings {
+            eprintln!("  [{}] {}", issue.location, issue.message);
+            if let Some(ref suggestion) = issue.suggestion {
+                eprintln!("    Suggestion: {}", suggestion);
+            }
+        }
+        eprintln!();
+    }
+
+    if !infos.is_empty() {
+        eprintln!("Info:");
+        for issue in &infos {
+            eprintln!("  [{}] {}", issue.location, issue.message);
+        }
+        eprintln!();
+    }
+
+    eprintln!(
+        "Summary: {} errors, {} warnings, {} info\n",
+        errors.len(),
+        warnings.len(),
+        infos.len()
+    );
+
+    if errors.is_empty() {
+        eprintln!("Configuration is valid (with warnings)");
+    } else {
+        eprintln!("Configuration has errors");
+    }
+}
+
+fn print_json_validation(path: &PathBuf, issues: &[arapuca::config::ValidationIssue]) {
+    use arapuca::config::ValidationLevel;
+
+    let errors = issues
+        .iter()
+        .filter(|i| i.level == ValidationLevel::Error)
+        .count();
+    let warnings = issues
+        .iter()
+        .filter(|i| i.level == ValidationLevel::Warning)
+        .count();
+    let infos = issues
+        .iter()
+        .filter(|i| i.level == ValidationLevel::Info)
+        .count();
+
+    // Manual JSON construction to avoid serde_json dependency
+    print!("{{");
+    print!(r#""valid":{},"#, errors == 0);
+    print!(r#""file":"{}","#, path.display());
+    print!(r#""issues":["#);
+
+    for (idx, issue) in issues.iter().enumerate() {
+        if idx > 0 {
+            print!(",");
+        }
+        print!("{{");
+        print!(
+            r#""level":"{}","#,
+            match issue.level {
+                ValidationLevel::Error => "error",
+                ValidationLevel::Warning => "warning",
+                ValidationLevel::Info => "info",
+            }
+        );
+        print!(r#""location":"{}","#, escape_json(&issue.location));
+        print!(r#""message":"{}""#, escape_json(&issue.message));
+        if let Some(ref suggestion) = issue.suggestion {
+            print!(r#","suggestion":"{}""#, escape_json(suggestion));
+        }
+        print!("}}");
+    }
+
+    print!(r#"],"summary":{{"errors":{},"warnings":{},"info":{}}}}}"#, errors, warnings, infos);
+    println!();
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 // ─── Image subcommands ─────────────────────────────────────────

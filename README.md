@@ -281,6 +281,55 @@ read_only = false
 
 See [`config.example.toml`](config.example.toml) for all available options.
 
+#### Config Command
+
+The `arapuca config` command helps manage configuration files:
+
+```bash
+# Generate config from current environment
+arapuca config init
+# Created ./arapuca.toml
+
+# Generate from environment variables only
+ARAPUCA_READ_PATHS="/usr:/lib" arapuca config init --from-env
+
+# Generate from template
+arapuca config init --template microvm
+arapuca config init --template process
+arapuca config init --template strict
+
+# Preview without writing
+arapuca config init --dry-run
+
+# Generate full config with all options (commented)
+arapuca config init --style full
+
+# Validate configuration
+arapuca config validate
+# ✓ Configuration is valid
+
+# Validate with path checking
+arapuca config validate --check-paths
+
+# Validate in strict mode (warnings as errors)
+arapuca config validate --strict
+
+# JSON output (for CI)
+arapuca config validate --format json
+```
+
+**Templates:**
+- `process`: Basic process-level sandboxing (Landlock + seccomp)
+- `microvm`: VM-based isolation with common settings
+- `strict`: Maximum security restrictions (no exec, minimal paths)
+
+**Validation checks:**
+- TOML syntax and structure
+- Required fields (e.g., microvm section when isolation=microvm)
+- Value ranges (cpus > 0, reasonable memory limits)
+- Path existence (with `--check-paths`)
+- Image availability (with `--check-images`)
+
 #### Environment Variables (legacy)
 
 Environment variables continue to work for backward compatibility:
