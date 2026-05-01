@@ -21,6 +21,30 @@ use std::io::IsTerminal;
 use std::net::TcpListener;
 use std::path::PathBuf;
 
+fn print_main_usage() {
+    eprintln!("Arapuca - Process sandbox for Linux, macOS, and Windows");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("    arapuca config <init|validate>        Manage configuration files");
+    eprintln!("    arapuca image <pull|list|rm|setup>    Manage VM images (microvm feature)");
+    #[cfg(feature = "microvm")]
+    eprintln!("    arapuca vm <command>                   Manage persistent VMs (microvm feature)");
+    eprintln!("    arapuca [--config <path>] -- <command> [args...]");
+    eprintln!("                                           Run command in sandbox");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("    # Generate config file");
+    eprintln!("    arapuca config init --template process");
+    eprintln!();
+    eprintln!("    # Run sandboxed command with config");
+    eprintln!("    arapuca --config arapuca.toml -- python3 script.py");
+    eprintln!();
+    eprintln!("    # Run with environment variables");
+    eprintln!("    ARAPUCA_READ_PATHS=/usr:/lib arapuca -- python3 script.py");
+    eprintln!();
+    eprintln!("For more information, see: https://github.com/sergio-correia/arapuca");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -55,7 +79,7 @@ fn main() {
     let cmd_idx = match sep_idx {
         Some(i) if i + 1 < args.len() => i + 1,
         _ => {
-            eprintln!("arapuca: usage: arapuca [image pull|list|rm] | [-- command ...]");
+            print_main_usage();
             std::process::exit(1);
         }
     };
