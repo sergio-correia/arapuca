@@ -112,7 +112,7 @@ cargo build --release
 # Run a command with filesystem restrictions
 ARAPUCA_READ_PATHS="/usr:/lib:/lib64:/bin:/etc:/dev" \
 ARAPUCA_WRITE_PATHS="/tmp/workspace" \
-./target/release/arapuca -- python3 agent.py
+./target/release/arapuca -- /usr/bin/python3 agent.py
 
 # The sandboxed process:
 # - Can only read files under /usr, /lib, /bin, /etc, /dev
@@ -162,7 +162,7 @@ cargo build --release --features microvm
 
 # Create a setup layer with pre-installed tools
 ./target/release/arapuca image setup fedora:42 \
-  --run 'dnf install -y git python3'
+  --run '/usr/bin/dnf install -y git /usr/bin/python3'
 
 # Future vm run uses the setup layer — no install needed
 ./target/release/arapuca vm run --image fedora:42 \
@@ -304,7 +304,7 @@ if (arapuca_apply(p) != 0) {
 }
 
 arapuca_profile_free(p);
-execvp("python3", argv);  // now sandboxed
+execvp("/usr/bin/python3", argv);  // now sandboxed
 ```
 
 Link with `-larapuca -ldl -lpthread`.
