@@ -500,14 +500,17 @@ fn run_subcommand(args: &[String]) {
     let read_paths = arapuca::env::canonicalize_paths(&default_read);
     let write_paths = arapuca::env::canonicalize_paths(&default_write);
 
-    arapuca::reject_cgroup_paths(&read_paths).unwrap_or_else(|e| {
-        eprintln!("arapuca run: {e}");
-        std::process::exit(125);
-    });
-    arapuca::reject_cgroup_paths(&write_paths).unwrap_or_else(|e| {
-        eprintln!("arapuca run: {e}");
-        std::process::exit(125);
-    });
+    #[cfg(unix)]
+    {
+        arapuca::reject_cgroup_paths(&read_paths).unwrap_or_else(|e| {
+            eprintln!("arapuca run: {e}");
+            std::process::exit(125);
+        });
+        arapuca::reject_cgroup_paths(&write_paths).unwrap_or_else(|e| {
+            eprintln!("arapuca run: {e}");
+            std::process::exit(125);
+        });
+    }
 
     let task = task_id.unwrap_or_else(|| format!("run-{}", std::process::id()));
     arapuca::sanitize_task_id(&task).unwrap_or_else(|e| {
@@ -575,9 +578,14 @@ fn run_subcommand(args: &[String]) {
     #[cfg(unix)]
     install_signal_forwarder(process.pid() as i32);
 
-    // Timeout enforcement.
+    // Timeout enforcement (Unix only — signals are not portable).
+    #[cfg(not(unix))]
+    let _ = timeout;
+
+    #[cfg(unix)]
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    #[cfg(unix)]
     if let Some(secs) = timeout {
         let done_clone = std::sync::Arc::clone(&done);
         std::thread::spawn(move || {
@@ -597,6 +605,8 @@ fn run_subcommand(args: &[String]) {
     }
 
     let status = process.wait();
+
+    #[cfg(unix)]
     done.store(true, std::sync::atomic::Ordering::Release);
 
     #[cfg(unix)]
@@ -610,6 +620,7 @@ fn run_subcommand(args: &[String]) {
     }
 
     let exit_code = match status {
+        #[allow(clippy::manual_unwrap_or)]
         Ok(s) => {
             if let Some(code) = s.code() {
                 code
@@ -2264,6 +2275,7 @@ fn vm_run(args: &[String]) {
     }
 
     let exit_code = match status {
+        #[allow(clippy::manual_unwrap_or)]
         Ok(s) => {
             if let Some(code) = s.code() {
                 code

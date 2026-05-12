@@ -10,6 +10,7 @@ pub const MAX_GUEST_FILE_SIZE: usize = 1024 * 1024;
 pub const MAX_GUEST_WRITE_FILES: usize = 16;
 
 /// Guest paths that must not be written to via write_files.
+#[cfg(unix)]
 const GUEST_PATH_DENY_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/cidata", "/agent"];
 
 /// Validate and sanitize a task ID.
@@ -38,6 +39,7 @@ pub fn sanitize_task_id(id: &str) -> crate::Result<&str> {
 }
 
 /// Validate a guest file path (must be absolute, no `..`, not in denied prefixes).
+#[cfg(unix)]
 pub fn validate_guest_path(path: &str) -> crate::Result<()> {
     if !path.starts_with('/') {
         return Err(Error::Validation("guest path must be absolute".into()));
@@ -63,6 +65,7 @@ pub fn validate_guest_path(path: &str) -> crate::Result<()> {
 }
 
 /// Validate guest file content size (must not exceed MAX_GUEST_FILE_SIZE).
+#[cfg(unix)]
 pub fn validate_guest_file_content(content: &str) -> crate::Result<()> {
     if content.len() > MAX_GUEST_FILE_SIZE {
         return Err(Error::Validation(format!(
@@ -74,6 +77,7 @@ pub fn validate_guest_file_content(content: &str) -> crate::Result<()> {
 }
 
 /// Validate guest file permissions (3-4 octal digits, no setuid/setgid/sticky).
+#[cfg(unix)]
 pub fn validate_guest_permissions(perms: &str) -> crate::Result<()> {
     if perms.len() < 3 || perms.len() > 4 {
         return Err(Error::Validation(format!(
@@ -103,6 +107,7 @@ pub fn validate_guest_permissions(perms: &str) -> crate::Result<()> {
 /// access) and filesystem canonicalization (resolves symlinks for paths
 /// that exist). Landlock itself resolves paths at enforcement time, so
 /// this check is defense-in-depth.
+#[cfg(unix)]
 pub fn reject_cgroup_paths(paths: &[std::path::PathBuf]) -> crate::Result<()> {
     for p in paths {
         let normalized = normalize_path(p);
@@ -128,6 +133,7 @@ pub fn reject_cgroup_paths(paths: &[std::path::PathBuf]) -> crate::Result<()> {
 
 /// Lexically normalize a path by resolving `.` and `..` components
 /// without accessing the filesystem.
+#[cfg(unix)]
 fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
     use std::path::Component;
     let mut parts = Vec::new();
@@ -183,18 +189,21 @@ mod tests {
         assert!(sanitize_task_id("has.dot").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn cgroup_path_rejected() {
         let paths = vec![PathBuf::from("/sys/fs/cgroup/user.slice")];
         assert!(reject_cgroup_paths(&paths).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn cgroup_exact_path_rejected() {
         let paths = vec![PathBuf::from("/sys/fs/cgroup")];
         assert!(reject_cgroup_paths(&paths).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn normal_paths_ok() {
         let paths = vec![
@@ -205,29 +214,34 @@ mod tests {
         assert!(reject_cgroup_paths(&paths).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn empty_paths_ok() {
         assert!(reject_cgroup_paths(&[]).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn cgroup_path_dotdot_bypass_rejected() {
         let paths = vec![PathBuf::from("/nonexistent/../sys/fs/cgroup")];
         assert!(reject_cgroup_paths(&paths).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn cgroup_path_dot_component_rejected() {
         let paths = vec![PathBuf::from("/sys/fs/./cgroup/user.slice")];
         assert!(reject_cgroup_paths(&paths).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn cgroup_path_excessive_dotdot_rejected() {
         let paths = vec![PathBuf::from("/../../../sys/fs/cgroup")];
         assert!(reject_cgroup_paths(&paths).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn normalize_preserves_root_on_excess_dotdot() {
         assert_eq!(
@@ -236,6 +250,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn normalize_resolves_dotdot() {
         assert_eq!(
@@ -244,21 +259,25 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_path_absolute_ok() {
         assert!(validate_guest_path("/etc/hostname").is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_path_relative_rejected() {
         assert!(validate_guest_path("relative/path").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_path_dotdot_rejected() {
         assert!(validate_guest_path("/tmp/../../etc/shadow").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn permissions_valid_octal() {
         assert!(validate_guest_permissions("644").is_ok());
@@ -266,6 +285,7 @@ mod tests {
         assert!(validate_guest_permissions("0600").is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn permissions_setuid_rejected() {
         assert!(validate_guest_permissions("4755").is_err());
@@ -273,6 +293,7 @@ mod tests {
         assert!(validate_guest_permissions("6755").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn permissions_non_octal_rejected() {
         assert!(validate_guest_permissions("abc").is_err());
@@ -280,6 +301,7 @@ mod tests {
         assert!(validate_guest_permissions("u+s").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn normalize_resolves_dot() {
         assert_eq!(
@@ -288,6 +310,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_path_sensitive_prefixes_rejected() {
         assert!(validate_guest_path("/proc/self").is_err());
@@ -297,6 +320,7 @@ mod tests {
         assert!(validate_guest_path("/agent/bin").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_path_bare_prefix_rejected() {
         assert!(validate_guest_path("/proc").is_err());
@@ -306,16 +330,19 @@ mod tests {
         assert!(validate_guest_path("/agent").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_path_root_rejected() {
         assert!(validate_guest_path("/").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_path_etc_allowed() {
         assert!(validate_guest_path("/etc/hostname").is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_path_similar_prefix_allowed() {
         assert!(validate_guest_path("/process_data").is_ok());
@@ -323,32 +350,38 @@ mod tests {
         assert!(validate_guest_path("/devices/usb").is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_path_dot_component_rejected() {
         assert!(validate_guest_path("/proc/./self").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_path_double_slash_rejected() {
         assert!(validate_guest_path("//proc/self").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_path_trailing_slash_rejected() {
         assert!(validate_guest_path("/proc/").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_file_content_empty_ok() {
         assert!(validate_guest_file_content("").is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_file_content_at_limit_ok() {
         let content = "a".repeat(MAX_GUEST_FILE_SIZE);
         assert!(validate_guest_file_content(&content).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn guest_file_content_one_over_rejected() {
         let content = "a".repeat(MAX_GUEST_FILE_SIZE + 1);
