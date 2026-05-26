@@ -348,6 +348,7 @@ fn run_subcommand(args: &[String]) {
     let mut cpus: Option<u32> = None;
     let mut pids: Option<u32> = None;
     let mut task_id: Option<String> = None;
+    let mut cwd: Option<PathBuf> = None;
     let mut seccomp_profile = arapuca::SeccompProfile::Strict;
     #[cfg(unix)]
     let mut tty = false;
@@ -367,6 +368,7 @@ fn run_subcommand(args: &[String]) {
             eprintln!();
             eprintln!("flags:");
             eprintln!("  -v /path[:ro]      allow path access (rw default, :ro read-only)");
+            eprintln!("  --cwd /path        set working directory (must be within a mount)");
             eprintln!("  --env KEY=VALUE    pass environment variable");
             eprintln!("  --timeout N        kill after N seconds");
             eprintln!("  --memory N         memory limit in MB");
@@ -551,6 +553,19 @@ fn run_subcommand(args: &[String]) {
                     }
                 };
             }
+            "--cwd" => {
+                i += 1;
+                let path = flag_args.get(i).unwrap_or_else(|| {
+                    eprintln!("--cwd requires a path");
+                    std::process::exit(125);
+                });
+                let p = PathBuf::from(path);
+                if !p.is_absolute() {
+                    eprintln!("arapuca run: --cwd path must be absolute: {}", p.display());
+                    std::process::exit(125);
+                }
+                cwd = Some(p);
+            }
             other => {
                 eprintln!("arapuca run: unknown flag: {other}");
                 eprintln!("hint: did you forget '--' before the command?");
@@ -602,6 +617,29 @@ fn run_subcommand(args: &[String]) {
         });
     }
 
+    if let Some(ref cwd_path) = cwd {
+        let canonical = cwd_path.canonicalize().unwrap_or_else(|e| {
+            eprintln!("arapuca run: --cwd path cannot be resolved: {e}");
+            std::process::exit(125);
+        });
+        if !canonical.is_dir() {
+            eprintln!(
+                "arapuca run: --cwd path is not a directory: {}",
+                canonical.display()
+            );
+            std::process::exit(125);
+        }
+        let in_mounts = read_paths
+            .iter()
+            .chain(write_paths.iter())
+            .any(|p| canonical.starts_with(p));
+        if !in_mounts {
+            eprintln!("arapuca run: --cwd path must be within a mounted path");
+            std::process::exit(125);
+        }
+        cwd = Some(canonical);
+    }
+
     let task = task_id.unwrap_or_else(|| format!("run-{}", std::process::id()));
     arapuca::sanitize_task_id(&task).unwrap_or_else(|e| {
         eprintln!("arapuca run: {e}");
@@ -648,7 +686,7 @@ fn run_subcommand(args: &[String]) {
         socket_dir: PathBuf::new(),
         task_id: task,
         phase: "run".into(),
-        work_dir: None,
+        work_dir: cwd,
         #[cfg(unix)]
         stdin: None,
         #[cfg(unix)]

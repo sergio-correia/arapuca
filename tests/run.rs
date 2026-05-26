@@ -789,6 +789,191 @@ fn wait_with_timeout(
     }
 }
 
+// ─── --cwd tests ─────────────────────────────────────────────
+
+#[test]
+fn cwd_sets_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+    let vol = format!("{dir_str}:ro");
+
+    let output = Command::new(arapuca_bin())
+        .args(["run", "--cwd", dir_str, "-v", &vol, "--", "/bin/pwd"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "pwd should succeed with --cwd");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        dir_str,
+        "working directory should match --cwd"
+    );
+}
+
+#[test]
+fn cwd_without_mount_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--cwd", "/opt", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(125),
+        "--cwd without matching mount should exit 125"
+    );
+}
+
+#[test]
+fn cwd_relative_path_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--cwd", "./relative", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(125),
+        "--cwd with relative path should exit 125"
+    );
+}
+
+#[test]
+fn cwd_nonexistent_path_rejected() {
+    let status = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--cwd",
+            "/nonexistent-arapuca-test-path",
+            "-v",
+            "/nonexistent-arapuca-test-path:ro",
+            "--",
+            "/bin/true",
+        ])
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(125),
+        "--cwd with nonexistent path should exit 125"
+    );
+}
+
+#[test]
+fn cwd_symlink_outside_mount_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let link = dir.path().join("escape");
+    std::os::unix::fs::symlink("/etc", &link).unwrap();
+
+    let dir_str = dir.path().to_str().unwrap();
+    let vol = format!("{dir_str}:ro");
+    let link_str = link.to_str().unwrap();
+
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--cwd", link_str, "-v", &vol, "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(125),
+        "--cwd symlink pointing outside mount should exit 125"
+    );
+}
+
+#[test]
+fn cwd_file_not_directory_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("not-a-dir.txt");
+    std::fs::write(&file, "").unwrap();
+
+    let dir_str = dir.path().to_str().unwrap();
+    let vol = format!("{dir_str}:ro");
+    let file_str = file.to_str().unwrap();
+
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--cwd", file_str, "-v", &vol, "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(125),
+        "--cwd pointing to a file should exit 125"
+    );
+}
+
+#[test]
+fn cwd_with_default_paths() {
+    let output = Command::new(arapuca_bin())
+        .args(["run", "--cwd", "/tmp", "--", "/bin/pwd"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "--cwd /tmp should work via default read paths"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "/tmp",
+        "working directory should be /tmp"
+    );
+}
+
+#[test]
+fn cwd_subdirectory_of_mount_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("child");
+    std::fs::create_dir(&sub).unwrap();
+
+    let dir_str = dir.path().to_str().unwrap();
+    let sub_str = sub.to_str().unwrap();
+    let vol = format!("{dir_str}:ro");
+
+    let output = Command::new(arapuca_bin())
+        .args(["run", "--cwd", sub_str, "-v", &vol, "--", "/bin/pwd"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "--cwd subdirectory of mount should succeed"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        sub_str,
+        "working directory should match --cwd subdirectory"
+    );
+}
+
+#[test]
+fn cwd_with_write_mount_allows_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--cwd",
+            dir_str,
+            "-v",
+            dir_str,
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo ok > testfile && cat testfile",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "--cwd with rw mount should allow writes"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "ok",
+        "write to cwd should succeed with rw mount"
+    );
+}
+
 // ─── /tmp write restriction tests ─────────────────────────────
 
 #[test]
