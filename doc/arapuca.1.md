@@ -57,6 +57,13 @@ preserved.
     */proc*, */sys*, and blanket */dev* are NOT included by default.
     Use **-v /tmp** to grant write access to all of */tmp*.
 
+**-\-cwd** *path*
+:   Set the working directory for the sandboxed process. The path must
+    be absolute, must exist, must be a directory, and must be within a
+    mounted path (default or **-v**). Symlinks are resolved before the
+    containment check. Useful for programmatic callers that need to set
+    the working directory without shell wrappers.
+
 **-\-env** *KEY*=*VALUE*
 :   Pass an environment variable to the sandboxed process. Dangerous
     variables (**LD_PRELOAD**, **ARAPUCA_\***, **DYLD_\***, interpreter

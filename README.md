@@ -172,6 +172,7 @@ arapuca run \
 | Flag | Description |
 |------|-------------|
 | `-v /path[:ro]` | Allow path access (read-write default, `:ro` for read-only) |
+| `--cwd /path` | Set working directory (must be within a mount) |
 | `--env KEY=VALUE` | Pass environment variable |
 | `--timeout N` | Kill after N seconds |
 | `--memory N` | Memory limit in MB |
