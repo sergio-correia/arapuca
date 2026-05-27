@@ -26,6 +26,9 @@ impl Sandbox for Other {
             ));
         }
 
+        // Validate task ID.
+        crate::sanitize_task_id(&cfg.task_id)?;
+
         let tmp_guard = crate::env::TmpDirGuard::new(crate::env::make_tmp_dir(&cfg.task_id)?);
 
         let audit_ctx = cfg

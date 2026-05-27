@@ -48,7 +48,7 @@ pub use validate::{MAX_GUEST_FILE_SIZE, MAX_GUEST_WRITE_FILES, sanitize_task_id}
 #[cfg(unix)]
 pub use validate::{
     reject_cgroup_paths, validate_guest_file_content, validate_guest_path,
-    validate_guest_permissions,
+    validate_guest_permissions, validate_work_dir,
 };
 
 /// Result type for arapuca operations.

@@ -54,6 +54,13 @@ impl Sandbox for Linux {
         crate::reject_cgroup_paths(&cfg.profile.read_paths)?;
         crate::reject_cgroup_paths(&cfg.profile.write_paths)?;
 
+        // Defense-in-depth: validate work_dir is within mounted paths.
+        crate::validate_work_dir(
+            &cfg.work_dir,
+            &cfg.profile.read_paths,
+            &cfg.profile.write_paths,
+        )?;
+
         let tmp_guard = crate::env::TmpDirGuard::new(crate::env::make_tmp_dir(&cfg.task_id)?);
 
         let audit_ctx = cfg

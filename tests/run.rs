@@ -794,18 +794,19 @@ fn wait_with_timeout(
 #[test]
 fn cwd_sets_working_directory() {
     let dir = tempfile::tempdir().unwrap();
-    let dir_str = dir.path().to_str().unwrap();
-    let vol = format!("{dir_str}:ro");
+    let canonical = dir.path().canonicalize().unwrap();
+    let canonical_str = canonical.to_str().unwrap();
+    let vol = format!("{canonical_str}:ro");
 
     let output = Command::new(arapuca_bin())
-        .args(["run", "--cwd", dir_str, "-v", &vol, "--", "/bin/pwd"])
+        .args(["run", "--cwd", canonical_str, "-v", &vol, "--", "/bin/pwd"])
         .output()
         .unwrap();
 
     assert!(output.status.success(), "pwd should succeed with --cwd");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        dir_str,
+        canonical_str,
         "working directory should match --cwd"
     );
 }
@@ -863,7 +864,8 @@ fn cwd_symlink_outside_mount_rejected() {
     let link = dir.path().join("escape");
     std::os::unix::fs::symlink("/etc", &link).unwrap();
 
-    let dir_str = dir.path().to_str().unwrap();
+    let canonical = dir.path().canonicalize().unwrap();
+    let dir_str = canonical.to_str().unwrap();
     let vol = format!("{dir_str}:ro");
     let link_str = link.to_str().unwrap();
 
@@ -884,7 +886,8 @@ fn cwd_file_not_directory_rejected() {
     let file = dir.path().join("not-a-dir.txt");
     std::fs::write(&file, "").unwrap();
 
-    let dir_str = dir.path().to_str().unwrap();
+    let canonical = dir.path().canonicalize().unwrap();
+    let dir_str = canonical.to_str().unwrap();
     let vol = format!("{dir_str}:ro");
     let file_str = file.to_str().unwrap();
 
@@ -901,6 +904,9 @@ fn cwd_file_not_directory_rejected() {
 
 #[test]
 fn cwd_with_default_paths() {
+    let expected = std::path::PathBuf::from("/tmp").canonicalize().unwrap();
+    let expected_str = expected.to_str().unwrap();
+
     let output = Command::new(arapuca_bin())
         .args(["run", "--cwd", "/tmp", "--", "/bin/pwd"])
         .output()
@@ -912,8 +918,8 @@ fn cwd_with_default_paths() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "/tmp",
-        "working directory should be /tmp"
+        expected_str,
+        "working directory should be /tmp (canonicalized)"
     );
 }
 
@@ -923,8 +929,10 @@ fn cwd_subdirectory_of_mount_accepted() {
     let sub = dir.path().join("child");
     std::fs::create_dir(&sub).unwrap();
 
-    let dir_str = dir.path().to_str().unwrap();
-    let sub_str = sub.to_str().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_sub = sub.canonicalize().unwrap();
+    let dir_str = canonical_dir.to_str().unwrap();
+    let sub_str = canonical_sub.to_str().unwrap();
     let vol = format!("{dir_str}:ro");
 
     let output = Command::new(arapuca_bin())
@@ -944,9 +952,23 @@ fn cwd_subdirectory_of_mount_accepted() {
 }
 
 #[test]
+fn cwd_path_traversal_resolved() {
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--cwd", "/tmp/../etc", "--", "/bin/true"])
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(125),
+        "--cwd with path traversal should resolve and be rejected"
+    );
+}
+
+#[test]
 fn cwd_with_write_mount_allows_writing() {
     let dir = tempfile::tempdir().unwrap();
-    let dir_str = dir.path().to_str().unwrap();
+    let canonical = dir.path().canonicalize().unwrap();
+    let dir_str = canonical.to_str().unwrap();
 
     let output = Command::new(arapuca_bin())
         .args([

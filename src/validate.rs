@@ -97,6 +97,55 @@ pub fn validate_guest_permissions(perms: &str) -> crate::Result<()> {
     Ok(())
 }
 
+/// Validate the working directory for the sandboxed process.
+///
+/// Defense-in-depth: ensures `work_dir` (when set) is absolute, exists as a
+/// directory, and falls within a configured read or write path. Landlock
+/// enforces filesystem access at runtime, but rejecting invalid `work_dir`
+/// early produces clear errors instead of confusing EACCES failures.
+///
+/// Both `work_dir` and mount paths are canonicalized to handle symlinks.
+#[cfg(unix)]
+pub fn validate_work_dir(
+    work_dir: &Option<std::path::PathBuf>,
+    read_paths: &[std::path::PathBuf],
+    write_paths: &[std::path::PathBuf],
+) -> crate::Result<()> {
+    let dir = match work_dir {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+    if !dir.is_absolute() {
+        return Err(Error::Validation(format!(
+            "work_dir must be absolute: {}",
+            dir.display()
+        )));
+    }
+    let canonical = dir.canonicalize().map_err(|e| {
+        Error::Validation(format!(
+            "work_dir cannot be resolved: {}: {e}",
+            dir.display()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(Error::Validation(format!(
+            "work_dir is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    let in_mounts = read_paths.iter().chain(write_paths.iter()).any(|p| {
+        let resolved = p.canonicalize().unwrap_or_else(|_| p.clone());
+        canonical.starts_with(&resolved)
+    });
+    if !in_mounts {
+        return Err(Error::Validation(format!(
+            "work_dir must be within a mounted path: {}",
+            canonical.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Reject paths that resolve to `/sys/fs/cgroup`.
 ///
 /// Defense-in-depth: prevents a sandboxed process from modifying its own
@@ -386,5 +435,68 @@ mod tests {
     fn guest_file_content_one_over_rejected() {
         let content = "a".repeat(MAX_GUEST_FILE_SIZE + 1);
         assert!(validate_guest_file_content(&content).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_dir_none_ok() {
+        assert!(validate_work_dir(&None, &[], &[]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_dir_relative_rejected() {
+        let dir = Some(PathBuf::from("relative/path"));
+        assert!(validate_work_dir(&dir, &[], &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_dir_nonexistent_rejected() {
+        let dir = Some(PathBuf::from("/nonexistent-arapuca-test-path"));
+        assert!(validate_work_dir(&dir, &[], &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_dir_file_not_dir_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("not-a-dir");
+        std::fs::write(&file, "").unwrap();
+        let dir = Some(file);
+        let mounts = vec![tmp.path().to_path_buf()];
+        assert!(validate_work_dir(&dir, &mounts, &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_dir_outside_mounts_rejected() {
+        let dir = Some(PathBuf::from("/tmp"));
+        let mounts = vec![PathBuf::from("/usr")];
+        assert!(validate_work_dir(&dir, &mounts, &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_dir_in_read_paths_ok() {
+        let dir = Some(PathBuf::from("/tmp"));
+        let read = vec![PathBuf::from("/tmp")];
+        assert!(validate_work_dir(&dir, &read, &[]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_dir_in_write_paths_ok() {
+        let dir = Some(PathBuf::from("/tmp"));
+        let write = vec![PathBuf::from("/tmp")];
+        assert!(validate_work_dir(&dir, &[], &write).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_dir_subdir_of_mount_ok() {
+        let dir = Some(std::env::temp_dir());
+        let mounts = vec![PathBuf::from("/")];
+        assert!(validate_work_dir(&dir, &mounts, &[]).is_ok());
     }
 }
