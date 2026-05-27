@@ -111,6 +111,7 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
         "/Library/Frameworks",
         "/System",
         "/dev",
+        "/private/var/select",
     ] {
         writeln!(profile, "(allow file-read* (subpath \"{sys_path}\"))").unwrap();
     }
@@ -308,6 +309,9 @@ mod tests {
         assert!(content.contains("(allow file-read* (literal \"/etc\"))"));
         assert!(content.contains("(allow file-read* (literal \"/private\"))"));
         assert!(content.contains("(allow file-read* (literal \"/private/var\"))"));
+
+        // Verify /private/var/select is readable (shell resolution).
+        assert!(content.contains("(allow file-read* (subpath \"/private/var/select\"))"));
 
         // Verify /etc paths use canonical /private/etc prefix.
         assert!(content.contains("(allow file-read* (literal \"/private/etc/hosts\"))"));
