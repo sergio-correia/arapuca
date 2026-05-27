@@ -157,6 +157,7 @@ impl Sandbox for Darwin {
 
         let wrapper = Self::wrapper_path();
         let use_wrapper = wrapper.is_some();
+        let allow_network = cfg.profile.seccomp_profile == crate::SeccompProfile::Baseline;
 
         let audit_ctx = cfg
             .audit_sink
@@ -202,10 +203,15 @@ impl Sandbox for Darwin {
                 })?;
             }
 
+            let seatbelt_detail = if allow_network {
+                "network=allowed"
+            } else {
+                "network=denied"
+            };
             ctx.emit(AuditEvent::LayerApplied {
                 timestamp: ctx.timestamp(),
                 layer: SandboxLayer::Seatbelt,
-                detail: None,
+                detail: Some(crate::audit::LayerDetail::Other(seatbelt_detail.into())),
             })?;
             ctx.emit(AuditEvent::LayerApplied {
                 timestamp: ctx.timestamp(),
@@ -236,13 +242,21 @@ impl Sandbox for Darwin {
         let tmp_dir = tmp_guard.path().to_path_buf();
 
         // Helper: canonicalize a path for Seatbelt profile embedding.
-        // Falls back to the original if canonicalization fails (path
-        // may not exist yet, e.g. socket files).
+        // For files that don't exist yet (e.g. socket files),
+        // canonicalize the parent directory and re-attach the filename.
+        // This is critical on macOS where /tmp → /private/tmp and
+        // /var → /private/var — Seatbelt matches kernel-resolved paths,
+        // so profile paths must be canonical.
         let canon = |p: &std::path::Path| -> String {
-            std::fs::canonicalize(p)
-                .unwrap_or_else(|_| p.to_path_buf())
-                .to_string_lossy()
-                .into_owned()
+            if let Ok(c) = std::fs::canonicalize(p) {
+                return c.to_string_lossy().into_owned();
+            }
+            if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+                if let Ok(cp) = std::fs::canonicalize(parent) {
+                    return cp.join(name).to_string_lossy().into_owned();
+                }
+            }
+            p.to_string_lossy().into_owned()
         };
 
         // Build profile data from config. All paths must be
@@ -295,6 +309,7 @@ impl Sandbox for Darwin {
             exec_paths,
             control_socket,
             llm_socket,
+            allow_network,
         };
 
         // Generate the Seatbelt profile.

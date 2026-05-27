@@ -24,6 +24,13 @@ pub struct ProfileData {
     pub control_socket: Option<String>,
     /// Path to the LLM proxy socket.
     pub llm_socket: Option<String>,
+    /// Allow outbound network access (TCP + DNS via mDNSResponder).
+    ///
+    /// Maps from `SeccompProfile::Baseline` on the caller side. When
+    /// true, the profile grants unrestricted TCP outbound and the Mach
+    /// IPC services needed for DNS and TLS on macOS. There is no
+    /// per-host filtering (unlike Linux's netns + CONNECT proxy).
+    pub allow_network: bool,
 }
 
 /// Validate that a path contains only safe characters for embedding in
@@ -37,8 +44,12 @@ pub fn validate_profile_path(path: &str) -> crate::Result<()> {
     if path.is_empty() {
         return Err(Error::Validation("empty path".into()));
     }
+    if path.split('/').any(|c| c == "..") {
+        return Err(Error::Validation(format!("path contains '..': {path}")));
+    }
     for ch in path.chars() {
-        if !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '_' | '.' | ' ' | '-' | '@') {
+        if !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '_' | '.' | ' ' | '-' | '@' | '+')
+        {
             return Err(Error::Validation(format!(
                 "invalid character in sandbox profile path: {:?}",
                 ch
@@ -127,16 +138,11 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
         "/private/etc/hosts",
         "/private/etc/resolv.conf",
         "/private/etc/localtime",
-        "/private/etc/ssl/cert.pem",
     ] {
         writeln!(profile, "(allow file-read* (literal \"{etc_file}\"))").unwrap();
     }
-    // Allow reading /etc/ssl directory for certificate lookup.
-    writeln!(
-        profile,
-        "(allow file-read* (subpath \"/private/etc/ssl/certs\"))"
-    )
-    .unwrap();
+    // Allow reading /etc/ssl for certificates and OpenSSL configuration.
+    writeln!(profile, "(allow file-read* (subpath \"/private/etc/ssl\"))").unwrap();
     writeln!(profile).unwrap();
 
     // User read paths.
@@ -178,16 +184,108 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
     }
     writeln!(profile).unwrap();
 
-    // Network: deny all TCP/UDP (via deny default). Only allow Unix
-    // domain sockets to specific paths.
-    if data.control_socket.is_some() || data.llm_socket.is_some() {
-        writeln!(profile, "; Unix sockets").unwrap();
-        writeln!(profile, "(allow network-outbound (remote unix))").unwrap();
+    // Network: baseline mode allows TCP outbound and DNS via
+    // mDNSResponder. Strict mode (default) blocks all network via
+    // (deny default).
+    if data.allow_network {
+        writeln!(profile, "; Network (baseline mode)").unwrap();
+        for meta_path in &[
+            "/private",
+            "/private/var",
+            "/private/etc",
+            "/usr",
+            "/System",
+            "/Library",
+            "/var",
+            "/etc",
+            "/tmp",
+        ] {
+            writeln!(
+                profile,
+                "(allow file-read-metadata (subpath \"{meta_path}\"))"
+            )
+            .unwrap();
+        }
+        writeln!(profile, "(allow network-outbound (remote tcp))").unwrap();
+        // mDNSResponder — DNS resolution on macOS goes through this socket.
+        writeln!(
+            profile,
+            "(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))"
+        )
+        .unwrap();
+        writeln!(profile, "(allow network-outbound").unwrap();
+        writeln!(profile, "  (control-name \"com.apple.netsrc\")").unwrap();
+        writeln!(
+            profile,
+            "  (control-name \"com.apple.network.statistics\"))"
+        )
+        .unwrap();
+        writeln!(profile, "(allow system-socket").unwrap();
+        writeln!(
+            profile,
+            "  (require-all (socket-domain AF_SYSTEM) (socket-protocol 2))"
+        )
+        .unwrap();
+        writeln!(profile, "  (socket-domain AF_ROUTE))").unwrap();
+        writeln!(profile).unwrap();
+
+        // File reads for network stack (from Apple's system-network).
+        writeln!(profile, "; Network stack files").unwrap();
+        writeln!(
+            profile,
+            "(allow file-read* (literal \"/Library/Preferences/com.apple.networkd.plist\"))"
+        )
+        .unwrap();
+        writeln!(
+            profile,
+            "(allow file-read* (literal \"/private/var/db/nsurlstoraged/dafsaData.bin\"))"
+        )
+        .unwrap();
+        writeln!(profile).unwrap();
+    } else if data.control_socket.is_some() || data.llm_socket.is_some() {
+        writeln!(
+            profile,
+            "; Unix sockets (strict mode — scoped to configured paths)"
+        )
+        .unwrap();
         if let Some(ref s) = data.control_socket {
+            writeln!(
+                profile,
+                "(allow network-outbound (remote unix-socket (path-literal \"{s}\")))"
+            )
+            .unwrap();
             writeln!(profile, "(allow file-read* (literal \"{s}\"))").unwrap();
             writeln!(profile, "(allow file-write* (literal \"{s}\"))").unwrap();
         }
         if let Some(ref s) = data.llm_socket {
+            writeln!(
+                profile,
+                "(allow network-outbound (remote unix-socket (path-literal \"{s}\")))"
+            )
+            .unwrap();
+            writeln!(profile, "(allow file-read* (literal \"{s}\"))").unwrap();
+            writeln!(profile, "(allow file-write* (literal \"{s}\"))").unwrap();
+        }
+        writeln!(profile).unwrap();
+    }
+
+    // Socket permissions in network mode (scoped to configured paths).
+    if data.allow_network && (data.control_socket.is_some() || data.llm_socket.is_some()) {
+        if let Some(ref s) = data.control_socket {
+            writeln!(
+                profile,
+                "(allow network-outbound (remote unix-socket (path-literal \"{s}\")))"
+            )
+            .unwrap();
+            writeln!(profile, "(allow file-read* (literal \"{s}\"))").unwrap();
+            writeln!(profile, "(allow file-write* (literal \"{s}\"))").unwrap();
+        }
+        if let Some(ref s) = data.llm_socket {
+            writeln!(
+                profile,
+                "(allow network-outbound (remote unix-socket (path-literal \"{s}\")))"
+            )
+            .unwrap();
             writeln!(profile, "(allow file-read* (literal \"{s}\"))").unwrap();
             writeln!(profile, "(allow file-write* (literal \"{s}\"))").unwrap();
         }
@@ -211,6 +309,67 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
         "(allow mach-lookup (global-name \"com.apple.system.notification_center\"))"
     )
     .unwrap();
+
+    if data.allow_network {
+        // Apple system-network Mach services (from system.sb).
+        writeln!(
+            profile,
+            "(allow mach-lookup (global-name \"com.apple.dnssd.service\"))"
+        )
+        .unwrap();
+        writeln!(
+            profile,
+            "(allow mach-lookup (global-name \"com.apple.nehelper\"))"
+        )
+        .unwrap();
+        writeln!(
+            profile,
+            "(allow mach-lookup (global-name \"com.apple.nesessionmanager\"))"
+        )
+        .unwrap();
+        writeln!(
+            profile,
+            "(allow mach-lookup (global-name \"com.apple.networkd\"))"
+        )
+        .unwrap();
+        writeln!(
+            profile,
+            "(allow mach-lookup (global-name \"com.apple.symptomsd\"))"
+        )
+        .unwrap();
+        writeln!(
+            profile,
+            "(allow mach-lookup (global-name \"com.apple.usymptomsd\"))"
+        )
+        .unwrap();
+        writeln!(
+            profile,
+            "(allow mach-lookup (global-name \"com.apple.SystemConfiguration.SCNetworkReachability\"))"
+        )
+        .unwrap();
+        writeln!(
+            profile,
+            "(allow mach-lookup (global-name \"com.apple.cfnetwork.cfnetworkagent\"))"
+        )
+        .unwrap();
+        // TLS certificate validation.
+        writeln!(
+            profile,
+            "(allow mach-lookup (global-name \"com.apple.trustd\"))"
+        )
+        .unwrap();
+        writeln!(
+            profile,
+            "(allow mach-lookup (global-name \"com.apple.trustd.agent\"))"
+        )
+        .unwrap();
+        // DNS and network configuration.
+        writeln!(
+            profile,
+            "(allow mach-lookup (global-name \"com.apple.SystemConfiguration.configd\"))"
+        )
+        .unwrap();
+    }
     writeln!(profile).unwrap();
 
     // POSIX shared memory (read-only).
@@ -254,12 +413,18 @@ mod tests {
         assert!(validate_profile_path("/opt/homebrew/opt/python@3.14/bin/python3.14").is_ok());
         // Dots.
         assert!(validate_profile_path("/usr/lib/libfoo.1.2.dylib").is_ok());
+        // + in C++ library paths.
+        assert!(validate_profile_path("/usr/lib/libc++.1.dylib").is_ok());
+        assert!(validate_profile_path("/opt/homebrew/Cellar/llvm/17/lib/c++").is_ok());
     }
 
     #[test]
     fn test_validate_profile_path_invalid() {
         // Empty.
         assert!(validate_profile_path("").is_err());
+        // Path traversal.
+        assert!(validate_profile_path("/tmp/../etc/passwd").is_err());
+        assert!(validate_profile_path("/nonexistent/../etc").is_err());
         // Double quote (profile injection).
         assert!(validate_profile_path("/tmp/foo\"bar").is_err());
         // Parentheses (Seatbelt syntax).
@@ -293,6 +458,7 @@ mod tests {
             exec_paths: vec!["/usr/local/bin".into()],
             control_socket: Some("/tmp/sock/control.sock".into()),
             llm_socket: Some("/tmp/sock/llm.sock".into()),
+            allow_network: false,
         };
 
         let path = generate_profile(&dir, &data).unwrap();
@@ -315,7 +481,7 @@ mod tests {
 
         // Verify /etc paths use canonical /private/etc prefix.
         assert!(content.contains("(allow file-read* (literal \"/private/etc/hosts\"))"));
-        assert!(content.contains("(allow file-read* (subpath \"/private/etc/ssl/certs\"))"));
+        assert!(content.contains("(allow file-read* (subpath \"/private/etc/ssl\"))"));
 
         // Verify /System is a subpath (covers /System/Library and
         // /System/Cryptexes).
@@ -328,13 +494,29 @@ mod tests {
         assert!(content.contains("(allow file-read* (subpath \"/tmp/work\"))"));
         assert!(content.contains("(allow file-write* (subpath \"/tmp/work\"))"));
 
-        // Verify socket paths.
+        // Verify scoped unix socket paths (strict mode).
+        assert!(content.contains(
+            "(allow network-outbound (remote unix-socket (path-literal \"/tmp/sock/control.sock\")))"
+        ));
+        assert!(content.contains(
+            "(allow network-outbound (remote unix-socket (path-literal \"/tmp/sock/llm.sock\")))"
+        ));
         assert!(content.contains("(allow file-read* (literal \"/tmp/sock/control.sock\"))"));
         assert!(content.contains("(allow file-write* (literal \"/tmp/sock/llm.sock\"))"));
 
         // Verify exec paths — explicit + auto-included from write paths.
         assert!(content.contains("(allow process-exec (subpath \"/usr/local/bin\"))"));
         assert!(content.contains("(allow process-exec (subpath \"/tmp/work\"))"));
+
+        // Verify NO network rules in strict mode.
+        assert!(
+            !content.contains("network-outbound (remote tcp)"),
+            "strict mode must not allow TCP outbound"
+        );
+        assert!(
+            !content.contains("com.apple.dnssd.service"),
+            "strict mode must not allow network Mach services"
+        );
 
         // Verify file permissions.
         #[cfg(unix)]
@@ -360,10 +542,80 @@ mod tests {
             exec_paths: vec![],
             control_socket: None,
             llm_socket: None,
+            allow_network: false,
         };
 
         let result = generate_profile(&dir, &data);
         assert!(result.is_err(), "injection path should be rejected");
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_generate_profile_with_network() {
+        let dir = std::env::temp_dir().join("arapuca-test-profile-net");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let data = ProfileData {
+            read_paths: vec!["/home/user/src".into()],
+            write_paths: vec!["/tmp/work".into()],
+            exec_paths: vec![],
+            control_socket: None,
+            llm_socket: None,
+            allow_network: true,
+        };
+
+        let path = generate_profile(&dir, &data).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        // File metadata scoped to system paths (not global).
+        assert!(content.contains("(allow file-read-metadata (subpath \"/private/var\"))"));
+        assert!(content.contains("(allow file-read-metadata (subpath \"/usr\"))"));
+        assert!(
+            !content.contains("file-read-metadata (subpath \"/\")"),
+            "file-read-metadata must not scope to root"
+        );
+
+        // TCP outbound.
+        assert!(content.contains("(allow network-outbound (remote tcp))"));
+
+        // mDNSResponder — scoped, not blanket unix.
+        assert!(content.contains("mDNSResponder"));
+        assert!(
+            !content.contains("(allow network-outbound (remote unix))"),
+            "unix socket outbound must be scoped, not blanket"
+        );
+
+        // Kernel control sockets.
+        assert!(content.contains("com.apple.netsrc"));
+        assert!(content.contains("com.apple.network.statistics"));
+
+        // System sockets.
+        assert!(content.contains("AF_SYSTEM"));
+        assert!(content.contains("AF_ROUTE"));
+
+        // Apple system-network Mach services.
+        assert!(content.contains("com.apple.dnssd.service"));
+        assert!(content.contains("com.apple.networkd"));
+        assert!(content.contains("com.apple.SystemConfiguration.SCNetworkReachability"));
+        assert!(content.contains("com.apple.cfnetwork.cfnetworkagent"));
+
+        // TLS Mach services.
+        assert!(content.contains("com.apple.trustd"));
+        assert!(content.contains("com.apple.trustd.agent"));
+
+        // DNS/network configuration.
+        assert!(content.contains("com.apple.SystemConfiguration.configd"));
+
+        // Network stack files.
+        assert!(content.contains("com.apple.networkd.plist"));
+
+        // deny-default still present.
+        assert!(content.contains("(deny default)"));
+
+        // Base Mach services still present.
+        assert!(content.contains("com.apple.system.logger"));
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&dir);
