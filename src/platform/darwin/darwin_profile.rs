@@ -106,7 +106,7 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
     // /etc is a symlink to /private/etc — it must be readable for
     // processes that open /etc/hosts, /etc/resolv.conf, etc.
     writeln!(profile, "; Ancestor directories for path traversal").unwrap();
-    for ancestor in &["/opt", "/etc", "/private", "/private/var"] {
+    for ancestor in &["/opt", "/etc", "/Users", "/private", "/private/var"] {
         writeln!(profile, "(allow file-read* (literal \"{ancestor}\"))").unwrap();
     }
     writeln!(profile).unwrap();
@@ -123,6 +123,7 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
         "/System",
         "/dev",
         "/private/var/select",
+        "/private/var/db/timezone",
     ] {
         writeln!(profile, "(allow file-read* (subpath \"{sys_path}\"))").unwrap();
     }
@@ -474,6 +475,7 @@ mod tests {
         assert!(content.contains("(allow file-read* (literal \"/opt\"))"));
         assert!(content.contains("(allow file-read* (literal \"/etc\"))"));
         assert!(content.contains("(allow file-read* (literal \"/private\"))"));
+        assert!(content.contains("(allow file-read* (literal \"/Users\"))"));
         assert!(content.contains("(allow file-read* (literal \"/private/var\"))"));
 
         // Verify /private/var/select is readable (shell resolution).
