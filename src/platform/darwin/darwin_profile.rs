@@ -121,12 +121,17 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
         "/opt/homebrew",
         "/Library/Frameworks",
         "/System",
-        "/dev",
         "/private/var/select",
         "/private/var/db/timezone",
     ] {
         writeln!(profile, "(allow file-read* (subpath \"{sys_path}\"))").unwrap();
     }
+    // Specific device nodes — not blanket /dev which would expose
+    // disk devices, DTrace, and pseudo-terminals.
+    for dev in &["/dev/null", "/dev/zero", "/dev/urandom", "/dev/random"] {
+        writeln!(profile, "(allow file-read* (literal \"{dev}\"))").unwrap();
+    }
+    writeln!(profile, "(allow file-read* (subpath \"/dev/fd\"))").unwrap();
     writeln!(profile).unwrap();
 
     // Specific /etc files (not the whole directory).
