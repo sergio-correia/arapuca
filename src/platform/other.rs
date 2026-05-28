@@ -26,8 +26,13 @@ impl Sandbox for Other {
             ));
         }
 
-        // Validate task ID.
+        // Validate task ID and work directory.
         crate::sanitize_task_id(&cfg.task_id)?;
+        crate::validate_work_dir(
+            &cfg.work_dir,
+            &cfg.profile.read_paths,
+            &cfg.profile.write_paths,
+        )?;
 
         let tmp_guard = crate::env::TmpDirGuard::new(crate::env::make_tmp_dir(&cfg.task_id)?);
 

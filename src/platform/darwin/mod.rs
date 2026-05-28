@@ -152,8 +152,13 @@ impl Darwin {
 
 impl Sandbox for Darwin {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
-        // Validate task ID.
+        // Validate task ID and work directory.
         crate::sanitize_task_id(&cfg.task_id)?;
+        crate::validate_work_dir(
+            &cfg.work_dir,
+            &cfg.profile.read_paths,
+            &cfg.profile.write_paths,
+        )?;
 
         let wrapper = Self::wrapper_path();
         let use_wrapper = wrapper.is_some();
