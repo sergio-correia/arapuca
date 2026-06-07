@@ -20,8 +20,6 @@
 use std::ffi::CString;
 #[cfg(feature = "microvm")]
 use std::io::IsTerminal;
-#[cfg(target_os = "linux")]
-use std::net::TcpListener;
 use std::path::PathBuf;
 
 fn main() {
@@ -192,15 +190,31 @@ fn main() {
 
         // Bridge: fork a TCP-to-UDS relay before seccomp is applied.
         // Activated when ARAPUCA_PROXY_BRIDGE=<port>:<uds_path> is set.
-        if let Some(bridge_port) = fork_bridge(audit_fd) {
-            let proxy = format!("http://127.0.0.1:{bridge_port}");
-            // SAFETY: single-threaded at this point (between
-            // Landlock apply and seccomp apply, no threads spawned).
-            unsafe {
-                std::env::set_var("HTTP_PROXY", &proxy);
-                std::env::set_var("HTTPS_PROXY", &proxy);
-                std::env::set_var("http_proxy", &proxy);
-                std::env::set_var("https_proxy", &proxy);
+        match arapuca::bridge::parse_bridge_env() {
+            Ok(Some((port, uds_path))) => {
+                let bridge_port = match arapuca::bridge::fork_bridge(port, &uds_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        audit_layer(audit_fd, "ProxyBridge", false, Some(&e.to_string()));
+                        eprintln!("arapuca: bridge: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let proxy = format!("http://127.0.0.1:{bridge_port}");
+                // SAFETY: single-threaded at this point (between
+                // Landlock apply and seccomp apply, no threads spawned).
+                unsafe {
+                    std::env::set_var("HTTP_PROXY", &proxy);
+                    std::env::set_var("HTTPS_PROXY", &proxy);
+                    std::env::set_var("http_proxy", &proxy);
+                    std::env::set_var("https_proxy", &proxy);
+                }
+                audit_layer(audit_fd, "ProxyBridge", true, None);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("arapuca: bridge: {e}");
+                std::process::exit(1);
             }
         }
 
@@ -3010,206 +3024,6 @@ fn apply_selinux_label(path: &str) {
         ),
         Err(e) => eprintln!("warning: chcon not available: {e}"),
     }
-}
-
-/// Parse ARAPUCA_PROXY_BRIDGE, fork a bridge child, and return the
-/// port number on success. Returns None if the env var is not set.
-/// Exits the process on error (fail-closed).
-///
-/// The bridge child: brings up loopback, binds TCP, applies its own
-/// seccomp, signals readiness, then enters the accept/relay loop.
-/// The parent waits for readiness (5s timeout) and returns.
-#[cfg(target_os = "linux")]
-fn fork_bridge(audit_fd: Option<i32>) -> Option<u16> {
-    let bridge_var = std::env::var("ARAPUCA_PROXY_BRIDGE").ok()?;
-
-    let (port_str, uds_path) = match bridge_var.split_once(':') {
-        Some((p, u)) if !u.is_empty() => (p, u),
-        _ => {
-            eprintln!("arapuca: invalid ARAPUCA_PROXY_BRIDGE format (expected port:path)");
-            std::process::exit(1);
-        }
-    };
-
-    let port: u16 = match port_str.parse() {
-        Ok(0) => {
-            eprintln!("arapuca: bridge port must be non-zero");
-            std::process::exit(1);
-        }
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("arapuca: invalid bridge port: {port_str}");
-            std::process::exit(1);
-        }
-    };
-
-    let uds_path = PathBuf::from(uds_path);
-
-    #[cfg(seccomp_supported)]
-    {
-        // SAFETY: PR_GET_SECCOMP is a simple query, no pointer args.
-        let seccomp_mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-        if seccomp_mode != 0 {
-            eprintln!("arapuca: bridge: seccomp already applied (invariant violation)");
-            std::process::exit(1);
-        }
-    }
-
-    // Bring up loopback inside the network namespace.
-    if let Err(e) = arapuca::bridge::loopback_up() {
-        eprintln!("arapuca: bridge: loopback: {e}");
-        std::process::exit(1);
-    }
-
-    // Bind the TCP listener before forking so the child only needs
-    // accept (not bind/listen) after its seccomp is applied.
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = match TcpListener::bind(addr) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("arapuca: bridge: bind {addr}: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // Create readiness pipe.
-    let mut pipe_fds = [0i32; 2];
-    // SAFETY: pipe2 with valid array and O_CLOEXEC flag.
-    let ret = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    if ret != 0 {
-        eprintln!("arapuca: bridge: pipe: {}", std::io::Error::last_os_error());
-        std::process::exit(1);
-    }
-    let pipe_read = pipe_fds[0];
-    let pipe_write = pipe_fds[1];
-
-    // Save PID for the pdeathsig race check in the child.
-    // SAFETY: getpid is always safe.
-    let parent_pid = unsafe { libc::getpid() };
-
-    // SAFETY: single-threaded at this point, fork is safe.
-    let child_pid = unsafe { libc::fork() };
-
-    if child_pid < 0 {
-        eprintln!("arapuca: bridge: fork: {}", std::io::Error::last_os_error());
-        std::process::exit(1);
-    }
-
-    use std::os::fd::AsRawFd;
-    let listener_fd = listener.as_raw_fd();
-
-    if child_pid == 0 {
-        // ── Bridge child ──────────────────────────────────────
-
-        // Close pipe read end.
-        // SAFETY: pipe_read is a valid fd from pipe2.
-        unsafe { libc::close(pipe_read) };
-
-        // Close all FDs >= 3 except pipe_write and listener_fd.
-        // SAFETY: close_range is available on Linux 5.9+ (within
-        // our Landlock 5.13+ kernel floor).
-        unsafe {
-            let mut keep = [pipe_write, listener_fd];
-            keep.sort();
-            let mut start = 3i32;
-            for &fd in &keep {
-                if fd > start {
-                    libc::syscall(libc::SYS_close_range, start as u32, (fd - 1) as u32, 0u32);
-                }
-                start = fd + 1;
-            }
-            libc::syscall(libc::SYS_close_range, start as u32, u32::MAX, 0u32);
-        }
-
-        // SAFETY: prctl with PR_SET_PDEATHSIG is a simple setter.
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
-
-        // Race check: if the parent died between fork and prctl,
-        // getppid will no longer match parent_pid.
-        // SAFETY: getppid is always safe.
-        if unsafe { libc::getppid() } != parent_pid {
-            unsafe { libc::_exit(1) };
-        }
-
-        // SAFETY: prctl with PR_SET_DUMPABLE is a simple setter.
-        // Prevents /proc/<pid>/mem access from the agent.
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
-
-        #[cfg(seccomp_supported)]
-        if let Err(e) = arapuca::bridge::apply_bridge_seccomp() {
-            eprintln!("arapuca: bridge: seccomp: {e}");
-            unsafe { libc::_exit(1) };
-        }
-        #[cfg(not(seccomp_supported))]
-        log::warn!("bridge: seccomp not available — running without syscall filter");
-
-        // Enter the accept/relay loop. This never returns normally
-        // — the bridge runs until killed by pdeathsig.
-        if let Err(e) = arapuca::bridge::listen_and_relay(listener, &uds_path, pipe_write) {
-            eprintln!("arapuca: bridge: relay: {e}");
-        }
-        unsafe { libc::_exit(0) };
-    }
-
-    // ── Parent ────────────────────────────────────────────────
-
-    // The parent does not need the listener — the child owns it.
-    let actual_port = listener.local_addr().expect("bound listener").port();
-    drop(listener);
-
-    // Close pipe write end.
-    // SAFETY: pipe_write is a valid fd from pipe2.
-    unsafe { libc::close(pipe_write) };
-
-    // Wait for bridge readiness (5s timeout), retrying on EINTR.
-    let mut pfd = libc::pollfd {
-        fd: pipe_read,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let poll_ret = loop {
-        // SAFETY: pfd is a valid stack-local pollfd, timeout in ms.
-        let ret = unsafe { libc::poll(&mut pfd, 1, 5000) };
-        if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            break ret;
-        }
-    };
-
-    if poll_ret == 0 {
-        eprintln!("arapuca: bridge: readiness timeout (5s)");
-        // SAFETY: child_pid is a valid PID from fork.
-        unsafe { libc::kill(child_pid, libc::SIGKILL) };
-        std::process::exit(1);
-    }
-    if poll_ret < 0 {
-        eprintln!("arapuca: bridge: poll: {}", std::io::Error::last_os_error());
-        // SAFETY: child_pid is a valid PID from fork.
-        unsafe { libc::kill(child_pid, libc::SIGKILL) };
-        std::process::exit(1);
-    }
-
-    // Read the readiness byte, retrying on EINTR.
-    let mut buf = [0u8; 1];
-    let n = loop {
-        // SAFETY: pipe_read is valid, buf is stack-local.
-        let ret =
-            unsafe { libc::read(pipe_read, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            break ret;
-        }
-    };
-    // SAFETY: done with pipe_read.
-    unsafe { libc::close(pipe_read) };
-
-    if n != 1 {
-        eprintln!("arapuca: bridge: readiness signal failed");
-        // SAFETY: child_pid is a valid PID from fork.
-        unsafe { libc::kill(child_pid, libc::SIGKILL) };
-        std::process::exit(1);
-    }
-
-    audit_layer(audit_fd, "ProxyBridge", true, None);
-    Some(actual_port)
 }
 
 /// Parse colon-separated paths from an environment variable.

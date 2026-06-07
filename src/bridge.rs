@@ -157,6 +157,224 @@ pub fn loopback_up() -> io::Result<()> {
 const MAX_CONNECTIONS: usize = 64;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Parse the `ARAPUCA_PROXY_BRIDGE` environment variable.
+///
+/// Expected format: `<port>:<uds_path>` (e.g., `18080:/tmp/proxy.sock`).
+/// Returns `Ok(None)` if the variable is not set.
+///
+/// # Errors
+///
+/// Returns an error if the variable is set but malformed (bad format,
+/// zero port, non-numeric port, colon in path).
+pub fn parse_bridge_env() -> crate::Result<Option<(u16, std::path::PathBuf)>> {
+    let val = match std::env::var("ARAPUCA_PROXY_BRIDGE") {
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(crate::Error::Validation(
+                "ARAPUCA_PROXY_BRIDGE is not valid UTF-8".into(),
+            ));
+        }
+    };
+
+    let (port_str, uds_path) = match val.split_once(':') {
+        Some((p, u)) if !u.is_empty() => (p, u),
+        _ => {
+            return Err(crate::Error::Validation(
+                "invalid ARAPUCA_PROXY_BRIDGE format (expected port:path)".into(),
+            ));
+        }
+    };
+
+    let port: u16 = match port_str.parse() {
+        Ok(0) => {
+            return Err(crate::Error::Validation(
+                "bridge port must be non-zero".into(),
+            ));
+        }
+        Ok(p) => p,
+        Err(_) => {
+            return Err(crate::Error::Validation(format!(
+                "invalid bridge port: {port_str}"
+            )));
+        }
+    };
+
+    Ok(Some((port, std::path::PathBuf::from(uds_path))))
+}
+
+/// Fork a TCP-to-UDS proxy bridge child process.
+///
+/// Brings up loopback, binds a TCP listener on `127.0.0.1:port`,
+/// forks a child that relays TCP connections to the UDS at `uds_path`,
+/// and waits for child readiness. Returns the actual bound port.
+///
+/// The bridge child applies its own seccomp filter and runs until
+/// killed by `PR_SET_PDEATHSIG`. It never returns.
+///
+/// # Preconditions
+///
+/// - Must be called before seccomp is applied (checked via prctl).
+/// - Must be inside a network namespace (loopback_up assumes fresh netns).
+///
+/// # Errors
+///
+/// Returns an error if loopback cannot be brought up, the listener
+/// cannot be bound, fork fails, or the bridge child fails to signal
+/// readiness within the timeout.
+pub fn fork_bridge(port: u16, uds_path: &Path) -> crate::Result<u16> {
+    #[cfg(seccomp_supported)]
+    {
+        // SAFETY: PR_GET_SECCOMP is a simple query, no pointer args.
+        let seccomp_mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
+        if seccomp_mode != 0 {
+            return Err(crate::Error::Process(
+                "bridge: seccomp already applied (invariant violation)".into(),
+            ));
+        }
+    }
+
+    loopback_up().map_err(|e| crate::Error::Process(format!("bridge: loopback: {e}")))?;
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = TcpListener::bind(addr)
+        .map_err(|e| crate::Error::Process(format!("bridge: bind {addr}: {e}")))?;
+
+    // Create readiness pipe.
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: pipe2 with valid array and O_CLOEXEC flag.
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(crate::Error::Syscall {
+            name: "pipe2",
+            source: io::Error::last_os_error(),
+        });
+    }
+    let pipe_read = pipe_fds[0];
+    let pipe_write = pipe_fds[1];
+
+    // SAFETY: getpid is always safe.
+    let parent_pid = unsafe { libc::getpid() };
+
+    // SAFETY: single-threaded at this point, fork is safe.
+    let child_pid = unsafe { libc::fork() };
+    if child_pid < 0 {
+        return Err(crate::Error::Syscall {
+            name: "fork",
+            source: io::Error::last_os_error(),
+        });
+    }
+
+    let listener_fd = listener.as_raw_fd();
+
+    if child_pid == 0 {
+        // ── Bridge child ──────────────────────────────────────
+        // All error exits use _exit (child can never return).
+
+        // SAFETY: pipe_read is a valid fd from pipe2.
+        unsafe { libc::close(pipe_read) };
+
+        // Close all FDs >= 3 except pipe_write and listener_fd.
+        unsafe {
+            let mut keep = [pipe_write, listener_fd];
+            keep.sort();
+            let mut start = 3i32;
+            for &fd in &keep {
+                if fd > start {
+                    libc::syscall(libc::SYS_close_range, start as u32, (fd - 1) as u32, 0u32);
+                }
+                start = fd + 1;
+            }
+            libc::syscall(libc::SYS_close_range, start as u32, u32::MAX, 0u32);
+        }
+
+        // SAFETY: prctl with PR_SET_PDEATHSIG is a simple setter.
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+
+        // Race check: if the parent died between fork and prctl.
+        if unsafe { libc::getppid() } != parent_pid {
+            unsafe { libc::_exit(1) };
+        }
+
+        // Prevents /proc/<pid>/mem access from the agent.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+
+        #[cfg(seccomp_supported)]
+        if let Err(e) = apply_bridge_seccomp() {
+            child_stderr(&format!("bridge: seccomp: {e}\n"));
+            unsafe { libc::_exit(1) };
+        }
+        #[cfg(not(seccomp_supported))]
+        child_stderr("bridge: seccomp not available\n");
+
+        if let Err(e) = listen_and_relay(listener, uds_path, pipe_write) {
+            child_stderr(&format!("bridge: relay: {e}\n"));
+        }
+        unsafe { libc::_exit(0) };
+    }
+
+    // ── Parent ────────────────────────────────────────────────
+
+    let actual_port = listener.local_addr().expect("bound listener").port();
+    drop(listener);
+
+    // SAFETY: pipe_write is a valid fd from pipe2.
+    unsafe { libc::close(pipe_write) };
+
+    // Wait for bridge readiness (5s timeout), retrying on EINTR.
+    let mut pfd = libc::pollfd {
+        fd: pipe_read,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let poll_ret = loop {
+        // SAFETY: pfd is a valid stack-local pollfd, timeout in ms.
+        let ret = unsafe { libc::poll(&mut pfd, 1, 5000) };
+        if ret >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break ret;
+        }
+    };
+
+    if poll_ret == 0 {
+        unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        return Err(crate::Error::Process(
+            "bridge: readiness timeout (5s)".into(),
+        ));
+    }
+    if poll_ret < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        return Err(crate::Error::Syscall {
+            name: "poll",
+            source: err,
+        });
+    }
+
+    // Read the readiness byte, retrying on EINTR.
+    let mut buf = [0u8; 1];
+    let n = loop {
+        let ret =
+            unsafe { libc::read(pipe_read, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if ret >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break ret;
+        }
+    };
+    unsafe { libc::close(pipe_read) };
+
+    if n != 1 {
+        unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        return Err(crate::Error::Process(
+            "bridge: readiness signal failed".into(),
+        ));
+    }
+
+    Ok(actual_port)
+}
+
+/// Write to stderr from the bridge child (raw libc, async-signal-safe).
+fn child_stderr(msg: &str) {
+    let _ = unsafe { libc::write(2, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
+}
+
 #[cfg(seccomp_supported)]
 const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
     | libc::CLONE_FS
@@ -1626,5 +1844,120 @@ mod tests {
         let (clone3_prog, main_prog) = build_connect_proxy_filters().unwrap();
         assert!(!clone3_prog.is_empty());
         assert!(!main_prog.is_empty());
+    }
+
+    // ─── parse_bridge_env tests ───────────────────────────────
+
+    // Serialized: parse_bridge_env reads a process-global env var.
+    static BRIDGE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_bridge_env<F: FnOnce()>(val: Option<&str>, f: F) {
+        let _guard = BRIDGE_ENV_LOCK.lock().unwrap();
+        match val {
+            Some(v) => unsafe { std::env::set_var("ARAPUCA_PROXY_BRIDGE", v) },
+            None => unsafe { std::env::remove_var("ARAPUCA_PROXY_BRIDGE") },
+        }
+        f();
+        unsafe { std::env::remove_var("ARAPUCA_PROXY_BRIDGE") };
+    }
+
+    #[test]
+    fn parse_bridge_env_not_set() {
+        with_bridge_env(None, || {
+            assert!(matches!(parse_bridge_env(), Ok(None)));
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_valid() {
+        with_bridge_env(Some("18080:/tmp/proxy.sock"), || {
+            let result = parse_bridge_env().unwrap().unwrap();
+            assert_eq!(result.0, 18080);
+            assert_eq!(result.1, std::path::PathBuf::from("/tmp/proxy.sock"));
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_port_one() {
+        with_bridge_env(Some("1:/sock"), || {
+            assert_eq!(parse_bridge_env().unwrap().unwrap().0, 1);
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_port_max() {
+        with_bridge_env(Some("65535:/sock"), || {
+            assert_eq!(parse_bridge_env().unwrap().unwrap().0, 65535);
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_port_zero() {
+        with_bridge_env(Some("0:/sock"), || {
+            assert!(parse_bridge_env().is_err());
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_port_overflow() {
+        with_bridge_env(Some("65536:/sock"), || {
+            assert!(parse_bridge_env().is_err());
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_port_negative() {
+        with_bridge_env(Some("-1:/sock"), || {
+            assert!(parse_bridge_env().is_err());
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_port_non_numeric() {
+        with_bridge_env(Some("abc:/sock"), || {
+            assert!(parse_bridge_env().is_err());
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_no_colon() {
+        with_bridge_env(Some("18080"), || {
+            assert!(parse_bridge_env().is_err());
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_empty_path() {
+        with_bridge_env(Some("18080:"), || {
+            assert!(parse_bridge_env().is_err());
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_empty_string() {
+        with_bridge_env(Some(""), || {
+            assert!(parse_bridge_env().is_err());
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_colon_only() {
+        with_bridge_env(Some(":"), || {
+            assert!(parse_bridge_env().is_err());
+        });
+    }
+
+    #[test]
+    fn parse_bridge_env_path_with_colons() {
+        // split_once means the first colon separates port from path;
+        // subsequent colons are part of the path.
+        with_bridge_env(Some("18080:/run/user:1000/proxy.sock"), || {
+            let result = parse_bridge_env().unwrap().unwrap();
+            assert_eq!(result.0, 18080);
+            assert_eq!(
+                result.1,
+                std::path::PathBuf::from("/run/user:1000/proxy.sock")
+            );
+        });
     }
 }
