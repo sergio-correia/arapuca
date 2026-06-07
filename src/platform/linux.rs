@@ -61,6 +61,20 @@ impl Sandbox for Linux {
             &cfg.profile.write_paths,
         )?;
 
+        // Selfexec mode does not support the proxy bridge (fork_bridge
+        // runs inside the wrapper binary, not the library). Fail early
+        // with a clear error instead of letting the child _exit(1).
+        if crate::selfexec::selfexec_enabled()
+            && cfg.profile.use_netns
+            && cfg.network_proxy_socket.is_some()
+        {
+            return Err(crate::Error::Validation(
+                "selfexec mode does not support the proxy bridge \
+                 (network_proxy_socket); use the external arapuca binary"
+                    .into(),
+            ));
+        }
+
         let tmp_guard = crate::env::TmpDirGuard::new(crate::env::make_tmp_dir(&cfg.task_id)?);
 
         let audit_ctx = cfg
