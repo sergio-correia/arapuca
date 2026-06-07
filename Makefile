@@ -1,10 +1,6 @@
 .PHONY: build release build-microvm release-microvm agent agent-release test test-unit test-integration lint fmt fmt-check clippy check ci ci-full audit header man clean static package install uninstall
 
-ifeq ($(shell uname -s),Linux)
-  FEATURES ?= microvm
-else
-  FEATURES ?=
-endif
+FEATURES ?=
 PREFIX  ?= /usr/local
 LIBDIR  ?= $(PREFIX)/lib
 DESTDIR ?=
