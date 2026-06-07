@@ -3221,51 +3221,10 @@ fn env_paths(name: &str) -> Vec<PathBuf> {
     }
 }
 
+#[cfg(unix)]
+use arapuca::wrapper::audit_layer;
 /// Write an audit status line to the audit FD (if set).
 ///
 /// Writes newline-delimited JSON. Errors are silently ignored — audit
 /// is observability, not a security gate.
-#[cfg(unix)]
-fn audit_layer(fd: Option<i32>, layer: &str, ok: bool, error: Option<&str>) {
-    let Some(fd) = fd else { return };
-    let status = if ok { "applied" } else { "failed" };
-    let json = if let Some(err) = error {
-        let escaped = json_escape(err);
-        format!(r#"{{"layer":"{layer}","status":"{status}","error":"{escaped}"}}"#)
-    } else {
-        format!(r#"{{"layer":"{layer}","status":"{status}"}}"#)
-    };
-    let line = format!("{json}\n");
-    // SAFETY: fd is a valid descriptor from ARAPUCA_AUDIT_FD, buf/len valid.
-    let _ = unsafe { libc::write(fd, line.as_ptr().cast::<libc::c_void>(), line.len()) };
-}
-
-/// Escape a string for JSON (RFC 8259): backslash, double-quote,
-/// and all control characters below U+0020.
-#[cfg(unix)]
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if c < '\u{0020}' => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Simple PATH lookup for a command name.
-fn which(cmd: &str) -> Option<PathBuf> {
-    let path_var = std::env::var("PATH").ok()?;
-    for dir in path_var.split(':') {
-        let candidate = PathBuf::from(dir).join(cmd);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
+use arapuca::wrapper::which;

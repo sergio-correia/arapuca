@@ -31,11 +31,13 @@ mod profile;
 pub mod rlimit;
 #[cfg(seccomp_supported)]
 pub mod seccomp;
+pub mod selfexec;
 #[cfg(unix)]
 pub mod terminal;
 mod validate;
 #[cfg(target_os = "linux")]
 pub mod vm;
+pub mod wrapper;
 
 pub use process::Process;
 

@@ -256,11 +256,21 @@ const WRAPPER_BIN: &str = if cfg!(windows) {
     "arapuca"
 };
 
-/// Returns the path to the arapuca binary if it exists.
+/// Returns the path to the arapuca wrapper binary if it exists.
 ///
-/// Looks next to the current executable first, then in PATH.
-/// Returns None if not found.
+/// When selfexec mode is enabled, returns the current executable
+/// (the consumer binary acts as its own wrapper). Otherwise looks
+/// next to the current executable, then in PATH.
 pub fn wrapper_path() -> Option<PathBuf> {
+    if crate::selfexec::selfexec_enabled() {
+        match std::env::current_exe() {
+            Ok(exe) => return Some(exe),
+            Err(e) => {
+                log::warn!("selfexec: current_exe() failed: {e}");
+                return None;
+            }
+        }
+    }
     // Look next to the current executable.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

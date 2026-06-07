@@ -1005,6 +1005,16 @@ pub extern "C" fn arapuca_wrapper_path() -> *mut c_char {
     }
 }
 
+/// Enable selfexec mode: `wrapper_path()` returns `current_exe()`.
+///
+/// Call before the first launch. Once enabled, the consumer binary
+/// acts as its own Landlock/seccomp trampoline — no separate
+/// `arapuca` binary is needed.
+#[unsafe(no_mangle)]
+pub extern "C" fn arapuca_enable_selfexec_mode() {
+    crate::selfexec::enable_selfexec_mode();
+}
+
 /// Calculate disk usage of a directory in MB.
 ///
 /// Returns 0 on error or if the path doesn't exist.
