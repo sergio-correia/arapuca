@@ -481,6 +481,15 @@ char *arapuca_make_tmp_dir(const char *task_id);
 char *arapuca_wrapper_path(void);
 
 /**
+ * Enable selfexec mode: `wrapper_path()` returns `current_exe()`.
+ *
+ * Call before the first launch. Once enabled, the consumer binary
+ * acts as its own Landlock/seccomp trampoline — no separate
+ * `arapuca` binary is needed.
+ */
+void arapuca_enable_selfexec_mode(void);
+
+/**
  * Calculate disk usage of a directory in MB.
  *
  * Returns 0 on error or if the path doesn't exist.
@@ -536,5 +545,16 @@ bool arapuca_microvm_available(void);
  * `distro` and `version` must be valid null-terminated strings.
  */
 char *arapuca_image_pull(const char *distro, const char *version);
+
+/**
+ * Entry point called from the C constructor in go-arapuca.
+ * The C side has already verified ARAPUCA_WRAPPER=1 AND argv[1]=="--".
+ * argc/argv are passed from C (__libc_argc/__libc_argv) to avoid
+ * dependency on Rust's std::env::args_os() .init_array ordering.
+ *
+ * This function never returns — it applies sandbox restrictions
+ * and exec-s into the target command, or _exit-s on failure.
+ */
+void arapuca_handle_selfexec_if_wrapper(int argc, const char *const *argv);
 
 #endif  /* ARAPUCA_H */
