@@ -271,12 +271,19 @@ pub fn wrapper_path() -> Option<PathBuf> {
             }
         }
     }
-    // Look next to the current executable.
+    // Look next to the current executable, then one level up
+    // (handles cargo test binaries in target/debug/deps/).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join(WRAPPER_BIN);
             if candidate.is_file() {
                 return Some(candidate);
+            }
+            if let Some(parent) = dir.parent() {
+                let candidate = parent.join(WRAPPER_BIN);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
         }
     }
