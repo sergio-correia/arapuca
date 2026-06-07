@@ -200,13 +200,34 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         audit_layer(audit_fd, "Landlock", true, None);
     }
 
-    // ── Bridge guard (fail-closed) ───────────────────────────────
-    if std::env::var_os("ARAPUCA_PROXY_BRIDGE").is_some() {
-        write_stderr(
-            "arapuca: selfexec: proxy bridge not supported in selfexec mode \
-             — use external arapuca binary\n",
-        );
-        unsafe { libc::_exit(1) };
+    // ── Proxy bridge ──────────────────────────────────────────────
+    // Fork a TCP-to-UDS relay child before seccomp is applied.
+    match crate::bridge::parse_bridge_env() {
+        Ok(Some((port, uds_path))) => {
+            match crate::bridge::fork_bridge(port, &uds_path) {
+                Ok(bridge_port) => {
+                    let proxy = format!("http://127.0.0.1:{bridge_port}");
+                    // SAFETY: single-threaded (Go runtime not started).
+                    unsafe {
+                        std::env::set_var("HTTP_PROXY", &proxy);
+                        std::env::set_var("HTTPS_PROXY", &proxy);
+                        std::env::set_var("http_proxy", &proxy);
+                        std::env::set_var("https_proxy", &proxy);
+                    }
+                    audit_layer(audit_fd, "ProxyBridge", true, None);
+                }
+                Err(e) => {
+                    audit_layer(audit_fd, "ProxyBridge", false, Some(&e.to_string()));
+                    write_stderr(&format!("arapuca: selfexec: bridge: {e}\n"));
+                    unsafe { libc::_exit(1) };
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            write_stderr(&format!("arapuca: selfexec: bridge env: {e}\n"));
+            unsafe { libc::_exit(1) };
+        }
     }
 
     // ── Seccomp ──────────────────────────────────────────────────
