@@ -14,6 +14,7 @@
 //!                         automatically — per-UID system-wide limit)
 //!   ARAPUCA_RLIMIT_CPU:   max CPU seconds (0 = no limit)
 //!   ARAPUCA_RLIMIT_FSIZE: max file size in bytes (0 = no limit)
+//!   ARAPUCA_RLIMIT_NOFILE: max open file descriptors (0 = no limit)
 //!
 //! Usage: arapuca -- command [args...]
 

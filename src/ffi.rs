@@ -208,6 +208,19 @@ pub unsafe extern "C" fn arapuca_profile_set_max_file_size_mb(
     }
 }
 
+/// Set maximum open file descriptors (RLIMIT_NOFILE).
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_max_open_files(profile: *mut ArapucaProfile, n: u64) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.max_open_files = n;
+        }
+    }
+}
+
 /// Enable/disable network namespace isolation.
 ///
 /// # Safety

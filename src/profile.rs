@@ -113,6 +113,8 @@ pub struct Profile {
     pub max_pids: u32,
     /// Maximum file size in MB via RLIMIT_FSIZE (0 = no limit).
     pub max_file_size_mb: u64,
+    /// Maximum open file descriptors via RLIMIT_NOFILE (0 = no limit).
+    pub max_open_files: u64,
     /// Whether execve is permitted (for git, test runners, etc.).
     pub allow_exec: bool,
     /// Use CLONE_NEWNET for network namespace isolation (Linux only).

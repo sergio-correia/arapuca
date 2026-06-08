@@ -559,6 +559,7 @@ impl Sandbox for Linux {
                 cpu_pct: cfg.profile.max_cpu_pct,
                 max_pids: cfg.profile.max_pids,
                 max_file_size_mb: cfg.profile.max_file_size_mb,
+                max_open_files: cfg.profile.max_open_files,
                 allow_exec: cfg.profile.allow_exec,
             })?;
 

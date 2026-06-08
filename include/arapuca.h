@@ -192,6 +192,14 @@ void arapuca_profile_set_max_pids(struct arapuca_ArapucaProfile *profile, uint32
 void arapuca_profile_set_max_file_size_mb(struct arapuca_ArapucaProfile *profile, uint64_t mb);
 
 /**
+ * Set maximum open file descriptors (RLIMIT_NOFILE).
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_max_open_files(struct arapuca_ArapucaProfile *profile, uint64_t n);
+
+/**
  * Enable/disable network namespace isolation.
  *
  * # Safety

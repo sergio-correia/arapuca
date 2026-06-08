@@ -98,6 +98,7 @@ pub enum AuditEvent {
         cpu_pct: u32,
         max_pids: u32,
         max_file_size_mb: u64,
+        max_open_files: u64,
         allow_exec: bool,
     },
 

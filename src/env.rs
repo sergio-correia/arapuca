@@ -331,6 +331,12 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
             (profile.max_file_size_mb * 1024 * 1024).to_string(),
         ));
     }
+    if profile.max_open_files > 0 {
+        env.push((
+            "ARAPUCA_RLIMIT_NOFILE".into(),
+            profile.max_open_files.to_string(),
+        ));
+    }
     // Always emit — never rely on absence encoding Strict.
     // Linux::launch() calls env_clear() so ambient vars don't leak,
     // but defense-in-depth: explicit is better than implicit.
@@ -735,6 +741,7 @@ mod tests {
             max_memory_mb: 256,
             max_pids: 100,
             max_file_size_mb: 512,
+            max_open_files: 1024,
             read_paths: vec![PathBuf::from("/usr")],
             ..Default::default()
         };
@@ -744,6 +751,7 @@ mod tests {
 
         let fsize_bytes = (512u64 * 1024 * 1024).to_string();
         assert_eq!(map.get("ARAPUCA_RLIMIT_FSIZE"), Some(&fsize_bytes.as_str()));
+        assert_eq!(map.get("ARAPUCA_RLIMIT_NOFILE"), Some(&"1024"));
         assert_eq!(map.get("ARAPUCA_READ_PATHS"), Some(&"/usr"));
         assert!(!map.contains_key("ARAPUCA_RLIMIT_NPROC"));
     }
