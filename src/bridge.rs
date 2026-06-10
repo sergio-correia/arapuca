@@ -222,7 +222,7 @@ pub fn parse_bridge_env() -> crate::Result<Option<(u16, std::path::PathBuf)>> {
 /// Returns an error if loopback cannot be brought up, the listener
 /// cannot be bound, fork fails, or the bridge child fails to signal
 /// readiness within the timeout.
-pub fn fork_bridge(port: u16, uds_path: &Path) -> crate::Result<u16> {
+pub fn fork_bridge(port: u16, uds_path: &Path, dns_audit_fd: Option<RawFd>) -> crate::Result<u16> {
     #[cfg(seccomp_supported)]
     {
         // SAFETY: PR_GET_SECCOMP is a simple query, no pointer args.
@@ -239,6 +239,16 @@ pub fn fork_bridge(port: u16, uds_path: &Path) -> crate::Result<u16> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr)
         .map_err(|e| crate::Error::Process(format!("bridge: bind {addr}: {e}")))?;
+
+    // Pre-bind DNS capture UDP socket before fork (before seccomp).
+    let dns_udp = if dns_audit_fd.is_some() {
+        let udp_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 53));
+        let udp = std::net::UdpSocket::bind(udp_addr)
+            .map_err(|e| crate::Error::Process(format!("bridge: dns bind {udp_addr}: {e}")))?;
+        Some(udp)
+    } else {
+        None
+    };
 
     // Create readiness pipe.
     let mut pipe_fds = [0i32; 2];
@@ -273,12 +283,19 @@ pub fn fork_bridge(port: u16, uds_path: &Path) -> crate::Result<u16> {
         // SAFETY: pipe_read is a valid fd from pipe2.
         unsafe { libc::close(pipe_read) };
 
-        // Close all FDs >= 3 except pipe_write and listener_fd.
+        // Close all FDs >= 3 except those we need to keep.
         unsafe {
-            let mut keep = [pipe_write, listener_fd];
-            keep.sort();
+            let mut keep_vec = vec![pipe_write, listener_fd];
+            if let Some(ref udp) = dns_udp {
+                keep_vec.push(udp.as_raw_fd());
+            }
+            if let Some(fd) = dns_audit_fd {
+                keep_vec.push(fd);
+            }
+            keep_vec.sort();
+            keep_vec.dedup();
             let mut start = 3i32;
-            for &fd in &keep {
+            for &fd in &keep_vec {
                 if fd > start {
                     libc::syscall(libc::SYS_close_range, start as u32, (fd - 1) as u32, 0u32);
                 }
@@ -286,6 +303,20 @@ pub fn fork_bridge(port: u16, uds_path: &Path) -> crate::Result<u16> {
             }
             libc::syscall(libc::SYS_close_range, start as u32, u32::MAX, 0u32);
         }
+
+        // Set dns_audit_fd to non-blocking to avoid stalling on pipe full.
+        if let Some(fd) = dns_audit_fd {
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+        }
+
+        // Ignore SIGPIPE so that writing to a broken audit pipe
+        // returns EPIPE instead of killing the bridge process.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
 
         // SAFETY: prctl with PR_SET_PDEATHSIG is a simple setter.
         unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
@@ -305,6 +336,11 @@ pub fn fork_bridge(port: u16, uds_path: &Path) -> crate::Result<u16> {
         }
         #[cfg(not(seccomp_supported))]
         child_stderr("bridge: seccomp not available\n");
+
+        // Spawn DNS capture thread if enabled.
+        if let (Some(udp), Some(audit_fd)) = (dns_udp, dns_audit_fd) {
+            std::thread::spawn(move || dns_serve(udp, audit_fd));
+        }
 
         if let Err(e) = listen_and_relay(listener, uds_path, pipe_write) {
             child_stderr(&format!("bridge: relay: {e}\n"));
@@ -727,6 +763,57 @@ pub fn listen_and_relay(listener: TcpListener, uds_path: &Path, ready_fd: RawFd)
     }
 
     Ok(())
+}
+
+// ─── DNS capture ─────────────────────────────────────────────
+
+/// Serve DNS queries on a pre-bound UDP socket, logging each
+/// query domain to the audit pipe and responding with NXDOMAIN.
+///
+/// Runs in a dedicated thread inside the bridge child process.
+/// Killed by SIGKILL (pdeathsig) when the parent exits.
+fn dns_serve(udp: std::net::UdpSocket, audit_fd: RawFd) {
+    let mut buf = [0u8; 4096];
+    let mut dropped: u64 = 0;
+    loop {
+        let (n, src) = match udp.recv_from(&mut buf) {
+            Ok(r) => r,
+            Err(e) => {
+                if e.kind() != io::ErrorKind::Interrupted && e.kind() != io::ErrorKind::WouldBlock {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                continue;
+            }
+        };
+
+        if n < 12 || buf[2] & 0x80 != 0 {
+            continue;
+        }
+
+        let id = u16::from_be_bytes([buf[0], buf[1]]);
+
+        let line: Vec<u8> = if let Some(query) = crate::dns::parse_query(&buf[..n]) {
+            let escaped = crate::wrapper::json_escape(&query.domain);
+            let qtype = crate::dns::qtype_name(query.qtype);
+            format!("{{\"domain\":\"{escaped}\",\"qtype\":\"{qtype}\"}}\n").into_bytes()
+        } else {
+            b"{\"domain\":\"<unparseable>\",\"qtype\":\"UNKNOWN\"}\n".to_vec()
+        };
+
+        let ret = unsafe { libc::write(audit_fd, line.as_ptr().cast(), line.len()) };
+        if ret < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+            dropped += 1;
+        } else if dropped > 0 {
+            let summary = format!("{{\"dropped\":{dropped}}}\n");
+            let _ = unsafe { libc::write(audit_fd, summary.as_ptr().cast(), summary.len()) };
+            dropped = 0;
+        }
+
+        let resp = crate::dns::build_nxdomain(&buf[..n], id);
+        if !resp.is_empty() {
+            let _ = udp.send_to(&resp, src);
+        }
+    }
 }
 
 // ─── CONNECT proxy ───────────────────────────────────────────

@@ -193,7 +193,12 @@ fn main() {
         // Activated when ARAPUCA_PROXY_BRIDGE=<port>:<uds_path> is set.
         match arapuca::bridge::parse_bridge_env() {
             Ok(Some((port, uds_path))) => {
-                let bridge_port = match arapuca::bridge::fork_bridge(port, &uds_path) {
+                let dns_audit_fd = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .filter(|&fd| fd >= 0);
+                let bridge_port = match arapuca::bridge::fork_bridge(port, &uds_path, dns_audit_fd)
+                {
                     Ok(p) => p,
                     Err(e) => {
                         audit_layer(audit_fd, "ProxyBridge", false, Some(&e.to_string()));
@@ -269,10 +274,17 @@ fn main() {
         audit_layer(audit_fd, "Pdeathsig", true, None);
     }
 
-    // Close audit FD before exec — the target command must not inherit it.
+    // Close audit FDs before exec — the target command must not inherit them.
     #[cfg(unix)]
     if let Some(fd) = audit_fd {
         // SAFETY: fd is a valid file descriptor from ARAPUCA_AUDIT_FD.
+        unsafe { libc::close(fd) };
+    }
+    #[cfg(unix)]
+    if let Some(fd) = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+    {
         unsafe { libc::close(fd) };
     }
 

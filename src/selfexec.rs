@@ -204,7 +204,11 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
     // Fork a TCP-to-UDS relay child before seccomp is applied.
     match crate::bridge::parse_bridge_env() {
         Ok(Some((port, uds_path))) => {
-            match crate::bridge::fork_bridge(port, &uds_path) {
+            let dns_audit_fd = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .filter(|&fd| fd >= 0);
+            match crate::bridge::fork_bridge(port, &uds_path, dns_audit_fd) {
                 Ok(bridge_port) => {
                     let proxy = format!("http://127.0.0.1:{bridge_port}");
                     // SAFETY: single-threaded (Go runtime not started).
@@ -264,10 +268,16 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
     #[cfg(unix)]
     audit_layer(audit_fd, "Rlimit", true, None);
 
-    // ── Close audit FD before exec ───────────────────────────────
-    // MUST happen before execve — the parent's validate_wrapper_audit()
-    // blocks on read() until all write-end holders close the FD.
+    // ── Close audit FDs before exec ──────────────────────────────
+    // MUST happen before execve — the parent's pipe readers block on
+    // read() until all write-end holders close the FD.
     if let Some(fd) = audit_fd {
+        unsafe { libc::close(fd) };
+    }
+    if let Some(fd) = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+    {
         unsafe { libc::close(fd) };
     }
 

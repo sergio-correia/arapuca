@@ -68,7 +68,7 @@ pub fn parse_query(buf: &[u8]) -> Option<DnsQuery> {
 
         let label_bytes = &buf[pos..pos + label_len];
 
-        // Validate label characters: only [a-zA-Z0-9-].
+        // Validate label characters: only [a-zA-Z0-9-_].
         // The dot separator is implicit (between labels), not in labels.
         for &b in label_bytes {
             if !b.is_ascii_alphanumeric() && b != b'-' && b != b'_' {
