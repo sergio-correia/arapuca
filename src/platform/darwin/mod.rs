@@ -300,6 +300,20 @@ impl Sandbox for Darwin {
                 exec_paths.push(parent.to_string_lossy().into_owned());
             }
         }
+        // When allow_exec is set, read_paths should also be executable.
+        // On Linux, Landlock applies LANDLOCK_ACCESS_FS_EXECUTE alongside
+        // READ_FILE. On macOS, file-read* and process-exec are separate
+        // Seatbelt operations, so we must explicitly add read_paths to
+        // exec_paths. Without this, binaries found via PATH in read-only
+        // directories (e.g. nvm's node inside a version prefix) cannot
+        // be executed even though they are readable.
+        if cfg.profile.allow_exec {
+            for p in &read_paths {
+                if !exec_paths.contains(p) {
+                    exec_paths.push(p.clone());
+                }
+            }
+        }
 
         let control_socket = if has_socket_dir {
             Some(canon(&cfg.socket_dir.join("control.sock")))
