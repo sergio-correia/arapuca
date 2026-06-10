@@ -203,11 +203,12 @@ pub fn parse_bridge_env() -> crate::Result<Option<(u16, std::path::PathBuf)>> {
     Ok(Some((port, std::path::PathBuf::from(uds_path))))
 }
 
-/// Fork a TCP-to-UDS proxy bridge child process.
+/// Fork a bridge child process for TCP-to-UDS relay and/or DNS capture.
 ///
-/// Brings up loopback, binds a TCP listener on `127.0.0.1:port`,
-/// forks a child that relays TCP connections to the UDS at `uds_path`,
-/// and waits for child readiness. Returns the actual bound port.
+/// When `uds_path` is `Some`, binds a TCP listener on `127.0.0.1:port`
+/// and relays connections to the UDS. When `None`, runs in DNS-only
+/// mode (no TCP listener, no relay). Returns the actual bound port,
+/// or `0` in DNS-only mode.
 ///
 /// The bridge child applies its own seccomp filter and runs until
 /// killed by `PR_SET_PDEATHSIG`. It never returns.
@@ -222,7 +223,11 @@ pub fn parse_bridge_env() -> crate::Result<Option<(u16, std::path::PathBuf)>> {
 /// Returns an error if loopback cannot be brought up, the listener
 /// cannot be bound, fork fails, or the bridge child fails to signal
 /// readiness within the timeout.
-pub fn fork_bridge(port: u16, uds_path: &Path, dns_audit_fd: Option<RawFd>) -> crate::Result<u16> {
+pub fn fork_bridge(
+    port: u16,
+    uds_path: Option<&Path>,
+    dns_audit_fd: Option<RawFd>,
+) -> crate::Result<u16> {
     #[cfg(seccomp_supported)]
     {
         // SAFETY: PR_GET_SECCOMP is a simple query, no pointer args.
@@ -236,9 +241,15 @@ pub fn fork_bridge(port: u16, uds_path: &Path, dns_audit_fd: Option<RawFd>) -> c
 
     loopback_up().map_err(|e| crate::Error::Process(format!("bridge: loopback: {e}")))?;
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = TcpListener::bind(addr)
-        .map_err(|e| crate::Error::Process(format!("bridge: bind {addr}: {e}")))?;
+    let listener = if uds_path.is_some() {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        Some(
+            TcpListener::bind(addr)
+                .map_err(|e| crate::Error::Process(format!("bridge: bind {addr}: {e}")))?,
+        )
+    } else {
+        None
+    };
 
     // Pre-bind DNS capture UDP socket before fork (before seccomp).
     let dns_udp = if dns_audit_fd.is_some() {
@@ -274,8 +285,6 @@ pub fn fork_bridge(port: u16, uds_path: &Path, dns_audit_fd: Option<RawFd>) -> c
         });
     }
 
-    let listener_fd = listener.as_raw_fd();
-
     if child_pid == 0 {
         // ── Bridge child ──────────────────────────────────────
         // All error exits use _exit (child can never return).
@@ -285,7 +294,10 @@ pub fn fork_bridge(port: u16, uds_path: &Path, dns_audit_fd: Option<RawFd>) -> c
 
         // Close all FDs >= 3 except those we need to keep.
         unsafe {
-            let mut keep_vec = vec![pipe_write, listener_fd];
+            let mut keep_vec = vec![pipe_write];
+            if let Some(ref l) = listener {
+                keep_vec.push(l.as_raw_fd());
+            }
             if let Some(ref udp) = dns_udp {
                 keep_vec.push(udp.as_raw_fd());
             }
@@ -342,15 +354,32 @@ pub fn fork_bridge(port: u16, uds_path: &Path, dns_audit_fd: Option<RawFd>) -> c
             std::thread::spawn(move || dns_serve(udp, audit_fd));
         }
 
-        if let Err(e) = listen_and_relay(listener, uds_path, pipe_write) {
-            child_stderr(&format!("bridge: relay: {e}\n"));
+        match (listener, uds_path) {
+            (Some(l), Some(p)) => {
+                if let Err(e) = listen_and_relay(l, p, pipe_write) {
+                    child_stderr(&format!("bridge: relay: {e}\n"));
+                }
+            }
+            _ => {
+                // DNS-only mode: signal readiness and block.
+                unsafe {
+                    libc::write(pipe_write, [1u8].as_ptr().cast(), 1);
+                    libc::close(pipe_write);
+                }
+                loop {
+                    std::thread::park();
+                }
+            }
         }
         unsafe { libc::_exit(0) };
     }
 
     // ── Parent ────────────────────────────────────────────────
 
-    let actual_port = listener.local_addr().expect("bound listener").port();
+    let actual_port = listener
+        .as_ref()
+        .map(|l| l.local_addr().expect("bound listener").port())
+        .unwrap_or(0);
     drop(listener);
 
     // SAFETY: pipe_write is a valid fd from pipe2.

@@ -125,7 +125,7 @@ mod linux {
 
         let _echo = spawn_uds_echo(&uds_path);
 
-        let port = arapuca::bridge::fork_bridge(0, &uds_path, None).unwrap();
+        let port = arapuca::bridge::fork_bridge(0, Some(&uds_path), None).unwrap();
         assert!(port > 0, "fork_bridge should return a valid port");
 
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -172,7 +172,7 @@ mod linux {
         if child_pid == 0 {
             // Child: call fork_bridge, report port, then sleep.
             unsafe { libc::close(pipe_read) };
-            let port = match arapuca::bridge::fork_bridge(0, &uds_for_child, None) {
+            let port = match arapuca::bridge::fork_bridge(0, Some(&uds_for_child), None) {
                 Ok(p) => p,
                 Err(_) => unsafe { libc::_exit(2) },
             };

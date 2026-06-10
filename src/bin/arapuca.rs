@@ -204,15 +204,15 @@ fn main() {
                     .ok()
                     .and_then(|s| s.parse::<i32>().ok())
                     .filter(|&fd| fd >= 0);
-                let bridge_port = match arapuca::bridge::fork_bridge(port, &uds_path, dns_audit_fd)
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        audit_layer(audit_fd, "ProxyBridge", false, Some(&e.to_string()));
-                        eprintln!("arapuca: bridge: {e}");
-                        std::process::exit(1);
-                    }
-                };
+                let bridge_port =
+                    match arapuca::bridge::fork_bridge(port, Some(&uds_path), dns_audit_fd) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            audit_layer(audit_fd, "ProxyBridge", false, Some(&e.to_string()));
+                            eprintln!("arapuca: bridge: {e}");
+                            std::process::exit(1);
+                        }
+                    };
                 let proxy = format!("http://127.0.0.1:{bridge_port}");
                 // SAFETY: single-threaded at this point (between
                 // Landlock apply and seccomp apply, no threads spawned).
@@ -224,7 +224,26 @@ fn main() {
                 }
                 audit_layer(audit_fd, "ProxyBridge", true, None);
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // DNS-only bridge: fork bridge for DNS capture without
+                // TCP relay when ARAPUCA_DNS_AUDIT_FD is set.
+                let dns_audit_fd = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .filter(|&fd| fd >= 0);
+                if let Some(dns_fd) = dns_audit_fd {
+                    match arapuca::bridge::fork_bridge(0, None, Some(dns_fd)) {
+                        Ok(_) => {
+                            audit_layer(audit_fd, "DnsCapture", true, None);
+                        }
+                        Err(e) => {
+                            audit_layer(audit_fd, "DnsCapture", false, Some(&e.to_string()));
+                            eprintln!("arapuca: dns bridge: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("arapuca: bridge: {e}");
                 std::process::exit(1);

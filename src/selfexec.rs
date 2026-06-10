@@ -214,7 +214,7 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
                 .ok()
                 .and_then(|s| s.parse::<i32>().ok())
                 .filter(|&fd| fd >= 0);
-            match crate::bridge::fork_bridge(port, &uds_path, dns_audit_fd) {
+            match crate::bridge::fork_bridge(port, Some(&uds_path), dns_audit_fd) {
                 Ok(bridge_port) => {
                     let proxy = format!("http://127.0.0.1:{bridge_port}");
                     // SAFETY: single-threaded (Go runtime not started).
@@ -233,7 +233,24 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
                 }
             }
         }
-        Ok(None) => {}
+        Ok(None) => {
+            let dns_audit_fd = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .filter(|&fd| fd >= 0);
+            if let Some(dns_fd) = dns_audit_fd {
+                match crate::bridge::fork_bridge(0, None, Some(dns_fd)) {
+                    Ok(_) => {
+                        audit_layer(audit_fd, "DnsCapture", true, None);
+                    }
+                    Err(e) => {
+                        audit_layer(audit_fd, "DnsCapture", false, Some(&e.to_string()));
+                        write_stderr(&format!("arapuca: selfexec: dns bridge: {e}\n"));
+                        unsafe { libc::_exit(1) };
+                    }
+                }
+            }
+        }
         Err(e) => {
             write_stderr(&format!("arapuca: selfexec: bridge env: {e}\n"));
             unsafe { libc::_exit(1) };

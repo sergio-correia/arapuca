@@ -213,22 +213,14 @@ impl Sandbox for Linux {
         }
 
         // ── DNS capture eligibility ────────────────────────────────
-        #[cfg(feature = "serde")]
-        let dns_capture_active = cfg.profile.dns_capture
-            && cfg.profile.use_netns
-            && cfg.network_proxy_socket.is_some()
-            && crate::netns::mount_ns_available();
-        #[cfg(not(feature = "serde"))]
-        let dns_capture_active = false;
+        let mount_ns_ok =
+            cfg.profile.dns_capture && cfg.profile.use_netns && crate::netns::mount_ns_available();
+        let dns_capture_active = mount_ns_ok;
 
         if cfg.profile.dns_capture && !dns_capture_active {
-            if !cfg!(feature = "serde") {
-                log::warn!("DNS capture requires the 'serde' feature");
-            } else if cfg.network_proxy_socket.is_none() {
-                log::warn!(
-                    "DNS capture requires a network proxy socket (bridge provides DNS server)"
-                );
-            } else if !crate::netns::mount_ns_available() {
+            if !cfg.profile.use_netns {
+                log::warn!("DNS capture requires use_netns");
+            } else if !mount_ns_ok {
                 log::warn!(
                     "DNS capture requires mount namespace support (unshare --mount); \
                      falling back to netns-only"
