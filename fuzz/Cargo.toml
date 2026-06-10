@@ -1,0 +1,45 @@
+[package]
+name = "arapuca-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+arapuca = { path = ".." }
+
+[[bin]]
+name = "sanitize_task_id"
+path = "fuzz_targets/sanitize_task_id.rs"
+doc = false
+
+[[bin]]
+name = "validate_guest_path"
+path = "fuzz_targets/validate_guest_path.rs"
+doc = false
+
+[[bin]]
+name = "validate_guest_permissions"
+path = "fuzz_targets/validate_guest_permissions.rs"
+doc = false
+
+[[bin]]
+name = "filter_caller_env"
+path = "fuzz_targets/filter_caller_env.rs"
+doc = false
+
+[[bin]]
+name = "sanitize_audit_string"
+path = "fuzz_targets/sanitize_audit_string.rs"
+doc = false
+
+[[bin]]
+name = "reject_cgroup_paths"
+path = "fuzz_targets/reject_cgroup_paths.rs"
+doc = false
+
+[workspace]
