@@ -454,13 +454,14 @@ int32_t arapuca_process_resource_stats(const struct arapuca_ArapucaProcess *proc
 uint32_t arapuca_process_oom_count(const struct arapuca_ArapucaProcess *proc);
 
 /**
- * Clean up the sandbox temp directory and cgroup.
+ * Clean up the sandbox temp directory, cgroup, and free the process handle.
+ * Safe to call with NULL.
  *
  * Must only be called after `arapuca_process_wait()` returns.
- * Consumes the process — subsequent calls on the same pointer are no-ops.
+ * The pointer is invalid after this call.
  *
  * # Safety
- * `proc` must be a valid pointer.
+ * `proc` must be NULL or a valid pointer from `arapuca_launch()`.
  */
 void arapuca_process_cleanup(struct arapuca_ArapucaProcess *proc);
 

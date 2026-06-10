@@ -911,17 +911,19 @@ pub unsafe extern "C" fn arapuca_process_oom_count(proc_: *const ArapucaProcess)
     proc_.inner.as_ref().map_or(0, |p| p.oom_count())
 }
 
-/// Clean up the sandbox temp directory and cgroup.
+/// Clean up the sandbox temp directory, cgroup, and free the process handle.
+/// Safe to call with NULL.
 ///
 /// Must only be called after `arapuca_process_wait()` returns.
-/// Consumes the process — subsequent calls on the same pointer are no-ops.
+/// The pointer is invalid after this call.
 ///
 /// # Safety
-/// `proc` must be a valid pointer.
+/// `proc` must be NULL or a valid pointer from `arapuca_launch()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arapuca_process_cleanup(proc_: *mut ArapucaProcess) {
-    if let Some(proc_) = unsafe { proc_.as_mut() } {
-        if let Some(process) = proc_.inner.take() {
+    if !proc_.is_null() {
+        let mut p = unsafe { Box::from_raw(proc_) };
+        if let Some(process) = p.inner.take() {
             process.cleanup();
         }
     }
