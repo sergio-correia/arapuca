@@ -55,6 +55,22 @@ mod linux {
         std::env::var("ARAPUCA_TEST_IN_NETNS").is_ok()
     }
 
+    fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x12, 0x34, 0x01, 0x00, 0x00, 0x01]);
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        for label in domain.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0);
+        buf.push((qtype >> 8) as u8);
+        buf.push(qtype as u8);
+        buf.push(0x00);
+        buf.push(0x01);
+        buf
+    }
+
     /// Start a UDS echo server that copies input back to the client.
     /// Returns the join handle (runs until the client disconnects).
     fn spawn_uds_echo(path: &std::path::Path) -> std::thread::JoinHandle<()> {
@@ -225,5 +241,151 @@ mod linux {
         // Bridge grandchild should be dead — connection refused.
         let result = TcpStream::connect(("127.0.0.1", port));
         assert!(result.is_err(), "bridge should be dead after parent killed");
+    }
+
+    #[test]
+    fn fork_bridge_dns_capture() {
+        if in_netns() {
+            fork_bridge_dns_capture_inner();
+            return;
+        }
+        if !netns_root_available() {
+            eprintln!("skipping: unshare --user --net --map-root-user not available");
+            return;
+        }
+        reexec_in_netns("linux::fork_bridge_dns_capture");
+    }
+
+    fn fork_bridge_dns_capture_inner() {
+        let mut pipe_fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let pipe_read = pipe_fds[0];
+        let pipe_write = pipe_fds[1];
+
+        let port = arapuca::bridge::fork_bridge(0, None, Some(pipe_write)).unwrap();
+        assert_eq!(port, 0, "DNS-only mode should return port 0");
+
+        unsafe { libc::close(pipe_write) };
+
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let query = build_dns_query("evil.example.com", 1);
+        sock.send_to(&query, "127.0.0.1:53").unwrap();
+
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) = sock.recv_from(&mut buf).unwrap();
+        assert!(n >= 12, "response too short");
+        assert_ne!(buf[2] & 0x80, 0, "QR bit should be set (response)");
+        assert_eq!(buf[3] & 0x0F, 3, "RCODE should be NXDOMAIN (3)");
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        let mut data = Vec::new();
+        unsafe {
+            let flags = libc::fcntl(pipe_read, libc::F_GETFL);
+            libc::fcntl(pipe_read, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        loop {
+            let mut tmp = [0u8; 1024];
+            let n = unsafe { libc::read(pipe_read, tmp.as_mut_ptr().cast(), tmp.len()) };
+            if n <= 0 {
+                break;
+            }
+            data.extend_from_slice(&tmp[..n as usize]);
+        }
+        unsafe { libc::close(pipe_read) };
+
+        let text = String::from_utf8_lossy(&data);
+        assert!(
+            text.contains("evil.example.com"),
+            "audit should contain domain, got: {text}"
+        );
+        assert!(
+            text.contains("\"qtype\":\"A\""),
+            "audit should contain qtype, got: {text}"
+        );
+    }
+
+    #[test]
+    fn fork_bridge_dns_with_relay() {
+        if in_netns() {
+            fork_bridge_dns_with_relay_inner();
+            return;
+        }
+        if !netns_root_available() {
+            eprintln!("skipping: unshare --user --net --map-root-user not available");
+            return;
+        }
+        reexec_in_netns("linux::fork_bridge_dns_with_relay");
+    }
+
+    fn fork_bridge_dns_with_relay_inner() {
+        let dir = tempfile::tempdir().unwrap();
+        let uds_path = dir.path().join("echo.sock");
+        let _echo = spawn_uds_echo(&uds_path);
+
+        let mut pipe_fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let pipe_read = pipe_fds[0];
+        let pipe_write = pipe_fds[1];
+
+        let port = arapuca::bridge::fork_bridge(0, Some(&uds_path), Some(pipe_write)).unwrap();
+        assert!(port > 0, "relay mode should return a valid port");
+
+        unsafe { libc::close(pipe_write) };
+
+        // Verify TCP relay works.
+        {
+            let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            client.write_all(b"relay test").unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
+            let mut resp = Vec::new();
+            client.read_to_end(&mut resp).unwrap();
+            assert_eq!(resp, b"relay test");
+        }
+
+        // Verify DNS capture works alongside relay.
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let query = build_dns_query("test.example.org", 28);
+        sock.send_to(&query, "127.0.0.1:53").unwrap();
+
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) = sock.recv_from(&mut buf).unwrap();
+        assert!(n >= 12);
+        assert_eq!(buf[3] & 0x0F, 3, "RCODE should be NXDOMAIN");
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        let mut data = Vec::new();
+        unsafe {
+            let flags = libc::fcntl(pipe_read, libc::F_GETFL);
+            libc::fcntl(pipe_read, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        loop {
+            let mut tmp = [0u8; 1024];
+            let n = unsafe { libc::read(pipe_read, tmp.as_mut_ptr().cast(), tmp.len()) };
+            if n <= 0 {
+                break;
+            }
+            data.extend_from_slice(&tmp[..n as usize]);
+        }
+        unsafe { libc::close(pipe_read) };
+
+        let text = String::from_utf8_lossy(&data);
+        assert!(
+            text.contains("test.example.org"),
+            "audit should contain domain, got: {text}"
+        );
+        assert!(
+            text.contains("\"qtype\":\"AAAA\""),
+            "audit should contain qtype, got: {text}"
+        );
     }
 }
