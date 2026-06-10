@@ -184,6 +184,24 @@ pub enum AuditEvent {
         dacls_restored: Option<bool>,
         container_deleted: Option<bool>,
     },
+
+    /// A sandboxed process attempted a blocked network connection.
+    ///
+    /// On Linux, this captures DNS queries intercepted by the bridge's
+    /// DNS server. Direct IP connections (no DNS involved) are blocked
+    /// by the network namespace but do NOT generate this event — their
+    /// capture requires seccomp-unotify (future work).
+    ///
+    /// On macOS, this captures Seatbelt network-outbound denials
+    /// parsed from the unified log after the process exits.
+    #[non_exhaustive]
+    NetworkBlocked {
+        timestamp: AuditTimestamp,
+        pid: u32,
+        destination: String,
+        protocol: String,
+        detail: Option<String>,
+    },
 }
 
 /// Current schema version. Incremented only for breaking changes.
@@ -221,6 +239,7 @@ pub enum SandboxLayer {
     MitigationPolicy,
     DaclGrant,
     ProcessSpawn,
+    DnsCapture,
 }
 
 /// Structured detail for a successfully applied layer.
@@ -244,6 +263,9 @@ pub enum LayerDetail {
         image_path: String,
         cpus: u32,
         mem_mb: u32,
+    },
+    DnsCapture {
+        port: u16,
     },
     Other(String),
 }
@@ -584,5 +606,51 @@ mod tests {
     #[test]
     fn schema_version_is_one() {
         assert_eq!(SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn network_blocked_event_can_be_constructed() {
+        let vec_sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+        let sink: Arc<dyn AuditSink> = Arc::clone(&vec_sink) as Arc<dyn AuditSink>;
+        let ctx = AuditContext::new(sink, AuditVerbosity::Standard);
+        let event = AuditEvent::NetworkBlocked {
+            timestamp: ctx.timestamp(),
+            pid: 1234,
+            destination: "evil.com".into(),
+            protocol: "dns".into(),
+            detail: Some("A".into()),
+        };
+        ctx.emit(event).unwrap();
+        let events = vec_sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn network_blocked_event_serializes() {
+        let event = AuditEvent::NetworkBlocked {
+            timestamp: AuditTimestamp(42),
+            pid: 1234,
+            destination: "evil.com".into(),
+            protocol: "dns".into(),
+            detail: Some("A".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event_type\":\"NetworkBlocked\""));
+        assert!(json.contains("\"destination\":\"evil.com\""));
+        assert!(json.contains("\"protocol\":\"dns\""));
+        assert!(json.contains("\"detail\":\"A\""));
+    }
+
+    #[test]
+    fn dns_capture_layer_detail() {
+        let detail = LayerDetail::DnsCapture { port: 53 };
+        assert!(matches!(detail, LayerDetail::DnsCapture { port: 53 }));
+    }
+
+    #[test]
+    fn dns_capture_sandbox_layer_exists() {
+        let layer = SandboxLayer::DnsCapture;
+        assert_eq!(layer, SandboxLayer::DnsCapture);
     }
 }
