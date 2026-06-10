@@ -402,7 +402,7 @@ impl std::fmt::Debug for AuditContext {
 /// it enters an audit event, preventing log injection attacks on
 /// downstream consumers.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn sanitize_audit_string(s: &str) -> String {
+pub fn sanitize_audit_string(s: &str) -> String {
     s.chars()
         .filter(|c| {
             if c.is_control() && *c != '\n' {

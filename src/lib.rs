@@ -41,17 +41,18 @@ pub mod wrapper;
 
 pub use process::Process;
 
+pub use audit::sanitize_audit_string;
 pub use error::Error;
 pub use profile::{
     Config, GuestFile, ImageSource, Isolation, MicroVmConfig, Profile, ResourceUsage,
     SeccompProfile,
 };
-pub use validate::{MAX_GUEST_FILE_SIZE, MAX_GUEST_WRITE_FILES, sanitize_task_id};
 #[cfg(unix)]
 pub use validate::{
-    reject_cgroup_paths, validate_guest_file_content, validate_guest_path,
-    validate_guest_permissions, validate_work_dir,
+    GUEST_PATH_DENY_PREFIXES, normalize_path, reject_cgroup_paths, validate_guest_file_content,
+    validate_guest_path, validate_guest_permissions, validate_work_dir,
 };
+pub use validate::{MAX_GUEST_FILE_SIZE, MAX_GUEST_WRITE_FILES, sanitize_task_id};
 
 /// Result type for arapuca operations.
 pub type Result<T> = std::result::Result<T, Error>;

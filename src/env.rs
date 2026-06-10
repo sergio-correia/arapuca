@@ -60,7 +60,7 @@ pub fn filter_caller_env(env: &[(String, String)]) -> FilterResult {
     FilterResult { passed, dropped }
 }
 
-fn drop_reason(key: &str) -> Option<DropReason> {
+pub fn drop_reason(key: &str) -> Option<DropReason> {
     if key.starts_with("ARAPUCA_") {
         return Some(DropReason::ArapucaPrefix);
     }

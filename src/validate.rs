@@ -11,7 +11,7 @@ pub const MAX_GUEST_WRITE_FILES: usize = 16;
 
 /// Guest paths that must not be written to via write_files.
 #[cfg(unix)]
-const GUEST_PATH_DENY_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/cidata", "/agent"];
+pub const GUEST_PATH_DENY_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/cidata", "/agent"];
 
 /// Validate and sanitize a task ID.
 ///
@@ -183,7 +183,7 @@ pub fn reject_cgroup_paths(paths: &[std::path::PathBuf]) -> crate::Result<()> {
 /// Lexically normalize a path by resolving `.` and `..` components
 /// without accessing the filesystem.
 #[cfg(unix)]
-fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
+pub fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
     use std::path::Component;
     let mut parts = Vec::new();
     for c in p.components() {
