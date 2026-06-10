@@ -37,6 +37,9 @@ pub struct Process {
     /// Cgroup path (None if no cgroup). Linux only.
     #[cfg(target_os = "linux")]
     pub(crate) cgroup_path: Option<PathBuf>,
+    /// DNS audit pipe read end. Read in wait() after child exits.
+    #[cfg(target_os = "linux")]
+    pub(crate) dns_audit_pipe: Option<std::os::unix::io::RawFd>,
     /// Reference to the cgroup manager for stats/cleanup. Linux only.
     #[cfg(target_os = "linux")]
     pub(crate) cgroup_mgr: Option<std::sync::Arc<crate::cgroup::CgroupManager>>,
@@ -124,6 +127,11 @@ impl Process {
                 std::process::ExitStatus::from_raw(wstatus)
             }
         };
+
+        // Read DNS audit pipe before emitting ProcessExited, so
+        // NetworkBlocked events appear in the event stream before
+        // the exit event.
+        self.read_dns_audit_pipe(pid);
 
         // Capture stats while cgroup still exists (before cleanup
         // destroys it). Eliminates the TOCTOU gap.
@@ -213,6 +221,120 @@ impl Process {
 
         Ok(status)
     }
+
+    /// Read DNS audit events from the bridge child's pipe and emit
+    /// `NetworkBlocked` events via the audit context.
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(not(feature = "serde"), allow(unused_variables))]
+    fn read_dns_audit_pipe(&mut self, pid: u32) {
+        let fd = match self.dns_audit_pipe.take() {
+            Some(fd) => fd,
+            None => return,
+        };
+
+        // Poll with a 1-second timeout — the bridge should be dead
+        // (pdeathsig) by now, but SIGKILL delivery is asynchronous.
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_ret = loop {
+            let ret = unsafe { libc::poll(&mut pfd, 1, 1000) };
+            if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break ret;
+            }
+        };
+        if poll_ret == 0 {
+            log::warn!("DNS audit pipe: timeout waiting for EOF (bridge may still be alive)");
+            unsafe { libc::close(fd) };
+            return;
+        }
+
+        // Read all available data. Set O_NONBLOCK so we never block
+        // waiting for the bridge child to die (SIGKILL is asynchronous).
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                if err.raw_os_error() == Some(libc::EAGAIN) {
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ret = unsafe { libc::poll(&mut pfd, 1, 1000) };
+                    if ret <= 0 {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n as usize]);
+        }
+        unsafe { libc::close(fd) };
+
+        #[cfg(not(feature = "serde"))]
+        if !data.is_empty() {
+            log::warn!(
+                "DNS audit: {} bytes discarded (compile with 'serde' feature to emit events)",
+                data.len()
+            );
+        }
+
+        #[cfg(feature = "serde")]
+        if !data.is_empty() {
+            let ctx = match self.audit_ctx {
+                Some(ref ctx) => ctx,
+                None => return,
+            };
+            let text = String::from_utf8_lossy(&data);
+            for line in text.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                #[derive(serde::Deserialize)]
+                struct DnsAuditLine {
+                    domain: String,
+                    qtype: String,
+                }
+                match serde_json::from_str::<DnsAuditLine>(line) {
+                    Ok(entry) => {
+                        if let Err(e) = ctx.emit(AuditEvent::NetworkBlocked {
+                            timestamp: ctx.timestamp(),
+                            pid,
+                            destination: entry.domain,
+                            protocol: "dns".into(),
+                            detail: Some(entry.qtype),
+                        }) {
+                            log::error!("audit emit failed: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("DNS audit: skipping malformed line: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_dns_audit_pipe(&mut self, _pid: u32) {}
 
     /// Read resource usage from the agent's cgroup.
     ///
@@ -324,6 +446,11 @@ impl Drop for Process {
         }
 
         #[cfg(target_os = "linux")]
+        if let Some(fd) = self.dns_audit_pipe.take() {
+            unsafe { libc::close(fd) };
+        }
+
+        #[cfg(target_os = "linux")]
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
             let _ = mgr.destroy(path);
         }
@@ -364,6 +491,8 @@ mod tests {
                 cgroup_path: None,
                 #[cfg(target_os = "linux")]
                 cgroup_mgr: None,
+                #[cfg(target_os = "linux")]
+                dns_audit_pipe: None,
                 #[cfg(all(target_os = "linux", feature = "microvm"))]
                 passt: None,
                 pty_master: None,
@@ -372,5 +501,91 @@ mod tests {
             };
         }
         assert!(!dir.exists(), "Drop should have removed the tmpdir");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "serde"))]
+    #[test]
+    fn dns_audit_pipe_emits_network_blocked() {
+        use std::sync::{Arc, Mutex};
+
+        struct VecSink(Mutex<Vec<crate::audit::AuditEvent>>);
+        impl crate::audit::AuditSink for VecSink {
+            fn emit(&self, event: crate::audit::AuditEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+
+        let mut pipe_fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let pipe_read = pipe_fds[0];
+        let pipe_write = pipe_fds[1];
+
+        let ndjson = b"{\"domain\":\"evil.example.com\",\"qtype\":\"A\"}\n\
+                       {\"domain\":\"bad.test\",\"qtype\":\"AAAA\"}\n";
+        unsafe {
+            libc::write(pipe_write, ndjson.as_ptr().cast(), ndjson.len());
+            libc::close(pipe_write);
+        }
+
+        let vec_sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+        let sink: Arc<dyn crate::audit::AuditSink> = Arc::clone(&vec_sink) as _;
+        let ctx = crate::audit::AuditContext::new(sink, crate::audit::AuditVerbosity::Standard);
+
+        let dir = crate::env::make_tmp_dir("dns-audit-test").unwrap();
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("failed to spawn true");
+        let mut process = Process {
+            child: ChildHandle::Managed(child),
+            tmp_dir: dir,
+            cgroup_path: None,
+            cgroup_mgr: None,
+            dns_audit_pipe: Some(pipe_read),
+            #[cfg(target_os = "macos")]
+            launch_timestamp: None,
+            #[cfg(all(target_os = "linux", feature = "microvm"))]
+            passt: None,
+            pty_master: None,
+            audit_ctx: Some(ctx),
+            final_stats: None,
+        };
+
+        process.read_dns_audit_pipe(42);
+
+        let captured = vec_sink.0.lock().unwrap();
+        let blocked: Vec<_> = captured
+            .iter()
+            .filter(|e| matches!(e, crate::audit::AuditEvent::NetworkBlocked { .. }))
+            .collect();
+        assert_eq!(blocked.len(), 2, "should emit 2 NetworkBlocked events");
+
+        if let crate::audit::AuditEvent::NetworkBlocked {
+            destination,
+            protocol,
+            detail,
+            ..
+        } = &blocked[0]
+        {
+            assert_eq!(destination, "evil.example.com");
+            assert_eq!(protocol, "dns");
+            assert_eq!(detail.as_deref(), Some("A"));
+        } else {
+            panic!("expected NetworkBlocked");
+        }
+
+        if let crate::audit::AuditEvent::NetworkBlocked {
+            destination,
+            detail,
+            ..
+        } = &blocked[1]
+        {
+            assert_eq!(destination, "bad.test");
+            assert_eq!(detail.as_deref(), Some("AAAA"));
+        } else {
+            panic!("expected NetworkBlocked");
+        }
     }
 }

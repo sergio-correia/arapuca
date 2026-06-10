@@ -381,6 +381,7 @@ fn run_subcommand(args: &[String]) {
     let mut tty = false;
     #[cfg(target_os = "linux")]
     let mut allowed_hosts: Vec<arapuca::bridge::AllowedHost> = Vec::new();
+    let mut deny_network = false;
 
     // Find -- separator.
     let sep_pos = args.iter().position(|a| a == "--");
@@ -403,6 +404,9 @@ fn run_subcommand(args: &[String]) {
             eprintln!("  --pids N           max number of PIDs");
             eprintln!("  --task-id NAME     identifier for cgroup and audit");
             eprintln!("  --allow-host H:P   allow HTTPS to host:port or *.domain:port");
+            eprintln!(
+                "  --deny-network     block all network; capture DNS queries as audit events"
+            );
             eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
             eprintln!("  -t, --tty          allocate a PTY for interactive programs");
             if sep_pos.is_none() && !args.is_empty() {
@@ -560,6 +564,14 @@ fn run_subcommand(args: &[String]) {
                     std::process::exit(125);
                 }
             }
+            "--deny-network" => {
+                deny_network = true;
+                #[cfg(not(target_os = "linux"))]
+                eprintln!(
+                    "arapuca run: --deny-network: DNS capture is Linux-only; \
+                     network denial on this platform is handled by the native sandbox"
+                );
+            }
             #[cfg(unix)]
             "-t" | "--tty" => {
                 tty = true;
@@ -680,7 +692,8 @@ fn run_subcommand(args: &[String]) {
         max_cpu_pct: cpus.unwrap_or(0),
         max_pids: pids.unwrap_or(0),
         allow_exec: true,
-        use_netns: connect_proxy_socket.is_some(),
+        use_netns: connect_proxy_socket.is_some() || deny_network,
+        dns_capture: deny_network,
         seccomp_profile,
         ..Default::default()
     };

@@ -212,10 +212,38 @@ impl Sandbox for Linux {
             }
         }
 
+        // ── DNS capture eligibility ────────────────────────────────
+        #[cfg(feature = "serde")]
+        let dns_capture_active = cfg.profile.dns_capture
+            && cfg.profile.use_netns
+            && cfg.network_proxy_socket.is_some()
+            && crate::netns::mount_ns_available();
+        #[cfg(not(feature = "serde"))]
+        let dns_capture_active = false;
+
+        if cfg.profile.dns_capture && !dns_capture_active {
+            if !cfg!(feature = "serde") {
+                log::warn!("DNS capture requires the 'serde' feature");
+            } else if cfg.network_proxy_socket.is_none() {
+                log::warn!(
+                    "DNS capture requires a network proxy socket (bridge provides DNS server)"
+                );
+            } else if !crate::netns::mount_ns_available() {
+                log::warn!(
+                    "DNS capture requires mount namespace support (unshare --mount); \
+                     falling back to netns-only"
+                );
+            }
+        }
+
         // ── Network namespace ──────────────────────────────────────
         let mut command = if cfg.profile.use_netns {
             let mut c = Command::new("unshare");
-            c.args(["--user", "--net", "--map-current-user", "--"]);
+            if dns_capture_active && use_landlock {
+                c.args(["--user", "--net", "--mount", "--map-current-user", "--"]);
+            } else {
+                c.args(["--user", "--net", "--map-current-user", "--"]);
+            }
             c.arg(&actual_cmd);
             c.args(&actual_args);
             if let Some(ref ctx) = audit_ctx {
@@ -399,6 +427,28 @@ impl Sandbox for Linux {
         // a pipe so the wrapper can report which layers it actually
         // applied. The write end is passed as an extra FD; the parent
         // reads from the read end after spawn.
+        //
+        // Pipe FDs are tracked in pipe_guard so early returns (? on
+        // emit calls between pipe creation and spawn) close them
+        // automatically via Drop. Defused after spawn succeeds.
+        struct PipeGuard(Vec<RawFd>);
+        impl PipeGuard {
+            fn push(&mut self, fd: RawFd) {
+                self.0.push(fd);
+            }
+            fn defuse(mut self) {
+                self.0.clear();
+            }
+        }
+        impl Drop for PipeGuard {
+            fn drop(&mut self) {
+                for &fd in &self.0 {
+                    unsafe { libc::close(fd) };
+                }
+            }
+        }
+        let mut pipe_guard = PipeGuard(Vec::new());
+
         let audit_pipe = if audit_ctx.is_some() && use_landlock {
             let mut fds = [0i32; 2];
             // SAFETY: fds is a valid 2-element array. O_CLOEXEC prevents
@@ -410,6 +460,8 @@ impl Sandbox for Linux {
                 // the lowest unused FDs, so the write-end cannot collide
                 // with any already-open user FD in fds_to_inherit.
                 fds_to_inherit.push(fds[1]);
+                pipe_guard.push(fds[0]);
+                pipe_guard.push(fds[1]);
                 Some((fds[0], fds[1], target_fd))
             } else {
                 log::warn!("audit pipe creation failed, continuing without");
@@ -422,6 +474,59 @@ impl Sandbox for Linux {
         // Add ARAPUCA_AUDIT_FD to wrapper env so it knows which FD to write to.
         if let Some((_, _, target_fd)) = audit_pipe {
             command.env("ARAPUCA_AUDIT_FD", target_fd.to_string());
+        }
+
+        // ── DNS audit pipe ────────────────────────────────────────
+        // When DNS capture is enabled, create a pipe for the bridge's
+        // DNS server to write NDJSON audit lines. The parent reads
+        // these after the process exits and emits NetworkBlocked events.
+        let dns_audit_pipe = if dns_capture_active && use_landlock {
+            let mut fds = [0i32; 2];
+            let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            if ret == 0 {
+                let target_fd = 3 + fds_to_inherit.len() as i32;
+                fds_to_inherit.push(fds[1]);
+                command.env("ARAPUCA_DNS_AUDIT_FD", target_fd.to_string());
+                pipe_guard.push(fds[0]);
+                pipe_guard.push(fds[1]);
+                Some((fds[0], fds[1]))
+            } else {
+                log::warn!("DNS audit pipe creation failed, continuing without");
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(ref ctx) = audit_ctx {
+            if dns_audit_pipe.is_some() {
+                ctx.emit(AuditEvent::LayerApplied {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::DnsCapture,
+                    detail: Some(LayerDetail::DnsCapture { port: 53 }),
+                })?;
+                applied_layers.push(SandboxLayer::DnsCapture);
+            } else {
+                let reason = if !cfg.profile.dns_capture {
+                    SkipReason::NotConfigured
+                } else if !cfg!(feature = "serde") {
+                    SkipReason::ComponentMissing(
+                        "serde feature required for DNS audit parsing".into(),
+                    )
+                } else if !use_landlock {
+                    SkipReason::ComponentMissing(
+                        "wrapper binary with filesystem paths required".into(),
+                    )
+                } else {
+                    SkipReason::PartialFailure("mount namespace unavailable".into())
+                };
+                ctx.emit(AuditEvent::LayerSkipped {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::DnsCapture,
+                    reason,
+                })?;
+                skipped_layers.push(SandboxLayer::DnsCapture);
+            }
         }
 
         // ── Emit pre_exec layer events from parent ─────────────────
@@ -661,6 +766,11 @@ impl Sandbox for Linux {
         }
 
         // ── Spawn ──────────────────────────────────────────────────
+        // Defuse the pipe guard — from here on, pipes are closed
+        // explicitly (error handler on spawn failure, or post-spawn
+        // cleanup on success).
+        pipe_guard.defuse();
+
         let child = command.spawn().map_err(|e| {
             if let Some(ref ctx) = audit_ctx {
                 let _ = ctx.emit(AuditEvent::LayerFailed {
@@ -670,7 +780,12 @@ impl Sandbox for Linux {
                 });
             }
             if let Some((read_fd, write_fd, _)) = audit_pipe {
-                // SAFETY: valid FDs from pipe().
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+            }
+            if let Some((read_fd, write_fd)) = dns_audit_pipe {
                 unsafe {
                     libc::close(read_fd);
                     libc::close(write_fd);
@@ -713,6 +828,15 @@ impl Sandbox for Linux {
             unsafe { libc::close(read_fd) };
         }
 
+        // Close DNS audit pipe write end in parent. The read end is
+        // kept open — Process::wait() reads it after the child exits.
+        let dns_audit_read_fd = if let Some((read_fd, write_fd)) = dns_audit_pipe {
+            unsafe { libc::close(write_fd) };
+            Some(read_fd)
+        } else {
+            None
+        };
+
         // ── Emit ProcessStarted ────────────────────────────────────
         if let Some(ref ctx) = audit_ctx {
             ctx.emit(AuditEvent::ProcessStarted {
@@ -746,6 +870,7 @@ impl Sandbox for Linux {
             tmp_dir: tmp_guard.defuse(),
             cgroup_path,
             cgroup_mgr: self.cgroup_mgr.clone(),
+            dns_audit_pipe: dns_audit_read_fd,
             #[cfg(feature = "microvm")]
             passt: None,
             pty_master: pty_master_fd.map(|fd| {

@@ -444,6 +444,8 @@ fn launch_vm(
         cgroup_path: None,
         #[cfg(target_os = "linux")]
         cgroup_mgr: None,
+        #[cfg(target_os = "linux")]
+        dns_audit_pipe: None,
         passt: None,
         pty_master: None,
         audit_ctx,

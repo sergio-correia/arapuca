@@ -119,6 +119,17 @@ pub struct Profile {
     pub allow_exec: bool,
     /// Use CLONE_NEWNET for network namespace isolation (Linux only).
     pub use_netns: bool,
+    /// Enable DNS query capture inside the network namespace.
+    ///
+    /// When enabled, the bridge child runs a DNS server on UDP port 53
+    /// that intercepts queries, logs them as `NetworkBlocked` audit
+    /// events, and responds with NXDOMAIN.
+    ///
+    /// Requires `use_netns`, non-empty `read_paths` or `write_paths`
+    /// (so the wrapper binary is invoked), and mount namespace support
+    /// (`unshare --mount`). The `serde` Cargo feature is required for
+    /// NDJSON parsing of audit events.
+    pub dns_capture: bool,
     /// Seccomp filter profile. Defaults to Strict.
     pub seccomp_profile: SeccompProfile,
 }
