@@ -1021,3 +1021,106 @@ fn private_tmpdir_writable_but_slash_tmp_blocked() {
         "/tmp should be read-only by default: {stdout}"
     );
 }
+
+// ─── --deny-network tests ─────────────────────────────────────
+
+fn netns_root_available() -> bool {
+    Command::new("unshare")
+        .args(["--user", "--net", "--map-root-user", "--", "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[test]
+fn deny_network_resolv_conf_override() {
+    if !netns_root_available() {
+        eprintln!("skipping: unshare --user --net --map-root-user not available");
+        return;
+    }
+    let output = Command::new("unshare")
+        .args(["--user", "--net", "--mount", "--map-root-user", "--"])
+        .arg(arapuca_bin())
+        .args([
+            "run",
+            "--deny-network",
+            "--seccomp",
+            "baseline",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /etc/resolv.conf",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "deny-network should succeed (exit {:?}):\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code(),
+    );
+    assert!(
+        stdout.contains("nameserver 127.0.0.1"),
+        "resolv.conf should be overridden to 127.0.0.1, got: {stdout}"
+    );
+}
+
+#[test]
+fn deny_network_dns_nxdomain() {
+    if !netns_root_available() {
+        eprintln!("skipping: unshare --user --net --map-root-user not available");
+        return;
+    }
+    let output = Command::new("unshare")
+        .args(["--user", "--net", "--mount", "--map-root-user", "--"])
+        .arg(arapuca_bin())
+        .args([
+            "run",
+            "--deny-network",
+            "--seccomp",
+            "baseline",
+            "--",
+            "/bin/sh",
+            "-c",
+            "nslookup example.com 2>&1; true",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "deny-network should succeed (exit {:?}):\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code(),
+    );
+    assert!(
+        stdout.contains("NXDOMAIN") || stdout.contains("server can't find"),
+        "DNS query should get NXDOMAIN, got: {stdout}"
+    );
+}
+
+#[test]
+fn deny_network_with_allow_host_rejected() {
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--deny-network",
+            "--allow-host",
+            "example.com:443",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(125));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mutually exclusive"),
+        "should reject combination, got: {stderr}"
+    );
+}
