@@ -40,6 +40,9 @@ pub struct Process {
     /// DNS audit pipe read end. Read in wait() after child exits.
     #[cfg(target_os = "linux")]
     pub(crate) dns_audit_pipe: Option<std::os::unix::io::RawFd>,
+    /// Launch timestamp for macOS Seatbelt denial log querying.
+    #[cfg(target_os = "macos")]
+    pub(crate) launch_timestamp: Option<std::time::SystemTime>,
     /// Reference to the cgroup manager for stats/cleanup. Linux only.
     #[cfg(target_os = "linux")]
     pub(crate) cgroup_mgr: Option<std::sync::Arc<crate::cgroup::CgroupManager>>,
@@ -128,10 +131,11 @@ impl Process {
             }
         };
 
-        // Read DNS audit pipe before emitting ProcessExited, so
-        // NetworkBlocked events appear in the event stream before
+        // Read blocked-network audit data before emitting
+        // ProcessExited, so NetworkBlocked events appear before
         // the exit event.
         self.read_dns_audit_pipe(pid);
+        self.read_seatbelt_denials(pid);
 
         // Capture stats while cgroup still exists (before cleanup
         // destroys it). Eliminates the TOCTOU gap.
@@ -334,7 +338,129 @@ impl Process {
     }
 
     #[cfg(not(target_os = "linux"))]
+    #[cfg_attr(windows, allow(dead_code))]
     fn read_dns_audit_pipe(&mut self, _pid: u32) {}
+
+    #[cfg(target_os = "macos")]
+    fn read_seatbelt_denials(&mut self, pid: u32) {
+        let launch_time = match self.launch_timestamp.take() {
+            Some(t) => t,
+            None => return,
+        };
+        let ctx = match self.audit_ctx {
+            Some(ref ctx) => ctx,
+            None => return,
+        };
+
+        let fmt = |t: std::time::SystemTime| -> String {
+            let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            let secs = d.as_secs();
+            let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+            let ts = secs as libc::time_t;
+            unsafe { libc::localtime_r(&ts, tm.as_mut_ptr()) };
+            let tm = unsafe { tm.assume_init() };
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec,
+            )
+        };
+
+        let start = fmt(launch_time);
+        let end = fmt(std::time::SystemTime::now());
+        let predicate = "subsystem == \"com.apple.sandbox\" \
+             AND category == \"violation\" \
+             AND eventMessage CONTAINS \"network\"";
+
+        let mut child = match std::process::Command::new("log")
+            .args([
+                "show",
+                "--start",
+                &start,
+                "--end",
+                &end,
+                "--style",
+                "ndjson",
+                "--predicate",
+                predicate,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("failed to spawn 'log show': {e}");
+                return;
+            }
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let output = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break child.stdout.take(),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        log::warn!("'log show' timed out (10s)");
+                        break None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    log::warn!("'log show' wait failed: {e}");
+                    break None;
+                }
+            }
+        };
+
+        if let Some(stdout) = output {
+            let reader = std::io::BufReader::new(stdout);
+            use std::io::BufRead;
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                if line.is_empty() {
+                    continue;
+                }
+                let pid_field = format!("\"processID\":{pid},");
+                let pid_field_end = format!("\"processID\":{pid}}}");
+                let pgid_field = format!("\"processGroupID\":{pid},");
+                let pgid_field_end = format!("\"processGroupID\":{pid}}}");
+                if !line.contains(&pid_field)
+                    && !line.contains(&pid_field_end)
+                    && !line.contains(&pgid_field)
+                    && !line.contains(&pgid_field_end)
+                {
+                    continue;
+                }
+                let (destination, protocol) = match extract_seatbelt_destination(&line) {
+                    Some((dest, proto)) => (dest, proto),
+                    None => ("<unknown>".into(), "network".into()),
+                };
+                if let Err(e) = ctx.emit(AuditEvent::NetworkBlocked {
+                    timestamp: ctx.timestamp(),
+                    pid,
+                    destination: crate::audit::sanitize_audit_string(&destination),
+                    protocol: crate::audit::sanitize_audit_string(&protocol),
+                    detail: Some("seatbelt-deny".into()),
+                }) {
+                    log::error!("audit emit failed: {e}");
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[cfg_attr(windows, allow(dead_code))]
+    fn read_seatbelt_denials(&mut self, _pid: u32) {}
 
     /// Read resource usage from the agent's cgroup.
     ///
@@ -471,6 +597,43 @@ impl Drop for Process {
     }
 }
 
+/// Extract a network destination from a Seatbelt denial log line.
+#[cfg(any(target_os = "macos", test))]
+fn extract_seatbelt_destination(ndjson_line: &str) -> Option<(String, String)> {
+    let msg_start = ndjson_line.find("\"eventMessage\"")?;
+    let msg_area = &ndjson_line[msg_start..];
+
+    // Try unescaped addr "..." first, then JSON-escaped addr \"...\"
+    if let Some(addr_pos) = msg_area.find("addr \"") {
+        let start = addr_pos + 6;
+        let rest = &msg_area[start..];
+        if let Some(end) = rest.find('"') {
+            return Some((rest[..end].to_string(), "network".into()));
+        }
+    }
+    if let Some(addr_pos) = msg_area.find("addr \\\"") {
+        let start = addr_pos + 7;
+        let rest = &msg_area[start..];
+        if let Some(end) = rest.find("\\\"") {
+            return Some((rest[..end].to_string(), "network".into()));
+        }
+    }
+
+    for (proto_str, proto_name) in [("remote tcp ", "tcp"), ("remote udp ", "udp")] {
+        if let Some(pos) = msg_area.find(proto_str) {
+            let start = pos + proto_str.len();
+            let rest = &msg_area[start..];
+            let end = rest.find(['"', ')', ',']).unwrap_or(rest.len());
+            let addr = rest[..end].trim();
+            if !addr.is_empty() {
+                return Some((addr.to_string(), proto_name.into()));
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +656,8 @@ mod tests {
                 cgroup_mgr: None,
                 #[cfg(target_os = "linux")]
                 dns_audit_pipe: None,
+                #[cfg(target_os = "macos")]
+                launch_timestamp: None,
                 #[cfg(all(target_os = "linux", feature = "microvm"))]
                 passt: None,
                 pty_master: None,
@@ -501,6 +666,46 @@ mod tests {
             };
         }
         assert!(!dir.exists(), "Drop should have removed the tmpdir");
+    }
+
+    #[test]
+    fn seatbelt_extract_addr_escaped() {
+        // macOS log show --style ndjson escapes quotes inside
+        // eventMessage as \". Test the escaped addr pattern.
+        let line = "{\"processID\":42,\"eventMessage\":\"deny(1) network-outbound addr \\\"1.2.3.4:443\\\"\"}";
+        let (dest, proto) = extract_seatbelt_destination(line).unwrap();
+        assert_eq!(dest, "1.2.3.4:443");
+        assert_eq!(proto, "network");
+    }
+
+    #[test]
+    fn seatbelt_extract_remote_tcp() {
+        let line =
+            r#"{"processID":42,"eventMessage":"deny(1) network-outbound remote tcp 10.0.0.1:80"}"#;
+        let (dest, proto) = extract_seatbelt_destination(line).unwrap();
+        assert_eq!(dest, "10.0.0.1:80");
+        assert_eq!(proto, "tcp");
+    }
+
+    #[test]
+    fn seatbelt_extract_remote_udp() {
+        let line =
+            r#"{"processID":42,"eventMessage":"deny(1) network-outbound remote udp 8.8.8.8:53"}"#;
+        let (dest, proto) = extract_seatbelt_destination(line).unwrap();
+        assert_eq!(dest, "8.8.8.8:53");
+        assert_eq!(proto, "udp");
+    }
+
+    #[test]
+    fn seatbelt_extract_no_match() {
+        let line = r#"{"processID":42,"eventMessage":"deny(1) file-read-data /etc/passwd"}"#;
+        assert!(extract_seatbelt_destination(line).is_none());
+    }
+
+    #[test]
+    fn seatbelt_extract_no_event_message() {
+        let line = r#"{"processID":42,"subsystem":"sandbox"}"#;
+        assert!(extract_seatbelt_destination(line).is_none());
     }
 
     #[cfg(all(target_os = "linux", feature = "serde"))]

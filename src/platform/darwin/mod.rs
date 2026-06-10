@@ -584,6 +584,8 @@ impl Sandbox for Darwin {
             });
         }
 
+        let pre_spawn_time = std::time::SystemTime::now();
+
         let child = command.spawn().map_err(|e| {
             if let Some(m) = pty_master_fd {
                 // SAFETY: valid FD from openpty, cleanup on spawn failure.
@@ -635,11 +637,17 @@ impl Sandbox for Darwin {
             });
         }
 
+        let capture_denials = !allow_network && audit_ctx.is_some();
+
         Ok(Process {
             child: crate::process::ChildHandle::Managed(child),
             tmp_dir: tmp_guard.defuse(),
-            // SAFETY: fd is a valid master FD from openpty with CLOEXEC set.
             pty_master: pty_master_fd.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
+            launch_timestamp: if capture_denials {
+                Some(pre_spawn_time)
+            } else {
+                None
+            },
             audit_ctx,
             final_stats: None,
         })
