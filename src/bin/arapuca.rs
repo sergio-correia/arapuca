@@ -182,6 +182,13 @@ fn main() {
             ..Default::default()
         };
 
+        // Bind-mount resolv.conf when DNS capture is active (before
+        // Landlock, since we need to write a temp file).
+        if std::env::var("ARAPUCA_DNS_AUDIT_FD").is_ok() {
+            let ok = arapuca::wrapper::override_resolv_conf();
+            audit_layer(audit_fd, "ResolvConfOverride", ok, None);
+        }
+
         if let Err(e) = arapuca::landlock::apply(&profile) {
             audit_layer(audit_fd, "Landlock", false, Some(&e.to_string()));
             eprintln!("arapuca: landlock: {e}");

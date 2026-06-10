@@ -61,6 +61,83 @@ pub fn write_stderr(msg: &str) {
     let _ = unsafe { libc::write(2, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
 }
 
+/// Bind-mount a custom resolv.conf with `nameserver 127.0.0.1` over
+/// `/etc/resolv.conf` for DNS capture. Called inside the mount
+/// namespace before Landlock.
+///
+/// Uses PID in the temp filename to avoid races under concurrent
+/// launches. Remounts read-only after the bind mount.
+/// Returns true on success, false on failure.
+#[cfg(target_os = "linux")]
+pub fn override_resolv_conf() -> bool {
+    let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+    let pid = std::process::id();
+    let path = format!("{tmpdir}/.arapuca-resolv-{pid}.conf");
+
+    // O_EXCL prevents symlink-following attacks on the temp file.
+    use std::io::Write;
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(_) => {
+            write_stderr("arapuca: failed to create resolv.conf override\n");
+            return false;
+        }
+    };
+    if f.write_all(b"nameserver 127.0.0.1\n").is_err() {
+        write_stderr("arapuca: failed to write resolv.conf override\n");
+        let _ = std::fs::remove_file(&path);
+        return false;
+    }
+    drop(f);
+
+    let src = match std::ffi::CString::new(path.as_str()) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let dst = match std::ffi::CString::new("/etc/resolv.conf") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let ret = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        write_stderr(&format!(
+            "arapuca: resolv.conf bind mount failed: {}\n",
+            std::io::Error::last_os_error()
+        ));
+        let _ = std::fs::remove_file(&path);
+        return false;
+    }
+
+    let ret = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            dst.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        write_stderr("arapuca: resolv.conf remount-ro failed\n");
+    }
+
+    let _ = std::fs::remove_file(&path);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

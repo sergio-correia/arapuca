@@ -28,6 +28,31 @@ pub fn available() -> bool {
     }
 }
 
+/// Probe whether mount namespace isolation works alongside netns.
+///
+/// Tests `unshare --user --net --mount --map-current-user -- /bin/true`.
+/// Required for DNS capture (bind-mounting resolv.conf). Falls back
+/// gracefully to netns-only if mount ns is unavailable.
+pub fn mount_ns_available() -> bool {
+    let result = Command::new("unshare")
+        .args([
+            "--user",
+            "--net",
+            "--mount",
+            "--map-current-user",
+            "--",
+            "/bin/true",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match result {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
 /// Timeout for the netns probe.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
