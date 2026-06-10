@@ -16,6 +16,7 @@ pub mod bridge;
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 pub mod diskquota;
+pub mod dns;
 pub mod env;
 mod error;
 pub mod ffi;
