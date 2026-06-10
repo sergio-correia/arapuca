@@ -640,6 +640,13 @@ fn run_subcommand(args: &[String]) {
         i += 1;
     }
 
+    // ── Flag validation ────────────────────────────────────────
+    #[cfg(target_os = "linux")]
+    if deny_network && !allowed_hosts.is_empty() {
+        eprintln!("arapuca run: --deny-network and --allow-host are mutually exclusive");
+        std::process::exit(125);
+    }
+
     // ── CONNECT proxy for --allow-host ────────────────────────
     #[cfg(target_os = "linux")]
     let (connect_proxy_socket, connect_proxy_pid, connect_proxy_pidfd) =
