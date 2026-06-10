@@ -208,6 +208,18 @@ void arapuca_profile_set_max_open_files(struct arapuca_ArapucaProfile *profile, 
 void arapuca_profile_set_netns(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
+ * Enable DNS query capture inside the network namespace.
+ *
+ * When enabled alongside netns, the bridge child intercepts DNS
+ * queries and emits NetworkBlocked audit events. Requires the
+ * serde feature and the wrapper binary with filesystem paths.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_dns_capture(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
  * Set micro-VM isolation on a profile with a distro image source.
  *
  * After this call, launching with this profile creates a VM instead
