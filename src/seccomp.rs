@@ -193,6 +193,31 @@ fn build_filter() -> crate::Result<BpfProgram> {
 
     eperm_rules.insert(libc::SYS_ioctl, vec![ioctl_tiocsti]);
 
+    // Block kill() with pid <= 0 (broadcast/group signals).
+    // pid <= 0 covers kill(-1, sig) (all processes), kill(0, sig)
+    // (process group), and kill(-pgid, sig) (specific group).
+    // Safe for positive PIDs: Linux pid_max <= 4194304 (0x400000),
+    // so no legitimate positive PID has bit 31 set.
+    let kill_zero = SeccompRule::new(vec![
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0u64)
+            .map_err(|e| Error::Seccomp(format!("kill zero condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("kill zero rule: {e}")))?;
+    let kill_negative = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(0x80000000),
+            0x80000000,
+        )
+        .map_err(|e| Error::Seccomp(format!("kill negative condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("kill negative rule: {e}")))?;
+    eperm_rules.insert(libc::SYS_kill, vec![kill_zero, kill_negative]);
+
+    // Block tkill unconditionally (deprecated, superseded by tgkill).
+    eperm_rules.insert(libc::SYS_tkill, vec![]);
+
     // Block clone(2) with any CLONE_NEW* namespace flag. One rule per
     // flag — seccompiler OR's multiple rules for the same syscall.
     // Uses Qword (64-bit) to match the unsigned long flags argument.
@@ -377,6 +402,7 @@ pub(crate) struct SeccompSummary {
     pub clone_ns_filter: bool,
     pub clone3_enosys: bool,
     pub execveat_filter: bool,
+    pub kill_filter: bool,
 }
 
 pub(crate) fn summary(profile: &crate::SeccompProfile) -> SeccompSummary {
@@ -389,6 +415,7 @@ pub(crate) fn summary(profile: &crate::SeccompProfile) -> SeccompSummary {
             clone_ns_filter: true,
             clone3_enosys: true,
             execveat_filter: true,
+            kill_filter: true,
         },
         crate::SeccompProfile::Baseline => SeccompSummary {
             tier1_kill_count: baseline_kill_syscalls().len(),
@@ -398,6 +425,7 @@ pub(crate) fn summary(profile: &crate::SeccompProfile) -> SeccompSummary {
             clone_ns_filter: true,
             clone3_enosys: true,
             execveat_filter: true,
+            kill_filter: true,
         },
     }
 }
@@ -439,6 +467,7 @@ fn baseline_kill_syscalls() -> Vec<i64> {
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
         libc::SYS_memfd_create,
+        libc::SYS_pidfd_send_signal,
     ]
 }
 
@@ -564,10 +593,12 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
     seccompiler::apply_filter(&clone_prog)
         .map_err(|e| Error::Seccomp(format!("install baseline clone filter: {e}")))?;
 
-    // Block prctl(PR_SET_PDEATHSIG, *) — prevent sandboxed processes
-    // from changing or clearing the parent-death signal.
-    let mut prctl_deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
-    prctl_deny.insert(
+    // Consolidated EPERM filter for all argument-filtered rules.
+    // A single stacked filter reduces BPF evaluation overhead.
+    let mut eperm_rules: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+
+    // prctl(PR_SET_PDEATHSIG, *)
+    eperm_rules.insert(
         libc::SYS_prctl,
         vec![
             SeccompRule::new(vec![
@@ -582,25 +613,9 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
             .map_err(|e| Error::Seccomp(format!("baseline prctl rule: {e}")))?,
         ],
     );
-    let prctl_filter = SeccompFilter::new(
-        prctl_deny.into_iter().collect(),
-        SeccompAction::Allow,
-        SeccompAction::Errno(libc::EPERM as u32),
-        arch,
-    )
-    .map_err(|e| Error::Seccomp(format!("build baseline prctl filter: {e}")))?;
-    let prctl_prog: BpfProgram =
-        prctl_filter
-            .try_into()
-            .map_err(|e: seccompiler::BackendError| {
-                Error::Seccomp(format!("compile baseline prctl filter: {e}"))
-            })?;
-    seccompiler::apply_filter(&prctl_prog)
-        .map_err(|e| Error::Seccomp(format!("install baseline prctl filter: {e}")))?;
 
-    // Block execveat with AT_EMPTY_PATH (fileless execution via memfd).
-    let mut execveat_deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
-    execveat_deny.insert(
+    // execveat with AT_EMPTY_PATH (fileless execution)
+    eperm_rules.insert(
         libc::SYS_execveat,
         vec![
             SeccompRule::new(vec![
@@ -615,25 +630,9 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
             .map_err(|e| Error::Seccomp(format!("baseline execveat rule: {e}")))?,
         ],
     );
-    let execveat_filter = SeccompFilter::new(
-        execveat_deny.into_iter().collect(),
-        SeccompAction::Allow,
-        SeccompAction::Errno(libc::EPERM as u32),
-        arch,
-    )
-    .map_err(|e| Error::Seccomp(format!("build baseline execveat filter: {e}")))?;
-    let execveat_prog: BpfProgram =
-        execveat_filter
-            .try_into()
-            .map_err(|e: seccompiler::BackendError| {
-                Error::Seccomp(format!("compile baseline execveat filter: {e}"))
-            })?;
-    seccompiler::apply_filter(&execveat_prog)
-        .map_err(|e| Error::Seccomp(format!("install baseline execveat filter: {e}")))?;
 
-    // Block ioctl(TIOCSTI) — terminal input injection on kernels < 6.2.
-    let mut ioctl_deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
-    ioctl_deny.insert(
+    // ioctl(TIOCSTI) — terminal input injection
+    eperm_rules.insert(
         libc::SYS_ioctl,
         vec![
             SeccompRule::new(vec![
@@ -643,21 +642,43 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
             .map_err(|e| Error::Seccomp(format!("baseline ioctl rule: {e}")))?,
         ],
     );
-    let ioctl_filter = SeccompFilter::new(
-        ioctl_deny.into_iter().collect(),
+
+    // kill(pid <= 0) — broadcast/group signals
+    let kill_zero = SeccompRule::new(vec![
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0u64)
+            .map_err(|e| Error::Seccomp(format!("baseline kill zero condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("baseline kill zero rule: {e}")))?;
+    let kill_negative = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(0x80000000),
+            0x80000000,
+        )
+        .map_err(|e| Error::Seccomp(format!("baseline kill negative condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("baseline kill negative rule: {e}")))?;
+    eperm_rules.insert(libc::SYS_kill, vec![kill_zero, kill_negative]);
+
+    // tkill — deprecated, block unconditionally
+    eperm_rules.insert(libc::SYS_tkill, vec![]);
+
+    let eperm_filter = SeccompFilter::new(
+        eperm_rules.into_iter().collect(),
         SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
         arch,
     )
-    .map_err(|e| Error::Seccomp(format!("build baseline ioctl filter: {e}")))?;
-    let ioctl_prog: BpfProgram =
-        ioctl_filter
+    .map_err(|e| Error::Seccomp(format!("build baseline eperm filter: {e}")))?;
+    let eperm_prog: BpfProgram =
+        eperm_filter
             .try_into()
             .map_err(|e: seccompiler::BackendError| {
-                Error::Seccomp(format!("compile baseline ioctl filter: {e}"))
+                Error::Seccomp(format!("compile baseline eperm filter: {e}"))
             })?;
-    seccompiler::apply_filter(&ioctl_prog)
-        .map_err(|e| Error::Seccomp(format!("install baseline ioctl filter: {e}")))?;
+    seccompiler::apply_filter(&eperm_prog)
+        .map_err(|e| Error::Seccomp(format!("install baseline eperm filter: {e}")))?;
 
     Ok(main_prog)
 }
