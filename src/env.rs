@@ -103,6 +103,12 @@ pub fn drop_reason(key: &str) -> Option<DropReason> {
     }
     if matches!(
         key,
+        "GCONV_PATH" | "HOSTALIASES" | "LOCPATH" | "GETCONF_DIR"
+    ) {
+        return Some(DropReason::RuntimeInjection);
+    }
+    if matches!(
+        key,
         "RUBYOPT"
             | "RUBYLIB"
             | "JAVA_TOOL_OPTIONS"
