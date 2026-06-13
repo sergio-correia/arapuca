@@ -270,6 +270,35 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         }
     }
 
+    // ── PID namespace ────────────────────────────────────────────
+    if std::env::var("ARAPUCA_PID_NS").as_deref() == Ok("1") {
+        let pid_report_fd: Option<i32> = std::env::var("ARAPUCA_PID_REPORT_FD")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let dns_audit_fd: Option<i32> = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .filter(|&fd| fd >= 0);
+
+        if let Err(e) = crate::pidns::unshare_pidns() {
+            audit_layer(audit_fd, "PidNamespace", false, Some(&e.to_string()));
+            write_stderr(&format!("arapuca: selfexec: pidns: {e}\n"));
+            unsafe { libc::_exit(1) };
+        }
+        audit_layer(audit_fd, "PidNamespace", true, None);
+
+        crate::pidns::fork_into_pidns(audit_fd, dns_audit_fd, pid_report_fd);
+
+        let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        if ret != 0 {
+            write_stderr(&format!(
+                "arapuca: selfexec: pidns child pdeathsig: {}\n",
+                std::io::Error::last_os_error()
+            ));
+            unsafe { libc::_exit(1) };
+        }
+    }
+
     // ── Seccomp ──────────────────────────────────────────────────
     #[cfg(seccomp_supported)]
     {
