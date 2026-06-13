@@ -381,7 +381,7 @@ pub(crate) fn summary(profile: &crate::SeccompProfile) -> SeccompSummary {
             prctl_filter: true,
             clone_ns_filter: true,
             clone3_enosys: true,
-            execveat_filter: false,
+            execveat_filter: true,
         },
     }
 }
@@ -419,6 +419,10 @@ fn baseline_kill_syscalls() -> Vec<i64> {
         libc::SYS_perf_event_open,
         libc::SYS_userfaultfd,
         SYS_LSM_SET_SELF_ATTR,
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+        libc::SYS_memfd_create,
     ]
 }
 
@@ -577,6 +581,39 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
             })?;
     seccompiler::apply_filter(&prctl_prog)
         .map_err(|e| Error::Seccomp(format!("install baseline prctl filter: {e}")))?;
+
+    // Block execveat with AT_EMPTY_PATH (fileless execution via memfd).
+    let mut execveat_deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    execveat_deny.insert(
+        libc::SYS_execveat,
+        vec![
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    4,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(libc::AT_EMPTY_PATH as u64),
+                    libc::AT_EMPTY_PATH as u64,
+                )
+                .map_err(|e| Error::Seccomp(format!("baseline execveat condition: {e}")))?,
+            ])
+            .map_err(|e| Error::Seccomp(format!("baseline execveat rule: {e}")))?,
+        ],
+    );
+    let execveat_filter = SeccompFilter::new(
+        execveat_deny.into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .map_err(|e| Error::Seccomp(format!("build baseline execveat filter: {e}")))?;
+    let execveat_prog: BpfProgram =
+        execveat_filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| {
+                Error::Seccomp(format!("compile baseline execveat filter: {e}"))
+            })?;
+    seccompiler::apply_filter(&execveat_prog)
+        .map_err(|e| Error::Seccomp(format!("install baseline execveat filter: {e}")))?;
 
     Ok(main_prog)
 }
