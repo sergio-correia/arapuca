@@ -131,8 +131,9 @@ fn build_filter() -> crate::Result<BpfProgram> {
 
     eperm_rules.insert(libc::SYS_socket, vec![socket_inet, socket_inet6]);
 
-    // prctl argument filtering: block PR_SET_PDEATHSIG=0 and PR_SET_DUMPABLE=1.
-    let prctl_disable_pdeathsig = SeccompRule::new(vec![
+    // prctl argument filtering: block all PR_SET_PDEATHSIG (any signal
+    // value) and all non-zero PR_SET_DUMPABLE (including SUID_DUMP_ROOT=2).
+    let prctl_block_pdeathsig = SeccompRule::new(vec![
         SeccompCondition::new(
             0,
             SeccompCmpArgLen::Dword,
@@ -140,8 +141,6 @@ fn build_filter() -> crate::Result<BpfProgram> {
             libc::PR_SET_PDEATHSIG as u64,
         )
         .map_err(|e| Error::Seccomp(format!("prctl condition: {e}")))?,
-        SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0u64)
-            .map_err(|e| Error::Seccomp(format!("prctl arg condition: {e}")))?,
     ])
     .map_err(|e| Error::Seccomp(format!("prctl rule: {e}")))?;
 
@@ -153,14 +152,14 @@ fn build_filter() -> crate::Result<BpfProgram> {
             libc::PR_SET_DUMPABLE as u64,
         )
         .map_err(|e| Error::Seccomp(format!("prctl condition: {e}")))?,
-        SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 1u64)
+        SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0u64)
             .map_err(|e| Error::Seccomp(format!("prctl arg condition: {e}")))?,
     ])
     .map_err(|e| Error::Seccomp(format!("prctl rule: {e}")))?;
 
     eperm_rules.insert(
         libc::SYS_prctl,
-        vec![prctl_disable_pdeathsig, prctl_set_dumpable],
+        vec![prctl_block_pdeathsig, prctl_set_dumpable],
     );
 
     // Block execveat with AT_EMPTY_PATH (fileless execution).
@@ -379,7 +378,7 @@ pub(crate) fn summary(profile: &crate::SeccompProfile) -> SeccompSummary {
             tier1_kill_count: baseline_kill_syscalls().len(),
             tier2_eperm_count: 0,
             socket_filter: false,
-            prctl_filter: false,
+            prctl_filter: true,
             clone_ns_filter: true,
             clone3_enosys: true,
             execveat_filter: false,
@@ -544,6 +543,40 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
         .map_err(|e| Error::Seccomp(format!("install baseline clone3 enosys: {e}")))?;
     seccompiler::apply_filter(&clone_prog)
         .map_err(|e| Error::Seccomp(format!("install baseline clone filter: {e}")))?;
+
+    // Block prctl(PR_SET_PDEATHSIG, *) — prevent sandboxed processes
+    // from changing or clearing the parent-death signal.
+    let mut prctl_deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    prctl_deny.insert(
+        libc::SYS_prctl,
+        vec![
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    libc::PR_SET_PDEATHSIG as u64,
+                )
+                .map_err(|e| Error::Seccomp(format!("baseline prctl condition: {e}")))?,
+            ])
+            .map_err(|e| Error::Seccomp(format!("baseline prctl rule: {e}")))?,
+        ],
+    );
+    let prctl_filter = SeccompFilter::new(
+        prctl_deny.into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .map_err(|e| Error::Seccomp(format!("build baseline prctl filter: {e}")))?;
+    let prctl_prog: BpfProgram =
+        prctl_filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| {
+                Error::Seccomp(format!("compile baseline prctl filter: {e}"))
+            })?;
+    seccompiler::apply_filter(&prctl_prog)
+        .map_err(|e| Error::Seccomp(format!("install baseline prctl filter: {e}")))?;
 
     Ok(main_prog)
 }
@@ -1030,16 +1063,51 @@ mod tests {
     }
 
     #[test]
-    fn prctl_pdeathsig_sigkill_allowed() {
+    fn prctl_pdeathsig_sigkill_blocked() {
         let (exited, code) = run_in_filtered_child(|| {
             let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
-            if ret == 0 {
-                unsafe { libc::_exit(42) };
+            if ret == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == libc::EPERM {
+                    unsafe { libc::_exit(42) };
+                }
             }
             unsafe { libc::_exit(1) };
         });
         assert!(exited, "child should exit normally");
-        assert_eq!(code, 42, "PR_SET_PDEATHSIG=SIGKILL should succeed");
+        assert_eq!(code, 42, "PR_SET_PDEATHSIG=SIGKILL should return EPERM");
+    }
+
+    #[test]
+    fn prctl_pdeathsig_sigcont_blocked() {
+        let (exited, code) = run_in_filtered_child(|| {
+            let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGCONT) };
+            if ret == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == libc::EPERM {
+                    unsafe { libc::_exit(42) };
+                }
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "PR_SET_PDEATHSIG=SIGCONT should return EPERM");
+    }
+
+    #[test]
+    fn prctl_set_dumpable_two_blocked() {
+        let (exited, code) = run_in_filtered_child(|| {
+            let ret = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 2) };
+            if ret == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == libc::EPERM {
+                    unsafe { libc::_exit(42) };
+                }
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "PR_SET_DUMPABLE=2 should return EPERM");
     }
 
     #[test]
@@ -1069,5 +1137,61 @@ mod tests {
         });
         assert!(exited, "child should exit normally");
         assert_eq!(code, 42, "AF_INET6 socket should return EPERM");
+    }
+
+    fn run_in_baseline_child(test_fn: fn()) -> (bool, i32) {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+
+        if pid == 0 {
+            if let Err(e) = apply(&crate::SeccompProfile::Baseline) {
+                eprintln!("seccomp baseline apply failed: {e}");
+                unsafe { libc::_exit(99) };
+            }
+            test_fn();
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut wstatus: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(pid, &mut wstatus, 0) };
+        assert!(ret > 0, "waitpid failed");
+
+        if libc::WIFEXITED(wstatus) {
+            (true, libc::WEXITSTATUS(wstatus))
+        } else if libc::WIFSIGNALED(wstatus) {
+            (false, libc::WTERMSIG(wstatus))
+        } else {
+            panic!("unexpected wait status: {wstatus}");
+        }
+    }
+
+    #[test]
+    fn baseline_prctl_pdeathsig_blocked() {
+        let (exited, code) = run_in_baseline_child(|| {
+            let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0) };
+            if ret == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == libc::EPERM {
+                    unsafe { libc::_exit(42) };
+                }
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "baseline: PR_SET_PDEATHSIG should return EPERM");
+    }
+
+    #[test]
+    fn baseline_prctl_set_name_allowed() {
+        let (exited, code) = run_in_baseline_child(|| {
+            let name = std::ffi::CString::new("test").unwrap();
+            let ret = unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
+            if ret == 0 {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "baseline: PR_SET_NAME should succeed");
     }
 }
