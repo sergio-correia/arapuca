@@ -590,6 +590,29 @@ impl Sandbox for Linux {
         applied_layers.push(SandboxLayer::Pdeathsig);
         applied_layers.push(SandboxLayer::FdSanitization);
 
+        if let Some(ref ctx) = audit_ctx {
+            if cfg.profile.use_pidns && pid_report_pipe.is_some() {
+                ctx.emit(AuditEvent::LayerApplied {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::PidNamespace,
+                    detail: None,
+                })?;
+                applied_layers.push(SandboxLayer::PidNamespace);
+            } else {
+                let reason = if !cfg.profile.use_pidns {
+                    SkipReason::NotConfigured
+                } else {
+                    SkipReason::PartialFailure("PID report pipe creation failed".into())
+                };
+                ctx.emit(AuditEvent::LayerSkipped {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::PidNamespace,
+                    reason,
+                })?;
+                skipped_layers.push(SandboxLayer::PidNamespace);
+            }
+        }
+
         #[cfg(unix)]
         if cfg.tty {
             if let Some(ref ctx) = audit_ctx {

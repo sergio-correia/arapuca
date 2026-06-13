@@ -240,6 +240,7 @@ pub enum SandboxLayer {
     DaclGrant,
     ProcessSpawn,
     DnsCapture,
+    PidNamespace,
 }
 
 /// Structured detail for a successfully applied layer.
