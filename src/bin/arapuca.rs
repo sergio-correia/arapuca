@@ -282,6 +282,41 @@ fn main() {
             }
         }
 
+        // PID namespace: unshare + fork between bridge and seccomp.
+        // The parent (in host PID ns) stays as a signal relay; the
+        // child (PID 1 in new ns) continues to seccomp + exec.
+        if std::env::var("ARAPUCA_PID_NS").as_deref() == Ok("1") {
+            let pid_report_fd: Option<i32> = std::env::var("ARAPUCA_PID_REPORT_FD")
+                .ok()
+                .and_then(|s| s.parse().ok());
+            let dns_audit_fd: Option<i32> = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .filter(|&fd| fd >= 0);
+
+            if let Err(e) = arapuca::pidns::unshare_pidns() {
+                audit_layer(audit_fd, "PidNamespace", false, Some(&e.to_string()));
+                eprintln!("arapuca: pidns: {e}");
+                std::process::exit(1);
+            }
+            audit_layer(audit_fd, "PidNamespace", true, None);
+
+            // Parent never returns; child continues to seccomp.
+            arapuca::pidns::fork_into_pidns(audit_fd, dns_audit_fd, pid_report_fd);
+
+            // Child: re-set pdeathsig (fork clears it). The
+            // getppid() race check is skipped inside the PID
+            // namespace (getppid() returns 0 for cross-ns parent).
+            let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+            if ret != 0 {
+                eprintln!(
+                    "arapuca: pidns child pdeathsig: {}",
+                    std::io::Error::last_os_error()
+                );
+                unsafe { libc::_exit(1) };
+            }
+        }
+
         #[cfg(seccomp_supported)]
         {
             let seccomp_profile = match std::env::var("ARAPUCA_SECCOMP_PROFILE").as_deref() {
