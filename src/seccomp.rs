@@ -177,6 +177,22 @@ fn build_filter() -> crate::Result<BpfProgram> {
 
     eperm_rules.insert(libc::SYS_execveat, vec![execveat_empty_path]);
 
+    // Block ioctl(fd, TIOCSTI, ...) — terminal input injection.
+    // On kernels < 6.2, a sandboxed process can inject keystrokes
+    // into the parent's terminal via TIOCSTI on inherited FD 0.
+    let ioctl_tiocsti = SeccompRule::new(vec![
+        SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            0x5412u64, // TIOCSTI
+        )
+        .map_err(|e| Error::Seccomp(format!("ioctl TIOCSTI condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("ioctl TIOCSTI rule: {e}")))?;
+
+    eperm_rules.insert(libc::SYS_ioctl, vec![ioctl_tiocsti]);
+
     // Block clone(2) with any CLONE_NEW* namespace flag. One rule per
     // flag — seccompiler OR's multiple rules for the same syscall.
     // Uses Qword (64-bit) to match the unsigned long flags argument.
@@ -614,6 +630,34 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
             })?;
     seccompiler::apply_filter(&execveat_prog)
         .map_err(|e| Error::Seccomp(format!("install baseline execveat filter: {e}")))?;
+
+    // Block ioctl(TIOCSTI) — terminal input injection on kernels < 6.2.
+    let mut ioctl_deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    ioctl_deny.insert(
+        libc::SYS_ioctl,
+        vec![
+            SeccompRule::new(vec![
+                SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0x5412u64)
+                    .map_err(|e| Error::Seccomp(format!("baseline ioctl condition: {e}")))?,
+            ])
+            .map_err(|e| Error::Seccomp(format!("baseline ioctl rule: {e}")))?,
+        ],
+    );
+    let ioctl_filter = SeccompFilter::new(
+        ioctl_deny.into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .map_err(|e| Error::Seccomp(format!("build baseline ioctl filter: {e}")))?;
+    let ioctl_prog: BpfProgram =
+        ioctl_filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| {
+                Error::Seccomp(format!("compile baseline ioctl filter: {e}"))
+            })?;
+    seccompiler::apply_filter(&ioctl_prog)
+        .map_err(|e| Error::Seccomp(format!("install baseline ioctl filter: {e}")))?;
 
     Ok(main_prog)
 }
