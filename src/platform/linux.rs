@@ -570,6 +570,7 @@ impl Sandbox for Linux {
         // async-signal-safe functions are permitted. We use raw libc
         // calls (setsid, prctl) and fd::remap_fds (fcntl, dup2, close).
         // ManuallyDrop prevents free() on the Vec in the child process.
+        let parent_pid = unsafe { libc::getpid() };
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
@@ -577,6 +578,9 @@ impl Sandbox for Linux {
                 }
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    libc::_exit(1);
                 }
                 if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
                     return Err(std::io::Error::last_os_error());

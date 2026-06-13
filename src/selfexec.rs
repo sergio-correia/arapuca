@@ -149,9 +149,10 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
         if ret != 0 {
             write_stderr(&format!(
-                "arapuca: selfexec: pdeathsig: {} (non-fatal)\n",
+                "arapuca: selfexec: pdeathsig: {}\n",
                 std::io::Error::last_os_error()
             ));
+            unsafe { libc::_exit(1) };
         }
     }
 

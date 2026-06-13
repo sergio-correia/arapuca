@@ -331,7 +331,9 @@ pub fn fork_bridge(
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
 
         // SAFETY: prctl with PR_SET_PDEATHSIG is a simple setter.
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
 
         // Race check: if the parent died between fork and prctl.
         if unsafe { libc::getppid() } != parent_pid {
@@ -339,7 +341,9 @@ pub fn fork_bridge(
         }
 
         // Prevents /proc/<pid>/mem access from the agent.
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
 
         #[cfg(seccomp_supported)]
         if let Err(e) = apply_bridge_seccomp() {

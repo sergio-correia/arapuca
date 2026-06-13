@@ -139,6 +139,8 @@ fn main() {
     // 0b. Unconditional setsid — detach from parent's session.
     // Called BEFORE pdeathsig since setsid clears it.
     // Tolerate EPERM (already a session leader from library's pre_exec).
+    #[cfg(target_os = "linux")]
+    let parent_pid = unsafe { libc::getppid() };
     #[cfg(unix)]
     {
         // SAFETY: setsid is async-signal-safe, no arguments.
@@ -150,6 +152,20 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    // 0b2. Pdeathsig — immediately after setsid, before any other setup.
+    #[cfg(target_os = "linux")]
+    {
+        let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        if ret != 0 {
+            eprintln!("arapuca: pdeathsig: {}", std::io::Error::last_os_error());
+            std::process::exit(1);
+        }
+        if unsafe { libc::getppid() } != parent_pid {
+            std::process::exit(1);
+        }
+        audit_layer(audit_fd, "Pdeathsig", true, None);
     }
 
     // 0c. Unconditional PR_SET_NO_NEW_PRIVS — prevent privilege
@@ -284,21 +300,6 @@ fn main() {
     }
     #[cfg(unix)]
     audit_layer(audit_fd, "Rlimit", true, None);
-
-    // 4. Pdeathsig — kill subprocess if parent dies (Linux only).
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: prctl with PR_SET_PDEATHSIG is a simple setter, no
-        // pointer arguments. Affects only the calling thread.
-        let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
-        if ret != 0 {
-            eprintln!(
-                "arapuca: pdeathsig: {} (non-fatal)",
-                std::io::Error::last_os_error()
-            );
-        }
-        audit_layer(audit_fd, "Pdeathsig", true, None);
-    }
 
     // Close audit FDs before exec — the target command must not inherit them.
     #[cfg(unix)]
@@ -1498,11 +1499,20 @@ fn fork_connect_proxy(allowed_hosts: &[arapuca::bridge::AllowedHost]) -> (PathBu
         // after. The getppid race check below covers the window between
         // setsid and prctl. This differs from the bridge fork (which
         // omits setsid) because the CONNECT proxy is a session leader.
-        // SAFETY: setsid is always safe.
-        unsafe { libc::setsid() };
+        // SAFETY: setsid is always safe. Tolerate EPERM (already session leader).
+        let ret = unsafe { libc::setsid() };
+        if ret == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EPERM) {
+                eprintln!("arapuca: connect proxy: setsid: {err}");
+                unsafe { libc::_exit(1) };
+            }
+        }
 
         // SAFETY: prctl with PR_SET_PDEATHSIG.
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
 
         // Race check.
         // SAFETY: getppid is always safe.
@@ -1511,10 +1521,14 @@ fn fork_connect_proxy(allowed_hosts: &[arapuca::bridge::AllowedHost]) -> (PathBu
         }
 
         // SAFETY: prctl with PR_SET_NO_NEW_PRIVS.
-        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64) };
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
 
         // SAFETY: prctl with PR_SET_DUMPABLE.
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
 
         // Pre-initialize NSS before seccomp — forces dlopen of all
         // NSS modules. Using an unresolvable FQDN traverses the
