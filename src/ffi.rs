@@ -949,12 +949,23 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
     };
 
     #[cfg(target_os = "linux")]
+    {
+        let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64) };
+        if ret != 0 {
+            set_error(&format!(
+                "PR_SET_NO_NEW_PRIVS: {}",
+                std::io::Error::last_os_error()
+            ));
+            return -1;
+        }
+    }
+    #[cfg(target_os = "linux")]
     if let Err(e) = crate::landlock::apply(inner) {
         set_error(&format!("landlock: {e}"));
         return -1;
     }
     #[cfg(seccomp_supported)]
-    if let Err(e) = crate::seccomp::apply(&crate::SeccompProfile::Strict) {
+    if let Err(e) = crate::seccomp::apply(&inner.seccomp_profile) {
         set_error(&format!("seccomp: {e}"));
         return -1;
     }

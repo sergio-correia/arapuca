@@ -105,10 +105,9 @@ impl Sandbox for Linux {
         // Layer 1: Landlock wrapper. If the arapuca binary is available
         // and filesystem paths are configured, wrap through it.
         let wrapper = Self::wrapper_path();
-        let use_landlock = wrapper.is_some()
-            && (!cfg.profile.read_paths.is_empty() || !cfg.profile.write_paths.is_empty());
+        let use_wrapper = wrapper.is_some();
 
-        if use_landlock {
+        if use_wrapper {
             let wrapper_path = wrapper.as_ref().unwrap();
             let mut wrapper_args = vec!["--".to_string(), actual_cmd];
             wrapper_args.extend(actual_args);
@@ -162,18 +161,18 @@ impl Sandbox for Linux {
                 skipped_layers.push(SandboxLayer::Seccomp);
             }
         } else {
-            // Wrapper binary absent or no paths configured — no
+            // Wrapper binary not available — no
             // Landlock/seccomp/rlimit/NO_NEW_PRIVS.
             let has_paths =
                 !cfg.profile.read_paths.is_empty() || !cfg.profile.write_paths.is_empty();
-            if wrapper.is_none() && has_paths {
+            if has_paths {
                 return Err(Error::Process(
                     "filesystem restrictions requested but arapuca wrapper binary \
                      not found — refusing to launch without Landlock/seccomp enforcement"
                         .into(),
                 ));
             }
-            let reason = SkipReason::NotConfigured;
+            let reason = SkipReason::NotAvailable;
             for layer in [
                 SandboxLayer::Landlock,
                 SandboxLayer::Rlimit,
@@ -231,7 +230,7 @@ impl Sandbox for Linux {
         // ── Network namespace ──────────────────────────────────────
         let mut command = if cfg.profile.use_netns {
             let mut c = Command::new("unshare");
-            if dns_capture_active && use_landlock {
+            if dns_capture_active && use_wrapper {
                 c.args(["--user", "--net", "--mount", "--map-current-user", "--"]);
             } else {
                 c.args(["--user", "--net", "--map-current-user", "--"]);
@@ -270,7 +269,7 @@ impl Sandbox for Linux {
         let mut env_vars = crate::env::minimal_env(tmp_guard.path());
 
         // Add Landlock/rlimit env vars for the wrapper.
-        if use_landlock {
+        if use_wrapper {
             let mut profile = cfg.profile.clone();
             profile.write_paths.push(tmp_guard.path().to_path_buf());
             profile.read_paths.push(tmp_guard.path().to_path_buf());
@@ -441,7 +440,7 @@ impl Sandbox for Linux {
         }
         let mut pipe_guard = PipeGuard(Vec::new());
 
-        let audit_pipe = if audit_ctx.is_some() && use_landlock {
+        let audit_pipe = if audit_ctx.is_some() && use_wrapper {
             let mut fds = [0i32; 2];
             // SAFETY: fds is a valid 2-element array. O_CLOEXEC prevents
             // leaking the read end to the child process.
@@ -472,7 +471,7 @@ impl Sandbox for Linux {
         // When DNS capture is enabled, create a pipe for the bridge's
         // DNS server to write NDJSON audit lines. The parent reads
         // these after the process exits and emits NetworkBlocked events.
-        let dns_audit_pipe = if dns_capture_active && use_landlock {
+        let dns_audit_pipe = if dns_capture_active && use_wrapper {
             let mut fds = [0i32; 2];
             let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
             if ret == 0 {
@@ -505,10 +504,8 @@ impl Sandbox for Linux {
                     SkipReason::ComponentMissing(
                         "serde feature required for DNS audit parsing".into(),
                     )
-                } else if !use_landlock {
-                    SkipReason::ComponentMissing(
-                        "wrapper binary with filesystem paths required".into(),
-                    )
+                } else if !use_wrapper {
+                    SkipReason::ComponentMissing("wrapper binary not available".into())
                 } else {
                     SkipReason::PartialFailure("mount namespace unavailable".into())
                 };
