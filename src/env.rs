@@ -304,7 +304,17 @@ pub fn wrapper_path() -> Option<PathBuf> {
 ///
 /// These configure Landlock paths and rlimits. Uses the `ARAPUCA_*`
 /// prefix so the wrapper strips them after applying.
-pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
+pub fn wrapper_env(profile: &crate::Profile) -> crate::Result<Vec<(String, String)>> {
+    let sep_char = PATH_LIST_SEP;
+    for path in profile.read_paths.iter().chain(profile.write_paths.iter()) {
+        let s = path.to_string_lossy();
+        if s.contains(sep_char) {
+            return Err(crate::Error::Validation(format!(
+                "sandbox path must not contain '{sep_char}': {s}"
+            )));
+        }
+    }
+
     let mut env = Vec::new();
     env.push(("ARAPUCA_WRAPPER".into(), "1".into()));
     if !profile.read_paths.is_empty() {
@@ -313,7 +323,7 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let sep = &PATH_LIST_SEP.to_string();
+        let sep = &sep_char.to_string();
         env.push(("ARAPUCA_READ_PATHS".into(), paths.join(sep)));
     }
     if !profile.write_paths.is_empty() {
@@ -322,7 +332,7 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let sep = &PATH_LIST_SEP.to_string();
+        let sep = &sep_char.to_string();
         env.push(("ARAPUCA_WRITE_PATHS".into(), paths.join(sep)));
     }
     if profile.max_file_size_mb > 0 {
@@ -347,7 +357,7 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
         "ARAPUCA_SECCOMP_PROFILE".into(),
         profile.seccomp_profile.as_str().into(),
     ));
-    env
+    Ok(env)
 }
 
 /// Fixed port for the proxy bridge TCP listener. The bridge runs
@@ -726,7 +736,7 @@ mod tests {
             max_file_size_mb: 512,
             ..Default::default()
         };
-        let env = wrapper_env(&profile);
+        let env = wrapper_env(&profile).unwrap();
         let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert!(
             !keys.contains(&"ARAPUCA_RLIMIT_AS"),
@@ -748,7 +758,7 @@ mod tests {
             read_paths: vec![PathBuf::from("/usr")],
             ..Default::default()
         };
-        let env = wrapper_env(&profile);
+        let env = wrapper_env(&profile).unwrap();
         let map: std::collections::HashMap<&str, &str> =
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 

@@ -273,7 +273,7 @@ impl Sandbox for Linux {
             let mut profile = cfg.profile.clone();
             profile.write_paths.push(tmp_guard.path().to_path_buf());
             profile.read_paths.push(tmp_guard.path().to_path_buf());
-            env_vars.extend(crate::env::wrapper_env(&profile));
+            env_vars.extend(crate::env::wrapper_env(&profile)?);
         }
 
         // Add network proxy socket (non-ARAPUCA prefix, not stripped).

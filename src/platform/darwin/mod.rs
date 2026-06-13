@@ -386,7 +386,7 @@ impl Sandbox for Darwin {
 
         // Add rlimit env vars for the wrapper (if using it).
         if wrapper.is_some() {
-            let wrapper_env = crate::env::wrapper_env(&cfg.profile);
+            let wrapper_env = crate::env::wrapper_env(&cfg.profile)?;
             env_vars.extend(wrapper_env);
 
             // Add RLIMIT_CPU if cpu_pct is set (convert % to seconds).
