@@ -136,6 +136,22 @@ fn main() {
         }
     };
 
+    // 0a. Wait for cgroup readiness signal from parent.
+    // The parent adds this process to the cgroup and then writes a
+    // byte to the sync pipe. If the pipe closes without data (parent
+    // failed to add PID), exit immediately.
+    #[cfg(target_os = "linux")]
+    if let Ok(fd_str) = std::env::var("ARAPUCA_CGROUP_SYNC_FD") {
+        if let Ok(fd) = fd_str.parse::<i32>() {
+            let mut buf = [0u8; 1];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), 1) };
+            unsafe { libc::close(fd) };
+            if n != 1 {
+                std::process::exit(1);
+            }
+        }
+    }
+
     // 0b. Unconditional setsid — detach from parent's session.
     // Called BEFORE pdeathsig since setsid clears it.
     // Tolerate EPERM (already a session leader from library's pre_exec).

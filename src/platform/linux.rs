@@ -752,6 +752,33 @@ impl Sandbox for Linux {
             skipped_layers.push(SandboxLayer::Cgroup);
         }
 
+        // ── Cgroup sync pipe ──────────────────────────────────────
+        // When a cgroup was successfully created, create a parent→child
+        // pipe so the wrapper blocks until the parent has added the PID
+        // to the cgroup. This closes the race window where the child
+        // runs without cgroup limits between spawn and add_pid.
+        let cgroup_sync_pipe = if cgroup_path.is_some() {
+            let mut fds = [0i32; 2];
+            // Both ends created with O_CLOEXEC to avoid leaking the
+            // write end if another thread forks between pipe2 and
+            // fcntl. The read end's CLOEXEC is cleared by remap_fds
+            // when it's placed in the fds_to_inherit array.
+            let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            if ret == 0 {
+                let target_fd = 3 + fds_to_inherit.len() as i32;
+                fds_to_inherit.push(fds[0]);
+                command.env("ARAPUCA_CGROUP_SYNC_FD", target_fd.to_string());
+                pipe_guard.push(fds[0]);
+                pipe_guard.push(fds[1]);
+                Some((fds[0], fds[1]))
+            } else {
+                log::warn!("cgroup sync pipe creation failed, continuing without");
+                None
+            }
+        } else {
+            None
+        };
+
         // ── Emit SandboxReady ──────────────────────────────────────
         if let Some(ref ctx) = audit_ctx {
             ctx.emit(AuditEvent::SandboxReady {
@@ -787,6 +814,12 @@ impl Sandbox for Linux {
                     libc::close(write_fd);
                 }
             }
+            if let Some((read_fd, write_fd)) = cgroup_sync_pipe {
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+            }
             #[cfg(unix)]
             {
                 if let Some(m) = pty_master_fd {
@@ -809,6 +842,54 @@ impl Sandbox for Linux {
         if let Some(s) = pty_slave_fd {
             // SAFETY: valid FD from openpty, no longer needed in parent.
             unsafe { libc::close(s) };
+        }
+
+        // ── Close sync pipe read end in parent ────────────────────
+        if let Some((read_fd, _)) = cgroup_sync_pipe {
+            unsafe { libc::close(read_fd) };
+        }
+
+        // ── Add PID to cgroup BEFORE reading audit pipe ───────────
+        // The wrapper blocks on the sync pipe at startup, waiting for
+        // the parent to confirm cgroup membership. We must do add_pid
+        // + sync_write before the audit pipe read, otherwise the
+        // parent would deadlock (waiting for audit EOF while the
+        // wrapper waits for the sync byte).
+        if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &cgroup_path) {
+            if let Err(e) = mgr.add_pid(path, child.id()) {
+                // Close sync pipe without writing — wrapper sees EOF and exits.
+                if let Some((_, write_fd)) = cgroup_sync_pipe {
+                    unsafe { libc::close(write_fd) };
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = mgr.destroy(path);
+                // Clean up remaining pipe FDs to prevent leaks.
+                if let Some((read_fd, write_fd, _)) = audit_pipe {
+                    unsafe {
+                        libc::close(read_fd);
+                        libc::close(write_fd);
+                    }
+                }
+                if let Some((read_fd, write_fd)) = dns_audit_pipe {
+                    unsafe {
+                        libc::close(read_fd);
+                        libc::close(write_fd);
+                    }
+                }
+                #[cfg(unix)]
+                if let Some(m) = pty_master_fd {
+                    unsafe { libc::close(m) };
+                }
+                return Err(Error::Cgroup(format!("add_pid failed: {e}")));
+            }
+        }
+
+        // ── Signal cgroup readiness to wrapper ────────────────────
+        if let Some((_, write_fd)) = cgroup_sync_pipe {
+            // Write a single byte to unblock the wrapper, then close.
+            unsafe { libc::write(write_fd, [1u8].as_ptr().cast(), 1) };
+            unsafe { libc::close(write_fd) };
         }
 
         // ── Read wrapper audit pipe ────────────────────────────────
@@ -839,26 +920,6 @@ impl Sandbox for Linux {
                 timestamp: ctx.timestamp(),
                 pid: child.id(),
             })?;
-        }
-
-        // Add subprocess PID to cgroup.
-        if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &cgroup_path) {
-            if let Err(e) = mgr.add_pid(path, child.id()) {
-                log::warn!("failed to add PID to cgroup: {e}");
-                if let Some(ref ctx) = audit_ctx {
-                    // Post-spawn: can't abort (child is running), so we
-                    // intentionally discard mandatory emit errors here.
-                    if let Err(ae) = ctx.emit(AuditEvent::LayerSkipped {
-                        timestamp: ctx.timestamp(),
-                        layer: SandboxLayer::Cgroup,
-                        reason: SkipReason::PartialFailure(sanitize_audit_string(&format!(
-                            "add_pid failed: {e}"
-                        ))),
-                    }) {
-                        log::error!("audit emit failed: {ae}");
-                    }
-                }
-            }
         }
 
         Ok(Process {

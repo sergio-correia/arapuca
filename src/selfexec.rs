@@ -124,6 +124,18 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         }
     };
 
+    // ── Wait for cgroup readiness signal from parent ─────────────
+    if let Ok(fd_str) = std::env::var("ARAPUCA_CGROUP_SYNC_FD") {
+        if let Ok(fd) = fd_str.parse::<i32>() {
+            let mut buf = [0u8; 1];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), 1) };
+            unsafe { libc::close(fd) };
+            if n != 1 {
+                unsafe { libc::_exit(1) };
+            }
+        }
+    }
+
     // ── Save parent PID for race check ───────────────────────────
     let parent_pid = unsafe { libc::getppid() };
 
