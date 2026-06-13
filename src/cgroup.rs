@@ -245,10 +245,12 @@ impl CgroupManager {
         let mut swap_disabled = true;
         if limits.memory_max_mb > 0 {
             if self.has_controller("memory") {
-                let mem_max = limits.memory_max_mb as i64 * 1024 * 1024;
+                let mem_max = limits
+                    .memory_max_mb
+                    .checked_mul(1024 * 1024)
+                    .ok_or_else(|| Error::Cgroup("memory_max_mb overflow".into()))?;
                 write_cgroup_file(cg_path, "memory.max", &mem_max.to_string())?;
-                // memory.high at 90% for throttling before hard OOM.
-                let mem_high = mem_max * 9 / 10;
+                let mem_high = mem_max / 10 * 9;
                 write_cgroup_file(cg_path, "memory.high", &mem_high.to_string())?;
                 if let Err(e) = write_cgroup_file(cg_path, "memory.swap.max", "0") {
                     log::warn!("cgroup: memory.swap.max: {e} (continuing)");

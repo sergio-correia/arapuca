@@ -37,7 +37,10 @@ use crate::{Error, Profile};
 pub fn apply(profile: &Profile) -> crate::Result<()> {
     set_rlimit(libc::RLIMIT_CORE, 0, "RLIMIT_CORE")?;
     if profile.max_file_size_mb > 0 {
-        let bytes = profile.max_file_size_mb * 1024 * 1024;
+        let bytes = profile
+            .max_file_size_mb
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| Error::Rlimit("max_file_size_mb overflow".into()))?;
         set_rlimit(libc::RLIMIT_FSIZE, bytes, "RLIMIT_FSIZE")?;
     }
     if profile.max_open_files > 0 {

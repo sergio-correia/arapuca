@@ -328,7 +328,10 @@ pub fn wrapper_env(profile: &crate::Profile) -> Vec<(String, String)> {
     if profile.max_file_size_mb > 0 {
         env.push((
             "ARAPUCA_RLIMIT_FSIZE".into(),
-            (profile.max_file_size_mb * 1024 * 1024).to_string(),
+            profile
+                .max_file_size_mb
+                .saturating_mul(1024 * 1024)
+                .to_string(),
         ));
     }
     if profile.max_open_files > 0 {
