@@ -1534,6 +1534,46 @@ fn fork_connect_proxy(allowed_hosts: &[arapuca::bridge::AllowedHost]) -> (PathBu
             unsafe { libc::_exit(1) };
         }
 
+        // Apply Landlock with minimal NSS paths. The proxy needs to
+        // read resolver config and load NSS modules, but should not
+        // have access to the broader filesystem.
+        #[cfg(target_os = "linux")]
+        {
+            let proxy_read_paths: Vec<std::path::PathBuf> = [
+                "/etc/hosts",
+                "/etc/nsswitch.conf",
+                "/etc/resolv.conf",
+                "/etc/gai.conf",
+                "/etc/ld.so.cache",
+                "/etc/ld.so.conf",
+                "/etc/ld.so.conf.d",
+                "/etc/services",
+                "/etc/ssl",
+                "/etc/pki",
+                "/etc/ca-certificates",
+                "/run/systemd/resolve",
+                "/run/nscd",
+                "/lib",
+                "/lib64",
+                "/usr/lib",
+                "/usr/lib64",
+            ]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+            .collect();
+
+            if !proxy_read_paths.is_empty() {
+                let proxy_profile = arapuca::Profile {
+                    read_paths: proxy_read_paths,
+                    ..Default::default()
+                };
+                if let Err(e) = arapuca::landlock::apply(&proxy_profile) {
+                    eprintln!("arapuca: connect proxy: landlock: {e}");
+                }
+            }
+        }
+
         // Pre-initialize NSS before seccomp — forces dlopen of all
         // NSS modules. Using an unresolvable FQDN traverses the
         // entire nsswitch hosts chain (files, mymachines, resolve,
