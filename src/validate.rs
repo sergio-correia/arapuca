@@ -158,20 +158,21 @@ pub fn validate_work_dir(
 /// this check is defense-in-depth.
 #[cfg(unix)]
 pub fn reject_cgroup_paths(paths: &[std::path::PathBuf]) -> crate::Result<()> {
+    let cgroup_prefix = std::path::Path::new("/sys/fs/cgroup");
     for p in paths {
         let normalized = normalize_path(p);
         let ns = normalized.to_string_lossy();
-        if ns.starts_with("/sys/fs/cgroup") {
+        if ns.starts_with("/sys/fs/cgroup") || cgroup_prefix.starts_with(&*normalized) {
             return Err(Error::Validation(format!(
-                "path must not include /sys/fs/cgroup: {}",
+                "path must not include or be an ancestor of /sys/fs/cgroup: {}",
                 p.display()
             )));
         }
         if let Ok(resolved) = std::fs::canonicalize(p) {
             let rs = resolved.to_string_lossy();
-            if rs.starts_with("/sys/fs/cgroup") {
+            if rs.starts_with("/sys/fs/cgroup") || cgroup_prefix.starts_with(&*resolved) {
                 return Err(Error::Validation(format!(
-                    "path must not include /sys/fs/cgroup: {}",
+                    "path must not include or be an ancestor of /sys/fs/cgroup: {}",
                     p.display()
                 )));
             }

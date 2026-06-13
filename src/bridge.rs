@@ -1068,9 +1068,10 @@ pub fn is_safe_resolved_ip(addr: &std::net::IpAddr) -> bool {
     match addr {
         IpAddr::V4(ip) => is_safe_ipv4(ip),
         IpAddr::V6(ip) => {
-            // Canonicalize IPv4-mapped IPv6 (::ffff:X.X.X.X).
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return is_safe_ipv4(&mapped);
+            // Canonicalize IPv4-mapped (::ffff:X.X.X.X) and deprecated
+            // IPv4-compatible (::X.X.X.X, RFC 4291 §2.5.5.1) addresses.
+            if let Some(v4) = ip.to_ipv4() {
+                return is_safe_ipv4(&v4);
             }
             // Block NAT64 well-known prefix 64:ff9b::/96 (RFC 6052).
             // These embed IPv4 in the low 32 bits — a NAT64 gateway
