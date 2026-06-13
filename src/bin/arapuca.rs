@@ -425,6 +425,7 @@ fn run_subcommand(args: &[String]) {
     #[cfg(target_os = "linux")]
     let mut allowed_hosts: Vec<arapuca::bridge::AllowedHost> = Vec::new();
     let mut deny_network = false;
+    let mut no_pid_ns = false;
 
     // Find -- separator.
     let sep_pos = args.iter().position(|a| a == "--");
@@ -451,6 +452,7 @@ fn run_subcommand(args: &[String]) {
                 "  --deny-network     block all network; capture DNS queries as audit events"
             );
             eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
+            eprintln!("  --no-pid-ns        disable PID namespace isolation");
             eprintln!("  -t, --tty          allocate a PTY for interactive programs");
             if sep_pos.is_none() && !args.is_empty() {
                 eprintln!();
@@ -635,6 +637,9 @@ fn run_subcommand(args: &[String]) {
                     }
                 };
             }
+            "--no-pid-ns" => {
+                no_pid_ns = true;
+            }
             "--cwd" => {
                 i += 1;
                 let path = flag_args.get(i).unwrap_or_else(|| {
@@ -735,6 +740,7 @@ fn run_subcommand(args: &[String]) {
         std::process::exit(125);
     });
 
+    let use_netns = connect_proxy_socket.is_some() || deny_network;
     let profile = arapuca::Profile {
         read_paths,
         write_paths,
@@ -742,7 +748,8 @@ fn run_subcommand(args: &[String]) {
         max_cpu_pct: cpus.unwrap_or(0),
         max_pids: pids.unwrap_or(0),
         allow_exec: true,
-        use_netns: connect_proxy_socket.is_some() || deny_network,
+        use_netns,
+        use_pidns: use_netns && !no_pid_ns,
         dns_capture: deny_network,
         seccomp_profile,
         ..Default::default()

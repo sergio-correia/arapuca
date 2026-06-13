@@ -119,6 +119,14 @@ pub struct Profile {
     pub allow_exec: bool,
     /// Use CLONE_NEWNET for network namespace isolation (Linux only).
     pub use_netns: bool,
+    /// Use CLONE_NEWPID for PID namespace isolation (Linux only).
+    ///
+    /// When enabled, the wrapper binary calls `unshare(CLONE_NEWPID)` +
+    /// `fork()` so the target runs as PID 1 in an isolated namespace,
+    /// unable to see or signal host processes. Requires a user namespace
+    /// (provided by `use_netns`, or added automatically when `use_pidns`
+    /// is true without `use_netns`).
+    pub use_pidns: bool,
     /// Enable DNS query capture inside the network namespace.
     ///
     /// When enabled, the bridge child runs a DNS server on UDP port 53

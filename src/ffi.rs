@@ -234,6 +234,24 @@ pub unsafe extern "C" fn arapuca_profile_set_netns(profile: *mut ArapucaProfile,
     }
 }
 
+/// Enable or disable PID namespace isolation.
+///
+/// When enabled, the sandboxed process runs in an isolated PID
+/// namespace where it cannot see or signal host processes.
+/// Requires a user namespace (provided by netns or added
+/// automatically).
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_pidns(profile: *mut ArapucaProfile, enabled: bool) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.use_pidns = enabled;
+        }
+    }
+}
+
 /// Enable DNS query capture inside the network namespace.
 ///
 /// When enabled alongside netns, the bridge child intercepts DNS
