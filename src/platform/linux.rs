@@ -906,7 +906,7 @@ impl Sandbox for Linux {
         // kept open — Process::wait() reads it after the child exits.
         let dns_audit_read_fd = if let Some((read_fd, write_fd)) = dns_audit_pipe {
             unsafe { libc::close(write_fd) };
-            Some(read_fd)
+            Some(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(read_fd) })
         } else {
             None
         };

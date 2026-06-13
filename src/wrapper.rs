@@ -72,7 +72,25 @@ pub fn write_stderr(msg: &str) {
 pub fn override_resolv_conf() -> bool {
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let pid = std::process::id();
-    let path = format!("{tmpdir}/.arapuca-resolv-{pid}.conf");
+    let mut rand_buf = [0u8; 8];
+    let rand_hex = if unsafe {
+        libc::syscall(
+            libc::SYS_getrandom,
+            rand_buf.as_mut_ptr(),
+            rand_buf.len(),
+            0u32,
+        )
+    } == 8
+    {
+        rand_buf.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    } else {
+        String::from("00000000")
+    };
+    let path = format!("{tmpdir}/.arapuca-resolv-{pid}-{rand_hex}.conf");
 
     // O_EXCL prevents symlink-following attacks on the temp file.
     use std::io::Write;

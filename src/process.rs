@@ -39,7 +39,7 @@ pub struct Process {
     pub(crate) cgroup_path: Option<PathBuf>,
     /// DNS audit pipe read end. Read in wait() after child exits.
     #[cfg(target_os = "linux")]
-    pub(crate) dns_audit_pipe: Option<std::os::unix::io::RawFd>,
+    pub(crate) dns_audit_pipe: Option<std::os::unix::io::OwnedFd>,
     /// Launch timestamp for macOS Seatbelt denial log querying.
     #[cfg(target_os = "macos")]
     pub(crate) launch_timestamp: Option<std::time::SystemTime>,
@@ -231,10 +231,12 @@ impl Process {
     #[cfg(target_os = "linux")]
     #[cfg_attr(not(feature = "serde"), allow(unused_variables))]
     fn read_dns_audit_pipe(&mut self, pid: u32) {
-        let fd = match self.dns_audit_pipe.take() {
+        let owned_fd = match self.dns_audit_pipe.take() {
             Some(fd) => fd,
             None => return,
         };
+        use std::os::unix::io::AsRawFd;
+        let fd = owned_fd.as_raw_fd();
 
         // Poll with a 1-second timeout — the bridge should be dead
         // (pdeathsig) by now, but SIGKILL delivery is asynchronous.
@@ -251,7 +253,7 @@ impl Process {
         };
         if poll_ret == 0 {
             log::warn!("DNS audit pipe: timeout waiting for EOF (bridge may still be alive)");
-            unsafe { libc::close(fd) };
+            drop(owned_fd);
             return;
         }
 
@@ -291,7 +293,7 @@ impl Process {
             }
             data.extend_from_slice(&buf[..n as usize]);
         }
-        unsafe { libc::close(fd) };
+        drop(owned_fd);
 
         #[cfg(not(feature = "serde"))]
         if !data.is_empty() {
@@ -572,9 +574,7 @@ impl Drop for Process {
         }
 
         #[cfg(target_os = "linux")]
-        if let Some(fd) = self.dns_audit_pipe.take() {
-            unsafe { libc::close(fd) };
-        }
+        drop(self.dns_audit_pipe.take());
 
         #[cfg(target_os = "linux")]
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
@@ -748,7 +748,7 @@ mod tests {
             tmp_dir: dir,
             cgroup_path: None,
             cgroup_mgr: None,
-            dns_audit_pipe: Some(pipe_read),
+            dns_audit_pipe: Some(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(pipe_read) }),
             #[cfg(target_os = "macos")]
             launch_timestamp: None,
             #[cfg(all(target_os = "linux", feature = "microvm"))]

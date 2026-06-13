@@ -1081,6 +1081,16 @@ pub fn is_safe_resolved_ip(addr: &std::net::IpAddr) -> bool {
             if is_nat64_local(ip) {
                 return false;
             }
+            // Block 6to4 (2002::/16, RFC 3056): IPv4 embedded in
+            // bits 16-47. Deprecated but still routed in some clouds.
+            if let Some(embedded) = sixto4_embedded_ipv4(ip) {
+                return is_safe_ipv4(&embedded);
+            }
+            // Block Teredo (2001:0000::/32, RFC 4380): IPv4 XOR'd
+            // with 0xffff in the last 32 bits.
+            if let Some(embedded) = teredo_embedded_ipv4(ip) {
+                return is_safe_ipv4(&embedded);
+            }
             !ip.is_loopback()
                 && !ip.is_unspecified()
                 && !is_ipv6_link_local(ip)
@@ -1111,6 +1121,34 @@ fn is_nat64_local(ip: &std::net::Ipv6Addr) -> bool {
     s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001
 }
 
+fn sixto4_embedded_ipv4(ip: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = ip.segments();
+    if s[0] == 0x2002 {
+        Some(std::net::Ipv4Addr::new(
+            (s[1] >> 8) as u8,
+            s[1] as u8,
+            (s[2] >> 8) as u8,
+            s[2] as u8,
+        ))
+    } else {
+        None
+    }
+}
+
+fn teredo_embedded_ipv4(ip: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = ip.segments();
+    if s[0] == 0x2001 && s[1] == 0x0000 {
+        Some(std::net::Ipv4Addr::new(
+            (s[6] >> 8) as u8 ^ 0xff,
+            s[6] as u8 ^ 0xff,
+            (s[7] >> 8) as u8 ^ 0xff,
+            s[7] as u8 ^ 0xff,
+        ))
+    } else {
+        None
+    }
+}
+
 fn is_safe_ipv4(ip: &std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     !ip.is_loopback()
@@ -1126,6 +1164,8 @@ fn is_safe_ipv4(ip: &std::net::Ipv4Addr) -> bool {
         && !(o[0] == 100 && (64..=127).contains(&o[1]))
         // Benchmarking (RFC 2544): 198.18.0.0/15
         && !(o[0] == 198 && (18..=19).contains(&o[1]))
+        // Reserved (RFC 1112): 240.0.0.0/4
+        && o[0] < 240
 }
 
 fn is_ipv6_link_local(ip: &std::net::Ipv6Addr) -> bool {

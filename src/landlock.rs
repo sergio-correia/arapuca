@@ -35,6 +35,7 @@ pub fn apply(profile: &Profile) -> crate::Result<()> {
     let write_paths = &profile.write_paths;
 
     if read_paths.is_empty() && write_paths.is_empty() {
+        log::info!("landlock: no paths configured, skipping filesystem restrictions");
         return Ok(());
     }
 
