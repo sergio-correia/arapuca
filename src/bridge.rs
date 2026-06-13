@@ -383,6 +383,10 @@ pub fn fork_bridge(
             unsafe { libc::_exit(1) };
         }
 
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+
         #[cfg(seccomp_supported)]
         if let Err(e) = apply_bridge_seccomp() {
             child_stderr(&format!("bridge: seccomp: {e}\n"));
