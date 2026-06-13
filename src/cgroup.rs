@@ -37,6 +37,10 @@ pub struct CgroupLimits {
     pub pids_max: u32,
     /// CPU percentage limit (0 = no limit; 200 = 2 cores).
     pub cpu_max_pct: u32,
+    /// Extra PID slots for sandbox infrastructure (e.g. the PID
+    /// namespace relay parent). Added to `pids_max` at the cgroup
+    /// write site so the user's intent is preserved.
+    pub pids_overhead: u32,
 }
 
 impl CgroupLimits {
@@ -265,7 +269,8 @@ impl CgroupManager {
 
         if limits.pids_max > 0 {
             if self.has_controller("pids") {
-                write_cgroup_file(cg_path, "pids.max", &limits.pids_max.to_string())?;
+                let effective_pids = limits.pids_max.saturating_add(limits.pids_overhead);
+                write_cgroup_file(cg_path, "pids.max", &effective_pids.to_string())?;
             } else {
                 return Err(Error::CgroupDegraded(
                     "pids controller not delegated".into(),
@@ -402,6 +407,7 @@ mod tests {
             memory_max_mb: 2048,
             pids_max: 256,
             cpu_max_pct: 200,
+            ..Default::default()
         };
         assert!(limits.validate().is_ok());
     }

@@ -754,6 +754,8 @@ impl Sandbox for Linux {
             memory_max_mb: cfg.profile.max_memory_mb,
             pids_max: cfg.profile.max_pids,
             cpu_max_pct: cfg.profile.max_cpu_pct,
+            pids_overhead: (if cfg.profile.use_pidns { 1 } else { 0 })
+                + (if cfg.profile.use_netns { 1 } else { 0 }),
         };
 
         let mut cgroup_path = None;
