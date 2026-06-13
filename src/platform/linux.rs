@@ -246,6 +246,22 @@ impl Sandbox for Linux {
             }
             applied_layers.push(SandboxLayer::NetworkNamespace);
             c
+        } else if cfg.profile.use_pidns {
+            // PID namespace without network namespace: need a user
+            // namespace for unprivileged unshare(CLONE_NEWPID).
+            let mut c = Command::new("unshare");
+            c.args(["--user", "--map-current-user", "--"]);
+            c.arg(&actual_cmd);
+            c.args(&actual_args);
+            if let Some(ref ctx) = audit_ctx {
+                ctx.emit(AuditEvent::LayerSkipped {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::NetworkNamespace,
+                    reason: SkipReason::NotConfigured,
+                })?;
+            }
+            skipped_layers.push(SandboxLayer::NetworkNamespace);
+            c
         } else {
             let mut c = Command::new(&actual_cmd);
             c.args(&actual_args);
@@ -517,6 +533,29 @@ impl Sandbox for Linux {
                 skipped_layers.push(SandboxLayer::DnsCapture);
             }
         }
+
+        // ── PID namespace pipe ─────────────────────────────────────
+        // When PID namespace is active, create a pipe for the wrapper
+        // parent to report the target's host PID. Set ARAPUCA_PID_NS
+        // so the wrapper knows to call unshare(CLONE_NEWPID) + fork().
+        let pid_report_pipe = if cfg.profile.use_pidns && use_wrapper {
+            command.env("ARAPUCA_PID_NS", "1");
+            let mut fds = [0i32; 2];
+            let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            if ret == 0 {
+                let target_fd = 3 + fds_to_inherit.len() as i32;
+                fds_to_inherit.push(fds[1]);
+                command.env("ARAPUCA_PID_REPORT_FD", target_fd.to_string());
+                pipe_guard.push(fds[0]);
+                pipe_guard.push(fds[1]);
+                Some((fds[0], fds[1]))
+            } else {
+                log::warn!("PID report pipe creation failed, continuing without pidns");
+                None
+            }
+        } else {
+            None
+        };
 
         // ── Emit pre_exec layer events from parent ─────────────────
         // pre_exec is async-signal-safe — no AuditContext allowed inside.
@@ -811,6 +850,12 @@ impl Sandbox for Linux {
                     libc::close(write_fd);
                 }
             }
+            if let Some((read_fd, write_fd)) = pid_report_pipe {
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+            }
             if let Some((read_fd, write_fd)) = cgroup_sync_pipe {
                 unsafe {
                     libc::close(read_fd);
@@ -874,6 +919,12 @@ impl Sandbox for Linux {
                         libc::close(write_fd);
                     }
                 }
+                if let Some((read_fd, write_fd)) = pid_report_pipe {
+                    unsafe {
+                        libc::close(read_fd);
+                        libc::close(write_fd);
+                    }
+                }
                 #[cfg(unix)]
                 if let Some(m) = pty_master_fd {
                     unsafe { libc::close(m) };
@@ -900,6 +951,23 @@ impl Sandbox for Linux {
             validate_wrapper_audit(read_fd);
             // SAFETY: read_fd is a valid descriptor from pipe().
             unsafe { libc::close(read_fd) };
+        }
+
+        // ── Read PID report pipe ──────────────────────────────────
+        // The wrapper parent writes the target's host PID (4 bytes,
+        // little-endian i32) after the audit events. Read it after
+        // validate_wrapper_audit to avoid deadlock.
+        if let Some((read_fd, write_fd)) = pid_report_pipe {
+            unsafe { libc::close(write_fd) };
+            let mut buf = [0u8; 4];
+            let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 4) };
+            unsafe { libc::close(read_fd) };
+            if n == 4 {
+                let target_pid = i32::from_le_bytes(buf);
+                log::debug!("pidns: target host PID = {target_pid}");
+            } else {
+                log::warn!("pidns: failed to read target PID from report pipe");
+            }
         }
 
         // Close DNS audit pipe write end in parent. The read end is
