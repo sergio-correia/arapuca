@@ -1497,19 +1497,7 @@ fn fork_connect_proxy(allowed_hosts: &[arapuca::bridge::AllowedHost]) -> (PathBu
         unsafe { libc::close(pipe_read) };
 
         // Close all FDs >= 3 except pipe_write and listener_fd.
-        // SAFETY: close_range with valid fd ranges.
-        unsafe {
-            let mut keep = [pipe_write, listener_fd];
-            keep.sort();
-            let mut start = 3i32;
-            for &fd in &keep {
-                if fd > start {
-                    libc::syscall(libc::SYS_close_range, start as u32, (fd - 1) as u32, 0u32);
-                }
-                start = fd + 1;
-            }
-            libc::syscall(libc::SYS_close_range, start as u32, u32::MAX, 0u32);
-        }
+        unsafe { arapuca::bridge::close_fds_except(&[pipe_write, listener_fd]) };
 
         // setsid clears PR_SET_PDEATHSIG, so pdeathsig must be re-set
         // after. The getppid race check below covers the window between

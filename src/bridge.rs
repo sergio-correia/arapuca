@@ -219,6 +219,53 @@ pub fn parse_bridge_env() -> crate::Result<Option<(u16, std::path::PathBuf)>> {
 /// - Must be inside a network namespace (loopback_up assumes fresh netns).
 ///
 /// # Errors
+/// Close all FDs >= 3 except those in `keep`.
+///
+/// Uses `close_range(2)` when available (Linux 5.9+). On older kernels,
+/// falls back to enumerating `/proc/self/fd`.
+pub(crate) unsafe fn close_fds_except(keep: &[i32]) {
+    let mut sorted: Vec<u32> = keep
+        .iter()
+        .filter(|&&fd| fd >= 3)
+        .map(|&fd| fd as u32)
+        .collect();
+    sorted.sort();
+    sorted.dedup();
+
+    let mut start = 3u32;
+    let mut all_ok = true;
+    for &fd in &sorted {
+        if fd > start {
+            let ret = libc::syscall(libc::SYS_close_range, start, fd - 1, 0u32);
+            if ret != 0 {
+                all_ok = false;
+                break;
+            }
+        }
+        start = fd + 1;
+    }
+    if all_ok {
+        let ret = libc::syscall(libc::SYS_close_range, start, u32::MAX, 0u32);
+        if ret == 0 {
+            return;
+        }
+    }
+
+    // Fallback: enumerate /proc/self/fd (works on all Linux versions).
+    // Collect FD numbers first — closing the ReadDir's directory FD
+    // mid-iteration would silently stop enumeration.
+    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        let fds_to_close: Vec<i32> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+            .filter(|&fd| fd >= 3 && !keep.contains(&fd))
+            .collect();
+        for fd in fds_to_close {
+            libc::close(fd);
+        }
+    }
+}
+
 ///
 /// Returns an error if loopback cannot be brought up, the listener
 /// cannot be bound, fork fails, or the bridge child fails to signal
@@ -304,16 +351,7 @@ pub fn fork_bridge(
             if let Some(fd) = dns_audit_fd {
                 keep_vec.push(fd);
             }
-            keep_vec.sort();
-            keep_vec.dedup();
-            let mut start = 3i32;
-            for &fd in &keep_vec {
-                if fd > start {
-                    libc::syscall(libc::SYS_close_range, start as u32, (fd - 1) as u32, 0u32);
-                }
-                start = fd + 1;
-            }
-            libc::syscall(libc::SYS_close_range, start as u32, u32::MAX, 0u32);
+            close_fds_except(&keep_vec);
         }
 
         // Set dns_audit_fd to non-blocking to avoid stalling on pipe full.
