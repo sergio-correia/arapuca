@@ -493,6 +493,16 @@ const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
     | libc::CLONE_SIGHAND
     | libc::CLONE_THREAD) as u64;
 
+#[cfg(seccomp_supported)]
+const CLONE_NS_FLAGS: u64 = libc::CLONE_NEWNS as u64
+    | libc::CLONE_NEWCGROUP as u64
+    | libc::CLONE_NEWUTS as u64
+    | libc::CLONE_NEWIPC as u64
+    | libc::CLONE_NEWUSER as u64
+    | libc::CLONE_NEWPID as u64
+    | libc::CLONE_NEWNET as u64
+    | 0x0000_0080; // CLONE_NEWTIME (not yet in libc crate)
+
 /// Apply a minimal default-deny seccomp filter for the bridge process.
 ///
 /// Only syscalls needed for TCP accept, UDS connect, bidirectional
@@ -580,7 +590,7 @@ fn build_bridge_filters() -> crate::Result<(seccompiler::BpfProgram, seccompiler
         allow.insert(nr, vec![]);
     }
 
-    // clone: require thread-creation flags to be present.
+    // clone: require thread-creation flags AND deny namespace flags.
     let clone_rule = SeccompRule::new(vec![
         SeccompCondition::new(
             0,
@@ -589,6 +599,13 @@ fn build_bridge_filters() -> crate::Result<(seccompiler::BpfProgram, seccompiler
             CLONE_THREAD_FLAGS,
         )
         .map_err(|e| crate::Error::Seccomp(format!("clone condition: {e}")))?,
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(CLONE_NS_FLAGS),
+            0,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("clone ns deny condition: {e}")))?,
     ])
     .map_err(|e| crate::Error::Seccomp(format!("clone rule: {e}")))?;
     allow.insert(libc::SYS_clone, vec![clone_rule]);
@@ -1417,7 +1434,7 @@ fn build_connect_proxy_filters() -> crate::Result<(seccompiler::BpfProgram, secc
         allow.insert(nr, vec![]);
     }
 
-    // clone: require thread-creation flags.
+    // clone: require thread-creation flags AND deny namespace flags.
     let clone_rule = SeccompRule::new(vec![
         SeccompCondition::new(
             0,
@@ -1426,6 +1443,13 @@ fn build_connect_proxy_filters() -> crate::Result<(seccompiler::BpfProgram, secc
             CLONE_THREAD_FLAGS,
         )
         .map_err(|e| crate::Error::Seccomp(format!("clone condition: {e}")))?,
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(CLONE_NS_FLAGS),
+            0,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("clone ns deny condition: {e}")))?,
     ])
     .map_err(|e| crate::Error::Seccomp(format!("clone rule: {e}")))?;
     allow.insert(libc::SYS_clone, vec![clone_rule]);
