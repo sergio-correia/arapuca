@@ -307,7 +307,10 @@ impl CgroupManager {
                 continue;
             }
             let cg_path = entry.path();
-            self.kill_procs(&cg_path);
+            let kill_path = cg_path.join("cgroup.kill");
+            if fs::write(&kill_path, "1").is_err() {
+                self.kill_procs(&cg_path);
+            }
             thread::sleep(DESTROY_BACKOFF);
             match fs::remove_dir(&cg_path) {
                 Ok(()) => log::info!("cgroup: cleaned up stale cgroup {name_str}"),

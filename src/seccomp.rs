@@ -177,9 +177,11 @@ fn build_filter() -> crate::Result<BpfProgram> {
 
     eperm_rules.insert(libc::SYS_execveat, vec![execveat_empty_path]);
 
-    // Block ioctl(fd, TIOCSTI, ...) — terminal input injection.
+    // Block ioctl(fd, TIOCSTI/TIOCLINUX, ...) — terminal input injection.
     // On kernels < 6.2, a sandboxed process can inject keystrokes
     // into the parent's terminal via TIOCSTI on inherited FD 0.
+    // TIOCLINUX subcommands 3+10 can achieve similar injection on
+    // virtual consoles (not ptys) on kernels < 5.11.
     let ioctl_tiocsti = SeccompRule::new(vec![
         SeccompCondition::new(
             1,
@@ -190,8 +192,18 @@ fn build_filter() -> crate::Result<BpfProgram> {
         .map_err(|e| Error::Seccomp(format!("ioctl TIOCSTI condition: {e}")))?,
     ])
     .map_err(|e| Error::Seccomp(format!("ioctl TIOCSTI rule: {e}")))?;
+    let ioctl_tioclinux = SeccompRule::new(vec![
+        SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            0x541Cu64, // TIOCLINUX
+        )
+        .map_err(|e| Error::Seccomp(format!("ioctl TIOCLINUX condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("ioctl TIOCLINUX rule: {e}")))?;
 
-    eperm_rules.insert(libc::SYS_ioctl, vec![ioctl_tiocsti]);
+    eperm_rules.insert(libc::SYS_ioctl, vec![ioctl_tiocsti, ioctl_tioclinux]);
 
     // Block kill() with pid <= 0 (broadcast/group signals).
     // pid <= 0 covers kill(-1, sig) (all processes), kill(0, sig)
@@ -656,12 +668,17 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
         ],
     );
 
-    // ioctl(TIOCSTI) — terminal input injection
+    // ioctl(TIOCSTI/TIOCLINUX) — terminal input injection
     eperm_rules.insert(
         libc::SYS_ioctl,
         vec![
             SeccompRule::new(vec![
                 SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0x5412u64)
+                    .map_err(|e| Error::Seccomp(format!("baseline ioctl condition: {e}")))?,
+            ])
+            .map_err(|e| Error::Seccomp(format!("baseline ioctl rule: {e}")))?,
+            SeccompRule::new(vec![
+                SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0x541Cu64)
                     .map_err(|e| Error::Seccomp(format!("baseline ioctl condition: {e}")))?,
             ])
             .map_err(|e| Error::Seccomp(format!("baseline ioctl rule: {e}")))?,
