@@ -780,7 +780,14 @@ impl Sandbox for Linux {
                         cgroup_path = Some(result.path);
                     }
                     Err(e) => {
-                        log::warn!("cgroup creation failed: {e} (continuing without)");
+                        if limits.has_limits() {
+                            return Err(Error::Cgroup(format!(
+                                "resource limits requested but cgroup creation failed: {e}"
+                            )));
+                        }
+                        log::warn!(
+                            "cgroup creation failed: {e} (no limits configured, continuing)"
+                        );
                         if let Some(ref ctx) = audit_ctx {
                             ctx.emit(AuditEvent::LayerSkipped {
                                 timestamp: ctx.timestamp(),
@@ -795,22 +802,10 @@ impl Sandbox for Linux {
                 }
             }
         } else if limits.has_limits() {
-            if cfg.profile.max_memory_mb > 0 || cfg.profile.max_pids > 0 {
-                log::warn!(
-                    "resource limits requested (memory={}MB, pids={}) but cgroups \
-                     unavailable — no enforcement",
-                    cfg.profile.max_memory_mb,
-                    cfg.profile.max_pids
-                );
-            }
-            if let Some(ref ctx) = audit_ctx {
-                ctx.emit(AuditEvent::LayerSkipped {
-                    timestamp: ctx.timestamp(),
-                    layer: SandboxLayer::Cgroup,
-                    reason: SkipReason::NotAvailable,
-                })?;
-            }
-            skipped_layers.push(SandboxLayer::Cgroup);
+            return Err(Error::Cgroup(format!(
+                "resource limits requested (memory={}MB, pids={}) but cgroups unavailable",
+                cfg.profile.max_memory_mb, cfg.profile.max_pids
+            )));
         }
 
         // ── Cgroup sync pipe ──────────────────────────────────────
