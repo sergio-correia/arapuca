@@ -125,6 +125,56 @@ impl Process {
         self.pty_master.as_ref().map(|fd| fd.as_fd())
     }
 
+    /// Send a signal to the sandboxed process.
+    ///
+    /// On Linux 5.3+, uses `pidfd_send_signal` for race-free delivery.
+    /// Falls back to `kill()` on older kernels or non-Linux platforms,
+    /// but only if `wait()` has not been called — after wait, the PID
+    /// may be recycled and signaling is refused.
+    #[cfg(unix)]
+    pub fn signal(&self, sig: i32) -> crate::Result<()> {
+        if self.waited {
+            return Err(crate::Error::Process(
+                "cannot signal after wait(): process already reaped".into(),
+            ));
+        }
+
+        let pid = self.pid();
+        if pid == 0 {
+            return Err(crate::Error::Process("process already reaped".into()));
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(ref fd) = self.pidfd {
+            use std::os::unix::io::AsRawFd;
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    sig,
+                    std::ptr::null::<libc::c_void>(),
+                    0u32,
+                )
+            };
+            if ret != 0 {
+                return Err(crate::Error::Syscall {
+                    name: "pidfd_send_signal",
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+            return Ok(());
+        }
+
+        let ret = unsafe { libc::kill(pid as libc::pid_t, sig) };
+        if ret != 0 {
+            return Err(crate::Error::Syscall {
+                name: "kill",
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(())
+    }
+
     /// Wait for the process to exit and return the exit status.
     #[cfg(not(windows))]
     pub fn wait(&mut self) -> crate::Result<std::process::ExitStatus> {
@@ -588,13 +638,53 @@ impl Drop for Process {
         #[cfg(not(windows))]
         match &mut self.child {
             ChildHandle::Managed(c) => {
-                let _ = c.kill();
-                let _ = c.wait();
+                if !self.waited {
+                    // pidfd targets the sandboxed process (target in
+                    // pidns); c.wait() waits for the wrapper/relay
+                    // which exits after the target.
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref fd) = self.pidfd {
+                        use std::os::unix::io::AsRawFd;
+                        let _ = unsafe {
+                            libc::syscall(
+                                libc::SYS_pidfd_send_signal,
+                                fd.as_raw_fd(),
+                                libc::SIGKILL,
+                                std::ptr::null::<libc::c_void>(),
+                                0u32,
+                            )
+                        };
+                    } else {
+                        let _ = c.kill();
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = c.kill();
+                    }
+                    let _ = c.wait();
+                }
             }
             ChildHandle::Forked(pid) if *pid > 0 => {
-                // SAFETY: kill and waitpid on a valid PID.
+                #[cfg(target_os = "linux")]
+                if let Some(ref fd) = self.pidfd {
+                    use std::os::unix::io::AsRawFd;
+                    let _ = unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            fd.as_raw_fd(),
+                            libc::SIGKILL,
+                            std::ptr::null::<libc::c_void>(),
+                            0u32,
+                        )
+                    };
+                } else {
+                    unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+                }
+                #[cfg(not(target_os = "linux"))]
                 unsafe {
                     libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+                }
+                unsafe {
                     libc::waitpid(*pid as libc::pid_t, std::ptr::null_mut(), 0);
                 }
             }

@@ -841,6 +841,36 @@ pub unsafe extern "C" fn arapuca_process_pid(proc_: *const ArapucaProcess) -> u3
     proc_.inner.as_ref().map_or(0, |p| p.pid())
 }
 
+/// Send a signal to a sandboxed process.
+///
+/// On Linux 5.3+, uses pidfd_send_signal for race-free delivery.
+/// Falls back to kill() on older kernels or non-Linux platforms.
+///
+/// Returns 0 on success, -1 on error (check `arapuca_last_error()`).
+///
+/// # Safety
+/// `proc` must be a valid pointer.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_process_signal(proc_: *const ArapucaProcess, signal: i32) -> i32 {
+    clear_error();
+    let Some(proc_) = (unsafe { proc_.as_ref() }) else {
+        set_error("null process pointer");
+        return -1;
+    };
+    let Some(process) = proc_.inner.as_ref() else {
+        set_error("process already cleaned up");
+        return -1;
+    };
+    match process.signal(signal) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(&e.to_string());
+            -1
+        }
+    }
+}
+
 /// Wait for a sandboxed process to exit.
 ///
 /// Returns:
