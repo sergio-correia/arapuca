@@ -29,8 +29,13 @@ fn pipe_pair() -> (std::fs::File, std::fs::File) {
 }
 
 fn base_config() -> Config {
+    let (read_paths, write_paths) = arapuca::env::default_sandbox_paths();
     Config {
-        profile: Profile::default(),
+        profile: Profile {
+            read_paths,
+            write_paths,
+            ..Default::default()
+        },
         socket_dir: PathBuf::new(),
         task_id: "stdio-test".into(),
         phase: "test".into(),

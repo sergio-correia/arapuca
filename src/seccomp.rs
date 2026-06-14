@@ -265,13 +265,16 @@ fn build_filter() -> crate::Result<BpfProgram> {
     // takes the most restrictive action across all filters). Blocking it
     // would also prevent our three-phase filter installation.
 
-    // --- ENOSYS filter for clone3 ---
-    // Return ENOSYS so Go/glibc fall back to clone(2), where we CAN
-    // inspect flags via arg0. This is the Chromium/Firefox approach.
-    // We cannot filter clone3 flags because they're inside a struct
-    // behind a pointer, not a direct syscall argument.
+    // --- ENOSYS filter for clone3 and io_uring ---
+    // clone3: return ENOSYS so Go/glibc fall back to clone(2), where
+    // we CAN inspect flags via arg0 (Chromium/Firefox approach).
+    // io_uring_*: return ENOSYS so libraries (libuv, liburing) fall
+    // back to epoll/poll. Matches kernel sysctl io_uring_disabled=2.
     let mut enosys_rules: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
     enosys_rules.insert(libc::SYS_clone3, vec![]);
+    enosys_rules.insert(libc::SYS_io_uring_setup, vec![]);
+    enosys_rules.insert(libc::SYS_io_uring_enter, vec![]);
+    enosys_rules.insert(libc::SYS_io_uring_register, vec![]);
 
     let enosys_filter = SeccompFilter::new(
         enosys_rules.into_iter().collect(),
@@ -350,9 +353,7 @@ fn tier1_kill_syscalls() -> Vec<i64> {
         libc::SYS_process_vm_writev,
         libc::SYS_userfaultfd,
         libc::SYS_kcmp,
-        libc::SYS_io_uring_setup,
-        libc::SYS_io_uring_enter,
-        libc::SYS_io_uring_register,
+        // io_uring_* in ENOSYS tier — libraries probe and fall back.
         libc::SYS_bpf,
         libc::SYS_mount_setattr,
         libc::SYS_move_mount,
@@ -474,9 +475,7 @@ fn baseline_kill_syscalls() -> Vec<i64> {
         libc::SYS_landlock_restrict_self,
         libc::SYS_userfaultfd,
         SYS_LSM_SET_SELF_ATTR,
-        libc::SYS_io_uring_setup,
-        libc::SYS_io_uring_enter,
-        libc::SYS_io_uring_register,
+        // io_uring_* in ENOSYS tier — libraries probe and fall back.
         libc::SYS_memfd_create,
         libc::SYS_pidfd_open,
         libc::SYS_pidfd_getfd,
@@ -755,7 +754,7 @@ mod tests {
     fn tier1_count_is_exact() {
         assert_eq!(
             tier1_kill_syscalls().len(),
-            49,
+            46,
             "tier1 count changed — update this assertion if intentional"
         );
     }

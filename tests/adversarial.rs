@@ -42,6 +42,11 @@ fn seccomp_only_command(cmd: &str, args: &[&str]) -> std::process::Output {
         .args(["--", cmd])
         .args(args)
         .env("ARAPUCA_WRAPPER", "1")
+        .env(
+            "ARAPUCA_READ_PATHS",
+            "/usr:/lib:/lib64:/bin:/sbin:/etc:/dev:/proc:/tmp",
+        )
+        .env("ARAPUCA_WRITE_PATHS", "/tmp")
         .output()
         .expect("failed to run arapuca")
 }

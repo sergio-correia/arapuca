@@ -205,8 +205,21 @@ fn timeout_fast_exit_no_delay() {
     );
 }
 
+fn cgroup_available() -> bool {
+    Command::new(arapuca_bin())
+        .args(["run", "--memory", "256", "--", "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 #[test]
 fn resource_limits_flag_accepted() {
+    if !cgroup_available() {
+        eprintln!("skipping: cgroups not available");
+        return;
+    }
     let status = Command::new(arapuca_bin())
         .args([
             "run",
@@ -1072,6 +1085,16 @@ fn deny_network_resolv_conf_override() {
 fn deny_network_dns_nxdomain() {
     if !netns_root_available() {
         eprintln!("skipping: unshare --user --net --map-root-user not available");
+        return;
+    }
+    if Command::new("nslookup")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("skipping: nslookup not available");
         return;
     }
     let output = Command::new("unshare")

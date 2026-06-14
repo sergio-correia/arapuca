@@ -218,12 +218,16 @@ pub fn parse_bridge_env() -> crate::Result<Option<(u16, std::path::PathBuf)>> {
 /// - Must be called before seccomp is applied (checked via prctl).
 /// - Must be inside a network namespace (loopback_up assumes fresh netns).
 ///
-/// # Errors
 /// Close all FDs >= 3 except those in `keep`.
 ///
 /// Uses `close_range(2)` when available (Linux 5.9+). On older kernels,
 /// falls back to enumerating `/proc/self/fd`.
-pub(crate) unsafe fn close_fds_except(keep: &[i32]) {
+///
+/// # Safety
+///
+/// Caller must ensure no other threads hold or depend on the FDs
+/// being closed. Intended for use in a post-fork, pre-exec context.
+pub unsafe fn close_fds_except(keep: &[i32]) {
     let mut sorted: Vec<u32> = keep
         .iter()
         .filter(|&&fd| fd >= 3)
@@ -236,7 +240,8 @@ pub(crate) unsafe fn close_fds_except(keep: &[i32]) {
     let mut all_ok = true;
     for &fd in &sorted {
         if fd > start {
-            let ret = libc::syscall(libc::SYS_close_range, start, fd - 1, 0u32);
+            // SAFETY: close_range is a simple syscall; no invariants beyond valid FD range.
+            let ret = unsafe { libc::syscall(libc::SYS_close_range, start, fd - 1, 0u32) };
             if ret != 0 {
                 all_ok = false;
                 break;
@@ -245,7 +250,8 @@ pub(crate) unsafe fn close_fds_except(keep: &[i32]) {
         start = fd + 1;
     }
     if all_ok {
-        let ret = libc::syscall(libc::SYS_close_range, start, u32::MAX, 0u32);
+        // SAFETY: same as above — close remaining range above the last kept FD.
+        let ret = unsafe { libc::syscall(libc::SYS_close_range, start, u32::MAX, 0u32) };
         if ret == 0 {
             return;
         }
@@ -261,17 +267,20 @@ pub(crate) unsafe fn close_fds_except(keep: &[i32]) {
             .filter(|&fd| fd >= 3 && !keep.contains(&fd))
             .collect();
         for fd in fds_to_close {
-            libc::close(fd);
+            // SAFETY: FD was valid at enumeration time; double-close is harmless.
+            unsafe { libc::close(fd) };
         }
         return;
     }
 
     // Last resort: brute-force close from 3 to sysconf(_SC_OPEN_MAX).
-    let max_fd = libc::sysconf(libc::_SC_OPEN_MAX) as i32;
+    // SAFETY: sysconf(_SC_OPEN_MAX) returns the system FD limit.
+    let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } as i32;
     let limit = max_fd.min(4096);
     for fd in 3..limit {
         if !keep.contains(&fd) {
-            libc::close(fd);
+            // SAFETY: closing an already-closed FD is harmless.
+            unsafe { libc::close(fd) };
         }
     }
 }

@@ -127,7 +127,7 @@ fn parent_relay(
 fn install_signal_handlers() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = forward_signal_handler as usize;
+        sa.sa_sigaction = forward_signal_handler as *const () as usize;
         sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
 

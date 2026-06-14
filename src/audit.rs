@@ -121,6 +121,7 @@ pub enum AuditEvent {
         clone_ns_filter: bool,
         clone3_enosys: bool,
         execveat_filter: bool,
+        kill_filter: bool,
         allow_exec: bool,
     },
 

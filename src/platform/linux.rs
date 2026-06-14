@@ -231,9 +231,9 @@ impl Sandbox for Linux {
         let mut command = if cfg.profile.use_netns {
             let mut c = Command::new("unshare");
             if dns_capture_active && use_wrapper {
-                c.args(["--user", "--net", "--mount", "--map-current-user", "--"]);
+                c.args(["--user", "--net", "--mount", "--map-root-user", "--"]);
             } else {
-                c.args(["--user", "--net", "--map-current-user", "--"]);
+                c.args(["--user", "--net", "--map-root-user", "--"]);
             }
             c.arg(&actual_cmd);
             c.args(&actual_args);
@@ -250,7 +250,7 @@ impl Sandbox for Linux {
             // PID namespace without network namespace: need a user
             // namespace for unprivileged unshare(CLONE_NEWPID).
             let mut c = Command::new("unshare");
-            c.args(["--user", "--map-current-user", "--"]);
+            c.args(["--user", "--map-root-user", "--"]);
             c.arg(&actual_cmd);
             c.args(&actual_args);
             if let Some(ref ctx) = audit_ctx {
@@ -557,6 +557,92 @@ impl Sandbox for Linux {
             None
         };
 
+        // ── Create cgroup ──────────────────────────────────────────
+        let limits = CgroupLimits {
+            memory_max_mb: cfg.profile.max_memory_mb,
+            pids_max: cfg.profile.max_pids,
+            cpu_max_pct: cfg.profile.max_cpu_pct,
+            pids_overhead: (if cfg.profile.use_pidns { 1 } else { 0 })
+                + (if cfg.profile.use_netns { 1 } else { 0 }),
+        };
+
+        let mut cgroup_path = None;
+        if let Some(ref mgr) = self.cgroup_mgr {
+            if limits.has_limits() {
+                match mgr.create(&cfg.task_id, &limits) {
+                    Ok(result) => {
+                        if !result.swap_disabled {
+                            log::warn!("cgroup: memory.swap.max could not be set");
+                        }
+                        if let Some(ref ctx) = audit_ctx {
+                            ctx.emit(AuditEvent::LayerApplied {
+                                timestamp: ctx.timestamp(),
+                                layer: SandboxLayer::Cgroup,
+                                detail: Some(LayerDetail::Cgroup {
+                                    path: sanitize_audit_string(&result.path.to_string_lossy()),
+                                    swap_disabled: result.swap_disabled,
+                                }),
+                            })?;
+                        }
+                        applied_layers.push(SandboxLayer::Cgroup);
+                        cgroup_path = Some(result.path);
+                    }
+                    Err(e) => {
+                        if limits.has_limits() {
+                            return Err(Error::Cgroup(format!(
+                                "resource limits requested but cgroup creation failed: {e}"
+                            )));
+                        }
+                        log::warn!(
+                            "cgroup creation failed: {e} (no limits configured, continuing)"
+                        );
+                        if let Some(ref ctx) = audit_ctx {
+                            ctx.emit(AuditEvent::LayerSkipped {
+                                timestamp: ctx.timestamp(),
+                                layer: SandboxLayer::Cgroup,
+                                reason: SkipReason::PartialFailure(sanitize_audit_string(
+                                    &format!("{e}"),
+                                )),
+                            })?;
+                        }
+                        skipped_layers.push(SandboxLayer::Cgroup);
+                    }
+                }
+            }
+        } else if limits.has_limits() {
+            return Err(Error::Cgroup(format!(
+                "resource limits requested (memory={}MB, pids={}) but cgroups unavailable",
+                cfg.profile.max_memory_mb, cfg.profile.max_pids
+            )));
+        }
+
+        // ── Cgroup sync pipe ──────────────────────────────────────
+        // When a cgroup was successfully created, create a parent→child
+        // pipe so the wrapper blocks until the parent has added the PID
+        // to the cgroup. This closes the race window where the child
+        // runs without cgroup limits between spawn and add_pid.
+        let cgroup_sync_pipe = if cgroup_path.is_some() {
+            let mut fds = [0i32; 2];
+            // Both ends created with O_CLOEXEC to avoid leaking the
+            // write end if another thread forks between pipe2 and
+            // fcntl. The read end's CLOEXEC is cleared by remap_fds
+            // when it's placed in the fds_to_inherit array.
+            let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            if ret == 0 {
+                let target_fd = 3 + fds_to_inherit.len() as i32;
+                fds_to_inherit.push(fds[0]);
+                command.env("ARAPUCA_CGROUP_SYNC_FD", target_fd.to_string());
+                pipe_guard.push(fds[0]);
+                pipe_guard.push(fds[1]);
+                Some((fds[0], fds[1]))
+            } else {
+                log::warn!("cgroup sync pipe creation failed, continuing without");
+                None
+            }
+        } else {
+            None
+        };
+
         // ── Emit pre_exec layer events from parent ─────────────────
         // pre_exec is async-signal-safe — no AuditContext allowed inside.
         // We emit from the parent with the semantic "will be applied."
@@ -744,96 +830,11 @@ impl Sandbox for Linux {
                     clone_ns_filter: seccomp.clone_ns_filter,
                     clone3_enosys: seccomp.clone3_enosys,
                     execveat_filter: seccomp.execveat_filter,
+                    kill_filter: seccomp.kill_filter,
                     allow_exec: cfg.profile.allow_exec,
                 })?;
             }
         }
-
-        // ── Create cgroup ──────────────────────────────────────────
-        let limits = CgroupLimits {
-            memory_max_mb: cfg.profile.max_memory_mb,
-            pids_max: cfg.profile.max_pids,
-            cpu_max_pct: cfg.profile.max_cpu_pct,
-            pids_overhead: (if cfg.profile.use_pidns { 1 } else { 0 })
-                + (if cfg.profile.use_netns { 1 } else { 0 }),
-        };
-
-        let mut cgroup_path = None;
-        if let Some(ref mgr) = self.cgroup_mgr {
-            if limits.has_limits() {
-                match mgr.create(&cfg.task_id, &limits) {
-                    Ok(result) => {
-                        if !result.swap_disabled {
-                            log::warn!("cgroup: memory.swap.max could not be set");
-                        }
-                        if let Some(ref ctx) = audit_ctx {
-                            ctx.emit(AuditEvent::LayerApplied {
-                                timestamp: ctx.timestamp(),
-                                layer: SandboxLayer::Cgroup,
-                                detail: Some(LayerDetail::Cgroup {
-                                    path: sanitize_audit_string(&result.path.to_string_lossy()),
-                                    swap_disabled: result.swap_disabled,
-                                }),
-                            })?;
-                        }
-                        applied_layers.push(SandboxLayer::Cgroup);
-                        cgroup_path = Some(result.path);
-                    }
-                    Err(e) => {
-                        if limits.has_limits() {
-                            return Err(Error::Cgroup(format!(
-                                "resource limits requested but cgroup creation failed: {e}"
-                            )));
-                        }
-                        log::warn!(
-                            "cgroup creation failed: {e} (no limits configured, continuing)"
-                        );
-                        if let Some(ref ctx) = audit_ctx {
-                            ctx.emit(AuditEvent::LayerSkipped {
-                                timestamp: ctx.timestamp(),
-                                layer: SandboxLayer::Cgroup,
-                                reason: SkipReason::PartialFailure(sanitize_audit_string(
-                                    &format!("{e}"),
-                                )),
-                            })?;
-                        }
-                        skipped_layers.push(SandboxLayer::Cgroup);
-                    }
-                }
-            }
-        } else if limits.has_limits() {
-            return Err(Error::Cgroup(format!(
-                "resource limits requested (memory={}MB, pids={}) but cgroups unavailable",
-                cfg.profile.max_memory_mb, cfg.profile.max_pids
-            )));
-        }
-
-        // ── Cgroup sync pipe ──────────────────────────────────────
-        // When a cgroup was successfully created, create a parent→child
-        // pipe so the wrapper blocks until the parent has added the PID
-        // to the cgroup. This closes the race window where the child
-        // runs without cgroup limits between spawn and add_pid.
-        let cgroup_sync_pipe = if cgroup_path.is_some() {
-            let mut fds = [0i32; 2];
-            // Both ends created with O_CLOEXEC to avoid leaking the
-            // write end if another thread forks between pipe2 and
-            // fcntl. The read end's CLOEXEC is cleared by remap_fds
-            // when it's placed in the fds_to_inherit array.
-            let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-            if ret == 0 {
-                let target_fd = 3 + fds_to_inherit.len() as i32;
-                fds_to_inherit.push(fds[0]);
-                command.env("ARAPUCA_CGROUP_SYNC_FD", target_fd.to_string());
-                pipe_guard.push(fds[0]);
-                pipe_guard.push(fds[1]);
-                Some((fds[0], fds[1]))
-            } else {
-                log::warn!("cgroup sync pipe creation failed, continuing without");
-                None
-            }
-        } else {
-            None
-        };
 
         // ── Emit SandboxReady ──────────────────────────────────────
         if let Some(ref ctx) = audit_ctx {
@@ -850,7 +851,7 @@ impl Sandbox for Linux {
         // cleanup on success).
         pipe_guard.defuse();
 
-        let child = command.spawn().map_err(|e| {
+        let mut child = command.spawn().map_err(|e| {
             if let Some(ref ctx) = audit_ctx {
                 let _ = ctx.emit(AuditEvent::LayerFailed {
                     timestamp: ctx.timestamp(),
