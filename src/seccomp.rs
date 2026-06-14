@@ -419,7 +419,7 @@ pub(crate) fn summary(profile: &crate::SeccompProfile) -> SeccompSummary {
         },
         crate::SeccompProfile::Baseline => SeccompSummary {
             tier1_kill_count: baseline_kill_syscalls().len(),
-            tier2_eperm_count: 0,
+            tier2_eperm_count: 2, // tkill + perf_event_open
             socket_filter: false,
             prctl_filter: true,
             clone_ns_filter: true,
