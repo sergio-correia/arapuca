@@ -904,6 +904,21 @@ impl Sandbox for Linux {
             Error::Process(format!("start sandboxed process: {e}"))
         })?;
 
+        // ── Open pidfd for race-free signaling ────────────────────
+        let mut pidfd: Option<std::os::unix::io::OwnedFd> = {
+            let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as i32, 0) };
+            if ret >= 0 {
+                Some(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(ret as i32) })
+            } else {
+                log::warn!(
+                    "pidfd_open failed: {} (falling back to kill)",
+                    std::io::Error::last_os_error()
+                );
+                None
+            }
+        };
+        let mut stored_target_pid: Option<u32> = None;
+
         // ── Close PTY slave in parent ──────────────────────────────
         #[cfg(unix)]
         if let Some(s) = pty_slave_fd {
@@ -985,11 +1000,32 @@ impl Sandbox for Linux {
         if let Some((read_fd, write_fd)) = pid_report_pipe {
             unsafe { libc::close(write_fd) };
             let mut buf = [0u8; 4];
-            let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 4) };
+            let n = loop {
+                let ret = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 4) };
+                if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break ret;
+                }
+            };
             unsafe { libc::close(read_fd) };
             if n == 4 {
                 let target_pid = i32::from_le_bytes(buf);
-                log::debug!("pidns: target host PID = {target_pid}");
+                if target_pid > 0 {
+                    log::debug!("pidns: target host PID = {target_pid}");
+                    let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, target_pid, 0) };
+                    if ret >= 0 {
+                        pidfd =
+                            Some(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(ret as i32) });
+                    } else {
+                        log::warn!(
+                            "pidns: pidfd_open for target failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                        pidfd = None;
+                    }
+                    stored_target_pid = Some(target_pid as u32);
+                } else {
+                    log::warn!("pidns: invalid target PID from report pipe: {target_pid}");
+                }
             } else {
                 log::warn!("pidns: failed to read target PID from report pipe");
             }
@@ -1008,7 +1044,7 @@ impl Sandbox for Linux {
         if let Some(ref ctx) = audit_ctx {
             ctx.emit(AuditEvent::ProcessStarted {
                 timestamp: ctx.timestamp(),
-                pid: child.id(),
+                pid: stored_target_pid.unwrap_or(child.id()),
             })?;
         }
 
@@ -1018,8 +1054,8 @@ impl Sandbox for Linux {
             cgroup_path,
             cgroup_mgr: self.cgroup_mgr.clone(),
             dns_audit_pipe: dns_audit_read_fd,
-            pidfd: None,
-            target_pid: None,
+            pidfd,
+            target_pid: stored_target_pid,
             waited: false,
             #[cfg(feature = "microvm")]
             passt: None,

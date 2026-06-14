@@ -90,8 +90,15 @@ pub struct Process {
 
 impl Process {
     /// Get the PID of the sandboxed process.
+    ///
+    /// When PID namespace isolation is active, returns the target's
+    /// host PID (not the wrapper/relay PID).
     #[cfg(not(windows))]
     pub fn pid(&self) -> u32 {
+        #[cfg(target_os = "linux")]
+        if let Some(tp) = self.target_pid {
+            return tp;
+        }
         match &self.child {
             ChildHandle::Managed(c) => c.id(),
             ChildHandle::Forked(pid) => *pid,

@@ -67,7 +67,17 @@ fn parent_relay(
     dns_audit_fd: Option<i32>,
     pid_report_fd: Option<i32>,
 ) -> ! {
-    // 1. Write child's host PID to PID report pipe.
+    // 1. Hold a pidfd to prevent the kernel from recycling the
+    // child's PID while the orchestrator reads the report pipe and
+    // opens its own pidfd. Opened BEFORE publishing the PID so the
+    // guard is in place before anyone can learn the PID. The raw FD
+    // is intentionally leaked — it closes at _exit.
+    let _pidfd_guard = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) };
+    if _pidfd_guard < 0 {
+        write_stderr("arapuca: pidns: pidfd_open for TOCTOU guard failed\n");
+    }
+
+    // 1b. Write child's host PID to PID report pipe.
     if let Some(fd) = pid_report_fd {
         let pid_bytes = child_pid.to_le_bytes();
         let _ = unsafe {
