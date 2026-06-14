@@ -646,6 +646,7 @@ impl Sandbox for Darwin {
         Ok(Process {
             child: crate::process::ChildHandle::Managed(child),
             tmp_dir: tmp_guard.defuse(),
+            waited: false,
             pty_master: pty_master_fd.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
             launch_timestamp: if capture_denials {
                 Some(pre_spawn_time)

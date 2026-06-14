@@ -356,6 +356,7 @@ impl Sandbox for Windows {
             process_handle,
             process_id: pi.dwProcessId,
             tmp_dir,
+            waited: false,
             job_handle: Some(job_handle),
             container_name: container_name_owned,
             saved_dacls,

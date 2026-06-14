@@ -40,6 +40,19 @@ pub struct Process {
     /// DNS audit pipe read end. Read in wait() after child exits.
     #[cfg(target_os = "linux")]
     pub(crate) dns_audit_pipe: Option<std::os::unix::io::OwnedFd>,
+    /// pidfd for the sandboxed process (Linux 5.3+). Enables
+    /// race-free signaling via pidfd_send_signal. None on older
+    /// kernels or non-Linux platforms.
+    #[cfg(target_os = "linux")]
+    pub(crate) pidfd: Option<std::os::unix::io::OwnedFd>,
+    /// Host PID of the actual target when PID namespace is active.
+    /// Without pidns, this is None and pid() returns child.id().
+    #[cfg(target_os = "linux")]
+    pub(crate) target_pid: Option<u32>,
+    /// Set to true after wait() successfully reaps the child.
+    /// Guards signal() against PID-recycling races on the kill()
+    /// fallback path.
+    pub(crate) waited: bool,
     /// Launch timestamp for macOS Seatbelt denial log querying.
     #[cfg(target_os = "macos")]
     pub(crate) launch_timestamp: Option<std::time::SystemTime>,
@@ -108,6 +121,9 @@ impl Process {
     /// Wait for the process to exit and return the exit status.
     #[cfg(not(windows))]
     pub fn wait(&mut self) -> crate::Result<std::process::ExitStatus> {
+        if self.waited {
+            return Err(crate::Error::Process("process already waited".into()));
+        }
         let pid = self.pid();
         let status = match &mut self.child {
             ChildHandle::Managed(c) => c
@@ -130,6 +146,7 @@ impl Process {
                 std::process::ExitStatus::from_raw(wstatus)
             }
         };
+        self.waited = true;
 
         // Read blocked-network audit data before emitting
         // ProcessExited, so NetworkBlocked events appear before
@@ -176,6 +193,9 @@ impl Process {
     /// Wait for the process to exit and return the exit status.
     #[cfg(windows)]
     pub fn wait(&mut self) -> crate::Result<std::process::ExitStatus> {
+        if self.waited {
+            return Err(crate::Error::Process("process already waited".into()));
+        }
         use std::os::windows::io::AsRawHandle;
         use std::os::windows::process::ExitStatusExt;
         use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED};
@@ -223,6 +243,7 @@ impl Process {
             }
         }
 
+        self.waited = true;
         Ok(status)
     }
 
@@ -656,6 +677,11 @@ mod tests {
                 cgroup_mgr: None,
                 #[cfg(target_os = "linux")]
                 dns_audit_pipe: None,
+                #[cfg(target_os = "linux")]
+                pidfd: None,
+                #[cfg(target_os = "linux")]
+                target_pid: None,
+                waited: false,
                 #[cfg(target_os = "macos")]
                 launch_timestamp: None,
                 #[cfg(all(target_os = "linux", feature = "microvm"))]
@@ -749,6 +775,9 @@ mod tests {
             cgroup_path: None,
             cgroup_mgr: None,
             dns_audit_pipe: Some(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(pipe_read) }),
+            pidfd: None,
+            target_pid: None,
+            waited: false,
             #[cfg(target_os = "macos")]
             launch_timestamp: None,
             #[cfg(all(target_os = "linux", feature = "microvm"))]

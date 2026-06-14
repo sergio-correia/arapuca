@@ -446,6 +446,11 @@ fn launch_vm(
         cgroup_mgr: None,
         #[cfg(target_os = "linux")]
         dns_audit_pipe: None,
+        #[cfg(target_os = "linux")]
+        pidfd: None,
+        #[cfg(target_os = "linux")]
+        target_pid: None,
+        waited: false,
         passt: None,
         pty_master: None,
         audit_ctx,

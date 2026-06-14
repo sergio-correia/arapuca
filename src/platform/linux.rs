@@ -1018,6 +1018,9 @@ impl Sandbox for Linux {
             cgroup_path,
             cgroup_mgr: self.cgroup_mgr.clone(),
             dns_audit_pipe: dns_audit_read_fd,
+            pidfd: None,
+            target_pid: None,
+            waited: false,
             #[cfg(feature = "microvm")]
             passt: None,
             pty_master: pty_master_fd.map(|fd| {
