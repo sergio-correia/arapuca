@@ -17,15 +17,26 @@ be bypassed from userspace.
 
 - **Landlock** filesystem restrictions (ABI v1-v6) — allowlist of
   readable and writable paths
-- **Seccomp BPF** syscall filtering — tiered deny list (KILL for
-  ptrace/mount/namespace manipulation, EPERM for symlinks/network)
+- **Seccomp BPF** syscall filtering — three-tier deny list (KILL for
+  escape-critical syscalls, EPERM for probed/filtered syscalls, ENOSYS
+  for clone3 fallback). Two profiles: strict (untrusted code) and
+  baseline (trusted-but-isolated applications)
 - **Cgroups v2** resource limits — memory, CPU, PIDs, OOM detection,
   usage telemetry
 - **Network namespace** isolation — CLONE_NEWUSER + CLONE_NEWNET
   blocks all direct network access; automatic **proxy bridge** relays
   HTTP traffic through a Unix domain socket so standard tools
-  (curl, git, npm) work via HTTP_PROXY
-- **Micro-VM isolation** (optional, `microvm` feature) — runs the
+  (curl, git, npm) work via HTTP_PROXY. `--deny-network` mode
+  captures DNS queries as audit events and responds with NXDOMAIN
+- **PID namespace** isolation — `CLONE_NEWPID` prevents the sandboxed
+  process from seeing or signaling host processes. Automatic when
+  network namespace is active; opt out with `--no-pid-ns`
+- **pidfd-based signaling** — `Process::signal()` uses
+  `pidfd_send_signal` (Linux 5.3+) for race-free signal delivery,
+  preventing PID recycling races. Falls back to `kill()` on older
+  kernels
+- **Micro-VM isolation** *(experimental)* (optional, `microvm`
+  feature) — runs the
   subprocess inside a lightweight KVM virtual machine via libkrun.
   Strongest isolation: separate kernel, address space, and device
   model. Includes image management (`arapuca image pull/list/rm/setup`),
@@ -37,7 +48,7 @@ be bypassed from userspace.
   pre-installed), cloud-init guest configuration with `write_files`
   support, COW overlays, and optional networking via passt with
   `--no-map-gw` to prevent guest access to host localhost.
-  **Persistent VMs** (`vm start/exec/stop`) — long-running VMs with
+  **Persistent VMs** *(experimental)* (`vm start/exec/stop`) — long-running VMs with
   interactive access via vsock, nonce-based authentication, TTY
   support with raw terminal mode and SIGWINCH forwarding, persistent
   overlay disks, and a guest agent injected via read-only virtiofs share
@@ -45,7 +56,10 @@ be bypassed from userspace.
 ### macOS
 
 - **Seatbelt** (`sandbox-exec`) — deny-default profile with explicit
-  allows for filesystem, exec, and Unix domain sockets
+  allows for filesystem, exec, and Unix domain sockets. Three network
+  modes: allowed (baseline), proxy-only (when a CONNECT proxy is
+  configured — blocks all TCP, allows only UDS to proxy), and denied
+  (strict)
 - **Path validation** — strict character allowlist prevents Seatbelt
   profile injection attacks
 - **Memory monitor** — best-effort RSS polling (500ms) with SIGKILL
@@ -180,7 +194,9 @@ arapuca run \
 | `--pids N` | Max number of PIDs |
 | `--task-id NAME` | Identifier for cgroup and audit |
 | `--allow-host H:P` | Allow HTTPS to host:port or `*.domain:port` via CONNECT proxy (Linux) |
+| `--deny-network` | Block all network; capture DNS queries as audit events (Linux) |
 | `--seccomp MODE` | Seccomp profile: `strict` (default) or `baseline` |
+| `--no-pid-ns` | Disable PID namespace isolation |
 | `-t, --tty` | Allocate a PTY for interactive programs |
 
 ### Micro-VM (requires `microvm` feature)
@@ -420,19 +436,31 @@ case.
 
 ### Seccomp Filter (Linux only)
 
-Two tiers with different responses:
+Three tiers with different responses (strict profile):
 
-**Tier 1 — KILL_PROCESS** (no legitimate use): `ptrace`, `mount`,
-`chroot`, `unshare`, `setns`, `clone3`, `memfd_create`, `io_uring_*`,
-`bpf`, `kexec_*`, kernel module syscalls, new mount API (`fsopen`,
-`fsmount`, `move_mount`, `open_tree`, `mount_setattr`).
+**Tier 1 — KILL_PROCESS** (49 syscalls, no legitimate use):
+`ptrace`, `mount`, `umount2`, `chroot`, `pivot_root`, `unshare`,
+`setns`, `personality`, `memfd_create`, `memfd_secret`, `io_uring_*`,
+`bpf`, `kexec_*`, `reboot`, kernel module syscalls, new mount API
+(`fsopen`, `fsmount`, `fspick`, `fsconfig`, `move_mount`, `open_tree`,
+`mount_setattr`), `pidfd_*`, `process_vm_readv/writev`,
+`process_madvise`, `userfaultfd`, `kcmp`, `landlock_*`, `swapon/off`,
+`acct`, `add_key/request_key/keyctl`, `quotactl*`, LSM self-attr.
 
-**Tier 2 — EPERM** (may be probed by libraries): `symlink`, `link`,
-`socket(AF_INET)`, `socket(AF_INET6)`, `perf_event_open`,
-`prctl(PR_SET_PDEATHSIG, 0)`, `prctl(PR_SET_DUMPABLE, 1)`.
+**Tier 2 — EPERM** (argument-filtered): `symlink`, `link`,
+`socket(AF_INET|AF_INET6)`, `perf_event_open`,
+`prctl(PR_SET_PDEATHSIG)`, `prctl(PR_SET_DUMPABLE, non-zero)`,
+`execveat(AT_EMPTY_PATH)`, `ioctl(TIOCSTI)`, `kill(pid <= 0)`,
+`tkill`, `clone(CLONE_NEW*)`.
 
-`socket(AF_UNIX)` is explicitly **allowed** — needed for IPC with the
-host (JSON-RPC, LLM proxy).
+**Tier 3 — ENOSYS** (force fallback): `clone3` returns ENOSYS so
+glibc/Go falls back to `clone(2)` where namespace flags can be
+inspected by BPF.
+
+`socket(AF_UNIX)` is explicitly **allowed** — needed for IPC with
+the host (JSON-RPC, LLM proxy). The **baseline** profile blocks
+only escape-critical syscalls (Tier 1) and uses EPERM for
+argument-filtered rules, allowing network sockets, memfd, etc.
 
 ### Network Model
 
