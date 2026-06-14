@@ -719,13 +719,15 @@ fn run_subcommand(args: &[String]) {
     // Merge default paths with user-specified paths.
     let (mut default_read, mut default_write) = arapuca::env::default_sandbox_paths();
 
-    // Baseline seccomp: add /proc and /sys for runtimes that need them
-    // (Bun/JSC reads /proc/self/maps, /proc/self/cgroup, /proc/version,
-    // /sys/devices/system/cpu/online, etc. during allocator init).
-    // Strict profile intentionally excludes these — see env.rs docs.
+    // Baseline seccomp: add /proc and specific /sys subtrees for
+    // runtimes that need them (Bun/JSC reads /proc/self/maps,
+    // /proc/self/cgroup, /proc/version, /sys/devices/system/cpu/online
+    // during allocator init). Using /sys/devices/system/cpu instead
+    // of /sys avoids conflicting with reject_cgroup_paths (which
+    // rejects ancestors of /sys/fs/cgroup).
     if seccomp_profile == arapuca::SeccompProfile::Baseline {
         default_read.push(PathBuf::from("/proc"));
-        default_read.push(PathBuf::from("/sys"));
+        default_read.push(PathBuf::from("/sys/devices/system/cpu"));
     }
 
     default_read.extend(read_only_paths);
