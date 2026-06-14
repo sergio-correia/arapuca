@@ -596,21 +596,32 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
     // A single stacked filter reduces BPF evaluation overhead.
     let mut eperm_rules: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
 
-    // prctl(PR_SET_PDEATHSIG, *)
+    // prctl(PR_SET_PDEATHSIG, *) and prctl(PR_SET_DUMPABLE, non-zero)
+    let baseline_prctl_pdeathsig = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::PR_SET_PDEATHSIG as u64,
+        )
+        .map_err(|e| Error::Seccomp(format!("baseline prctl condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("baseline prctl rule: {e}")))?;
+    let baseline_prctl_dumpable = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::PR_SET_DUMPABLE as u64,
+        )
+        .map_err(|e| Error::Seccomp(format!("baseline prctl condition: {e}")))?,
+        SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0u64)
+            .map_err(|e| Error::Seccomp(format!("baseline prctl arg condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("baseline prctl rule: {e}")))?;
     eperm_rules.insert(
         libc::SYS_prctl,
-        vec![
-            SeccompRule::new(vec![
-                SeccompCondition::new(
-                    0,
-                    SeccompCmpArgLen::Dword,
-                    SeccompCmpOp::Eq,
-                    libc::PR_SET_PDEATHSIG as u64,
-                )
-                .map_err(|e| Error::Seccomp(format!("baseline prctl condition: {e}")))?,
-            ])
-            .map_err(|e| Error::Seccomp(format!("baseline prctl rule: {e}")))?,
-        ],
+        vec![baseline_prctl_pdeathsig, baseline_prctl_dumpable],
     );
 
     // execveat with AT_EMPTY_PATH (fileless execution)
