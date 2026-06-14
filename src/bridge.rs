@@ -263,6 +263,16 @@ pub(crate) unsafe fn close_fds_except(keep: &[i32]) {
         for fd in fds_to_close {
             libc::close(fd);
         }
+        return;
+    }
+
+    // Last resort: brute-force close from 3 to sysconf(_SC_OPEN_MAX).
+    let max_fd = libc::sysconf(libc::_SC_OPEN_MAX) as i32;
+    let limit = max_fd.min(4096);
+    for fd in 3..limit {
+        if !keep.contains(&fd) {
+            libc::close(fd);
+        }
     }
 }
 
