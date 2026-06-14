@@ -919,4 +919,82 @@ mod tests {
             panic!("expected NetworkBlocked");
         }
     }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn signal_after_wait_without_pidfd_returns_error() {
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("failed to spawn true");
+        let mut process = Process {
+            child: ChildHandle::Managed(child),
+            tmp_dir: crate::env::make_tmp_dir("signal-test").unwrap(),
+            #[cfg(target_os = "linux")]
+            cgroup_path: None,
+            #[cfg(target_os = "linux")]
+            cgroup_mgr: None,
+            #[cfg(target_os = "linux")]
+            dns_audit_pipe: None,
+            #[cfg(target_os = "linux")]
+            pidfd: None,
+            #[cfg(target_os = "linux")]
+            target_pid: None,
+            waited: false,
+            #[cfg(target_os = "macos")]
+            launch_timestamp: None,
+            #[cfg(all(target_os = "linux", feature = "microvm"))]
+            passt: None,
+            pty_master: None,
+            audit_ctx: None,
+            final_stats: None,
+        };
+        let _ = process.wait();
+        let result = process.signal(libc::SIGTERM);
+        assert!(
+            result.is_err(),
+            "signal after wait without pidfd should fail"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot signal after wait"),
+            "expected 'cannot signal after wait', got: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn double_wait_returns_error() {
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("failed to spawn true");
+        let mut process = Process {
+            child: ChildHandle::Managed(child),
+            tmp_dir: crate::env::make_tmp_dir("double-wait-test").unwrap(),
+            #[cfg(target_os = "linux")]
+            cgroup_path: None,
+            #[cfg(target_os = "linux")]
+            cgroup_mgr: None,
+            #[cfg(target_os = "linux")]
+            dns_audit_pipe: None,
+            #[cfg(target_os = "linux")]
+            pidfd: None,
+            #[cfg(target_os = "linux")]
+            target_pid: None,
+            waited: false,
+            #[cfg(target_os = "macos")]
+            launch_timestamp: None,
+            #[cfg(all(target_os = "linux", feature = "microvm"))]
+            passt: None,
+            pty_master: None,
+            audit_ctx: None,
+            final_stats: None,
+        };
+        assert!(process.wait().is_ok());
+        let result = process.wait();
+        assert!(result.is_err(), "double wait should fail");
+        assert!(
+            result.unwrap_err().to_string().contains("already waited"),
+            "expected 'already waited' error"
+        );
+    }
 }
