@@ -29,14 +29,15 @@ use crate::{Error, Profile};
 /// - Uses `CompatLevel::BestEffort` so the strictest possible restrictions
 ///   are applied for the running kernel's ABI version.
 /// - Fail-closed: returns error if the ruleset is `NotEnforced`.
+///   When both path lists are empty, applies a deny-all filesystem
+///   policy (ruleset with zero rules) rather than skipping Landlock.
 #[must_use = "landlock errors must be handled — the process may be unsandboxed"]
 pub fn apply(profile: &Profile) -> crate::Result<()> {
     let read_paths = &profile.read_paths;
     let write_paths = &profile.write_paths;
 
     if read_paths.is_empty() && write_paths.is_empty() {
-        log::info!("landlock: no paths configured, skipping filesystem restrictions");
-        return Ok(());
+        log::warn!("landlock: no paths configured, applying deny-all filesystem policy");
     }
 
     // Use the highest ABI we fully support. The crate handles
