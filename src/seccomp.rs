@@ -466,7 +466,22 @@ fn baseline_kill_syscalls() -> Vec<i64> {
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
         libc::SYS_memfd_create,
+        libc::SYS_pidfd_open,
+        libc::SYS_pidfd_getfd,
         libc::SYS_pidfd_send_signal,
+        libc::SYS_kcmp,
+        libc::SYS_process_madvise,
+        libc::SYS_memfd_secret,
+        libc::SYS_quotactl,
+        libc::SYS_quotactl_fd,
+        libc::SYS_swapon,
+        libc::SYS_swapoff,
+        libc::SYS_acct,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_keyctl,
+        SYS_LSM_GET_SELF_ATTR,
+        SYS_LSM_LIST_MODULES,
     ]
 }
 
