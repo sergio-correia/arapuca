@@ -437,6 +437,18 @@ fn launch_vm(
         });
     }
 
+    // Open pidfd for the forked child (race-free — direct parent,
+    // child is guaranteed alive immediately after fork).
+    #[cfg(target_os = "linux")]
+    let pidfd = {
+        let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) };
+        if ret >= 0 {
+            Some(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(ret as i32) })
+        } else {
+            None
+        }
+    };
+
     Ok(Process {
         child: crate::process::ChildHandle::Forked(child_pid as u32),
         tmp_dir: tmp_dir.to_path_buf(),
@@ -447,7 +459,7 @@ fn launch_vm(
         #[cfg(target_os = "linux")]
         dns_audit_pipe: None,
         #[cfg(target_os = "linux")]
-        pidfd: None,
+        pidfd,
         #[cfg(target_os = "linux")]
         target_pid: None,
         waited: false,
