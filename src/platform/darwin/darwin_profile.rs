@@ -627,4 +627,49 @@ mod tests {
         // Cleanup.
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_generate_profile_proxy_only() {
+        let dir = std::env::temp_dir().join("arapuca-test-profile-proxy");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let data = ProfileData {
+            read_paths: vec!["/home/user/src".into()],
+            write_paths: vec!["/tmp/work".into()],
+            exec_paths: vec![],
+            control_socket: None,
+            llm_socket: Some("/tmp/sock/proxy.sock".into()),
+            allow_network: false,
+        };
+
+        let path = generate_profile(&dir, &data).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        // TCP outbound must be denied.
+        assert!(
+            !content.contains("network-outbound (remote tcp)"),
+            "proxy-only mode must not allow TCP outbound"
+        );
+
+        // UDS to proxy must be allowed.
+        assert!(
+            content.contains(
+                "(allow network-outbound (remote unix-socket (path-literal \"/tmp/sock/proxy.sock\")))"
+            ),
+            "proxy-only mode must allow UDS to proxy socket"
+        );
+
+        // Network Mach services must NOT be present.
+        assert!(
+            !content.contains("com.apple.dnssd.service"),
+            "proxy-only mode must not allow DNS Mach services"
+        );
+        assert!(
+            !content.contains("com.apple.trustd"),
+            "proxy-only mode must not allow TLS Mach services"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

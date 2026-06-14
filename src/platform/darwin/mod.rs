@@ -162,7 +162,9 @@ impl Sandbox for Darwin {
 
         let wrapper = Self::wrapper_path();
         let use_wrapper = wrapper.is_some();
-        let allow_network = cfg.profile.seccomp_profile == crate::SeccompProfile::Baseline;
+        let proxy_mode = cfg.network_proxy_socket.is_some();
+        let allow_network =
+            cfg.profile.seccomp_profile == crate::SeccompProfile::Baseline && !proxy_mode;
 
         let audit_ctx = cfg
             .audit_sink
@@ -210,6 +212,8 @@ impl Sandbox for Darwin {
 
             let seatbelt_detail = if allow_network {
                 "network=allowed"
+            } else if proxy_mode {
+                "network=proxy-only"
             } else {
                 "network=denied"
             };
