@@ -460,7 +460,6 @@ fn baseline_kill_syscalls() -> Vec<i64> {
         libc::SYS_landlock_create_ruleset,
         libc::SYS_landlock_add_rule,
         libc::SYS_landlock_restrict_self,
-        libc::SYS_perf_event_open,
         libc::SYS_userfaultfd,
         SYS_LSM_SET_SELF_ATTR,
         libc::SYS_io_uring_setup,
@@ -557,7 +556,7 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
     let clone_filter = SeccompFilter::new(
         clone_deny.into_iter().collect(),
         SeccompAction::Allow,
-        SeccompAction::KillProcess,
+        SeccompAction::Errno(libc::EPERM as u32),
         arch,
     )
     .map_err(|e| Error::Seccomp(format!("build baseline clone filter: {e}")))?;
@@ -663,6 +662,9 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
 
     // tkill — deprecated, block unconditionally
     eperm_rules.insert(libc::SYS_tkill, vec![]);
+
+    // perf_event_open — may be probed by profiling libraries
+    eperm_rules.insert(libc::SYS_perf_event_open, vec![]);
 
     let eperm_filter = SeccompFilter::new(
         eperm_rules.into_iter().collect(),
