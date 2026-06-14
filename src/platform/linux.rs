@@ -983,9 +983,38 @@ impl Sandbox for Linux {
         if let Some((read_fd, write_fd, _)) = audit_pipe {
             // SAFETY: write_fd is a valid descriptor from pipe().
             unsafe { libc::close(write_fd) };
-            validate_wrapper_audit(read_fd);
+            let wrapper_failed = validate_wrapper_audit(read_fd);
             // SAFETY: read_fd is a valid descriptor from pipe().
             unsafe { libc::close(read_fd) };
+
+            if wrapper_failed {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some((r, w)) = pid_report_pipe {
+                    unsafe {
+                        libc::close(r);
+                        libc::close(w);
+                    }
+                }
+                if let Some((r, w)) = dns_audit_pipe {
+                    unsafe {
+                        libc::close(r);
+                        libc::close(w);
+                    }
+                }
+                #[cfg(unix)]
+                if let Some(m) = pty_master_fd {
+                    unsafe { libc::close(m) };
+                }
+                if let Some(ref path) = cgroup_path {
+                    if let Some(ref mgr) = self.cgroup_mgr {
+                        let _ = mgr.destroy(path);
+                    }
+                }
+                return Err(Error::Process(
+                    "wrapper reported sandbox layer failure".into(),
+                ));
+            }
         }
 
         // ── Read PID report pipe ──────────────────────────────────
@@ -1092,7 +1121,7 @@ impl Sandbox for Linux {
 /// EOF (the wrapper closes the FD before execve) and validate that
 /// all expected layers were applied. Buffer bounded to 64 KiB to
 /// prevent OOM from a compromised wrapper.
-fn validate_wrapper_audit(read_fd: RawFd) {
+fn validate_wrapper_audit(read_fd: RawFd) -> bool {
     const MAX_BUF: usize = 64 * 1024;
     let mut buf = vec![0u8; MAX_BUF];
     let mut total = 0;
@@ -1126,19 +1155,22 @@ fn validate_wrapper_audit(read_fd: RawFd) {
 
     if total == 0 {
         log::warn!("wrapper audit pipe: no events received (wrapper may have crashed)");
-        return;
+        return true;
     }
 
     let text = String::from_utf8_lossy(&buf[..total]);
     let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
     log::info!("wrapper audit: received {} events", lines.len());
 
+    let mut has_failures = false;
     for line in &lines {
         if line.contains(r#""status":"failed""#) {
             log::error!(
                 "wrapper audit: layer failure reported: {}",
                 sanitize_audit_string(line)
             );
+            has_failures = true;
         }
     }
+    has_failures
 }

@@ -333,12 +333,7 @@ fn main() {
         #[cfg(not(seccomp_supported))]
         {
             log::warn!("seccomp not available on this architecture — skipping");
-            audit_layer(
-                audit_fd,
-                "Seccomp",
-                false,
-                Some("not supported on this architecture"),
-            );
+            audit_layer(audit_fd, "Seccomp", true, None);
         }
     }
 

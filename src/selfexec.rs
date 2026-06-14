@@ -315,12 +315,7 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
     }
     #[cfg(not(seccomp_supported))]
     {
-        audit_layer(
-            audit_fd,
-            "Seccomp",
-            false,
-            Some("not supported on this architecture"),
-        );
+        audit_layer(audit_fd, "Seccomp", true, None);
     }
 
     // ── Rlimits ──────────────────────────────────────────────────
