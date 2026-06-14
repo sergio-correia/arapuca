@@ -1614,7 +1614,11 @@ fn fork_connect_proxy(allowed_hosts: &[arapuca::bridge::AllowedHost]) -> (PathBu
                 };
                 if let Err(e) = arapuca::landlock::apply(&proxy_profile) {
                     eprintln!("arapuca: connect proxy: landlock: {e}");
+                    unsafe { libc::_exit(1) };
                 }
+            } else {
+                eprintln!("arapuca: connect proxy: no system paths found for Landlock");
+                unsafe { libc::_exit(1) };
             }
         }
 
