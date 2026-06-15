@@ -829,6 +829,7 @@ impl Sandbox for Linux {
                     prctl_filter: seccomp.prctl_filter,
                     clone_ns_filter: seccomp.clone_ns_filter,
                     clone3_enosys: seccomp.clone3_enosys,
+                    io_uring_enosys: seccomp.io_uring_enosys,
                     execveat_filter: seccomp.execveat_filter,
                     kill_filter: seccomp.kill_filter,
                     allow_exec: cfg.profile.allow_exec,

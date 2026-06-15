@@ -120,6 +120,7 @@ pub enum AuditEvent {
         prctl_filter: bool,
         clone_ns_filter: bool,
         clone3_enosys: bool,
+        io_uring_enosys: bool,
         execveat_filter: bool,
         kill_filter: bool,
         allow_exec: bool,

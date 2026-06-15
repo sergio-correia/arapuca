@@ -414,6 +414,7 @@ pub(crate) struct SeccompSummary {
     pub prctl_filter: bool,
     pub clone_ns_filter: bool,
     pub clone3_enosys: bool,
+    pub io_uring_enosys: bool,
     pub execveat_filter: bool,
     pub kill_filter: bool,
 }
@@ -427,6 +428,7 @@ pub(crate) fn summary(profile: &crate::SeccompProfile) -> SeccompSummary {
             prctl_filter: true,
             clone_ns_filter: true,
             clone3_enosys: true,
+            io_uring_enosys: true,
             execveat_filter: true,
             kill_filter: true,
         },
@@ -437,6 +439,7 @@ pub(crate) fn summary(profile: &crate::SeccompProfile) -> SeccompSummary {
             prctl_filter: true,
             clone_ns_filter: true,
             clone3_enosys: true,
+            io_uring_enosys: true,
             execveat_filter: true,
             kill_filter: true,
         },
@@ -594,27 +597,30 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
                 Error::Seccomp(format!("compile baseline clone filter: {e}"))
             })?;
 
-    // clone3 ENOSYS filter (same pattern as strict mode).
-    let mut clone3_enosys: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
-    clone3_enosys.insert(libc::SYS_clone3, vec![]);
-    let clone3_filter = SeccompFilter::new(
-        clone3_enosys.into_iter().collect(),
+    // ENOSYS filter for clone3 and io_uring (same pattern as strict mode).
+    let mut enosys_rules: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    enosys_rules.insert(libc::SYS_clone3, vec![]);
+    enosys_rules.insert(libc::SYS_io_uring_setup, vec![]);
+    enosys_rules.insert(libc::SYS_io_uring_enter, vec![]);
+    enosys_rules.insert(libc::SYS_io_uring_register, vec![]);
+    let enosys_filter = SeccompFilter::new(
+        enosys_rules.into_iter().collect(),
         SeccompAction::Allow,
         SeccompAction::Errno(libc::ENOSYS as u32),
         arch,
     )
-    .map_err(|e| Error::Seccomp(format!("build baseline clone3 enosys: {e}")))?;
-    let clone3_prog: BpfProgram =
-        clone3_filter
+    .map_err(|e| Error::Seccomp(format!("build baseline enosys filter: {e}")))?;
+    let enosys_prog: BpfProgram =
+        enosys_filter
             .try_into()
             .map_err(|e: seccompiler::BackendError| {
-                Error::Seccomp(format!("compile baseline clone3 enosys: {e}"))
+                Error::Seccomp(format!("compile baseline enosys filter: {e}"))
             })?;
 
     // Install stacked filters: ENOSYS first, then clone deny, then main.
     // Last installed is checked first; most restrictive action wins.
-    seccompiler::apply_filter(&clone3_prog)
-        .map_err(|e| Error::Seccomp(format!("install baseline clone3 enosys: {e}")))?;
+    seccompiler::apply_filter(&enosys_prog)
+        .map_err(|e| Error::Seccomp(format!("install baseline enosys filter: {e}")))?;
     seccompiler::apply_filter(&clone_prog)
         .map_err(|e| Error::Seccomp(format!("install baseline clone filter: {e}")))?;
 
@@ -1325,6 +1331,21 @@ mod tests {
         });
         assert!(exited, "child should exit normally");
         assert_eq!(code, 42, "baseline: PR_SET_PDEATHSIG should return EPERM");
+    }
+
+    #[test]
+    fn baseline_io_uring_returns_enosys() {
+        let (exited, code) = run_in_baseline_child(|| {
+            let ret =
+                unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null::<u8>()) };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if ret < 0 && errno == libc::ENOSYS {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "io_uring_setup should return ENOSYS, not kill");
+        assert_eq!(code, 42, "baseline: io_uring_setup should return ENOSYS");
     }
 
     #[test]
