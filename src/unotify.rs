@@ -326,6 +326,575 @@ pub fn recv_fd(socket_fd: RawFd) -> std::io::Result<RawFd> {
     }
 }
 
+// ─── /proc/<pid>/mem reader ────────────────────────────────────────
+
+/// Read a NUL-terminated string from a target process's memory.
+///
+/// Opens `/proc/<pid>/mem` and reads up to `max_len` bytes at `addr`,
+/// scanning for a NUL terminator. Returns `None` if the process exited,
+/// the address is unmapped, or the read fails for any reason.
+pub fn read_string_from_pid(pid: u32, addr: u64, max_len: usize) -> Option<String> {
+    if addr == 0 {
+        return None;
+    }
+    let mem_path = format!("/proc/{pid}/mem\0");
+    let fd = unsafe { libc::open(mem_path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+
+    let cap = max_len.min(4096);
+    let mut buf = vec![0u8; cap];
+    let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), cap, addr as libc::off_t) };
+    unsafe { libc::close(fd) };
+
+    if n <= 0 {
+        return None;
+    }
+    let n = n as usize;
+
+    // Find NUL terminator.
+    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    String::from_utf8_lossy(&buf[..end]).into_owned().into()
+}
+
+/// Parsed sockaddr information.
+pub struct SockaddrInfo {
+    /// Address family (AF_INET, AF_INET6, etc.).
+    pub family: u16,
+    /// Human-readable destination (e.g., "1.2.3.4:443").
+    pub destination: String,
+    /// Port number.
+    pub port: u16,
+}
+
+/// Result of reading a sockaddr from a target process.
+pub enum SockaddrResult {
+    /// Successfully read an AF_INET or AF_INET6 address.
+    Inet(SockaddrInfo),
+    /// Successfully read the family but it's not INET (AF_UNIX, etc.).
+    NonInet(u16),
+    /// Failed to read the sockaddr (process exited, unmapped, etc.).
+    ReadFailed,
+}
+
+/// Wrapper around `read_sockaddr_from_pid` that returns a three-way result.
+pub fn read_sockaddr(pid: u32, addr: u64, addrlen: u64) -> SockaddrResult {
+    if addr == 0 || addrlen < 2 {
+        return SockaddrResult::ReadFailed;
+    }
+    let mem_path = format!("/proc/{pid}/mem\0");
+    let fd = unsafe { libc::open(mem_path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return SockaddrResult::ReadFailed;
+    }
+
+    let mut family_buf = [0u8; 2];
+    let n = unsafe { libc::pread(fd, family_buf.as_mut_ptr().cast(), 2, addr as libc::off_t) };
+    if n != 2 {
+        unsafe { libc::close(fd) };
+        return SockaddrResult::ReadFailed;
+    }
+    let family = u16::from_ne_bytes(family_buf);
+
+    let result = match family as i32 {
+        libc::AF_INET if addrlen >= std::mem::size_of::<libc::sockaddr_in>() as u64 => {
+            let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let n = unsafe {
+                libc::pread(
+                    fd,
+                    &mut sa as *mut libc::sockaddr_in as *mut libc::c_void,
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                    addr as libc::off_t,
+                )
+            };
+            if n == std::mem::size_of::<libc::sockaddr_in>() as isize {
+                let port = u16::from_be(sa.sin_port);
+                let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+                SockaddrResult::Inet(SockaddrInfo {
+                    family,
+                    destination: format!("{ip}:{port}"),
+                    port,
+                })
+            } else {
+                SockaddrResult::ReadFailed
+            }
+        }
+        libc::AF_INET6 if addrlen >= std::mem::size_of::<libc::sockaddr_in6>() as u64 => {
+            let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            let n = unsafe {
+                libc::pread(
+                    fd,
+                    &mut sa as *mut libc::sockaddr_in6 as *mut libc::c_void,
+                    std::mem::size_of::<libc::sockaddr_in6>(),
+                    addr as libc::off_t,
+                )
+            };
+            if n == std::mem::size_of::<libc::sockaddr_in6>() as isize {
+                let port = u16::from_be(sa.sin6_port);
+                let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
+                SockaddrResult::Inet(SockaddrInfo {
+                    family,
+                    destination: format!("[{ip}]:{port}"),
+                    port,
+                })
+            } else {
+                SockaddrResult::ReadFailed
+            }
+        }
+        libc::AF_INET | libc::AF_INET6 => SockaddrResult::ReadFailed, // addrlen too short
+        _ => SockaddrResult::NonInet(family),
+    };
+
+    unsafe { libc::close(fd) };
+    result
+}
+
+// ─── Notification handler ─────────────────────────────────────────
+
+const SYS_OPENAT2: i64 = 437;
+
+/// Handle a single seccomp notification.
+///
+/// Dispatches by syscall number, reads arguments from `/proc/<pid>/mem`,
+/// writes an NDJSON audit line, and responds with either CONTINUE
+/// (observation) or ECONNREFUSED (network blocking).
+///
+/// Returns `true` if a response was sent, `false` if the notification
+/// was stale (target exited between recv and send).
+pub fn handle_notification(
+    listener_fd: RawFd,
+    notif: &libc::seccomp_notif,
+    audit_fd: RawFd,
+    config: &UnotifyConfig,
+    dropped: &mut u64,
+) -> bool {
+    let pid = notif.pid;
+    let nr = notif.data.nr as i64;
+    let args = &notif.data.args;
+
+    match nr {
+        libc::SYS_openat | SYS_OPENAT2 => {
+            // openat(dirfd, pathname, flags, mode)
+            // openat2(dirfd, pathname, &open_how, size)
+            let path_addr = args[1];
+            let flags = if nr == SYS_OPENAT2 {
+                // open_how.flags is the first field (u64)
+                // Read it from /proc/<pid>/mem at args[2]
+                read_u64_from_pid(pid, args[2]).unwrap_or(0) as u32
+            } else {
+                args[2] as u32
+            };
+            let path = read_string_from_pid(pid, path_addr, 3900).unwrap_or_default();
+            let is_write =
+                flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32 != 0;
+            write_audit_line(
+                audit_fd,
+                dropped,
+                &format!(
+                    "{{\"type\":\"file_access\",\"pid\":{pid},\"path\":\"{}\",\"flags\":{flags},\"is_write\":{is_write}}}",
+                    crate::wrapper::json_escape(&path),
+                ),
+            );
+            respond_continue(listener_fd, notif)
+        }
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_open => {
+            // open(pathname, flags, mode) — x86_64 only
+            let path_addr = args[0];
+            let flags = args[1] as u32;
+            let path = read_string_from_pid(pid, path_addr, 3900).unwrap_or_default();
+            let is_write =
+                flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32 != 0;
+            write_audit_line(
+                audit_fd,
+                dropped,
+                &format!(
+                    "{{\"type\":\"file_access\",\"pid\":{pid},\"path\":\"{}\",\"flags\":{flags},\"is_write\":{is_write}}}",
+                    crate::wrapper::json_escape(&path),
+                ),
+            );
+            respond_continue(listener_fd, notif)
+        }
+        libc::SYS_execve | libc::SYS_execveat => {
+            // execve(pathname, argv, envp) — pathname is arg0
+            // execveat(dirfd, pathname, argv, envp, flags) — pathname is arg1
+            let path_addr = if nr == libc::SYS_execveat {
+                args[1]
+            } else {
+                args[0]
+            };
+            let binary = read_string_from_pid(pid, path_addr, 3900).unwrap_or_default();
+            write_audit_line(
+                audit_fd,
+                dropped,
+                &format!(
+                    "{{\"type\":\"process_spawn\",\"pid\":{pid},\"binary\":\"{}\"}}",
+                    crate::wrapper::json_escape(&binary),
+                ),
+            );
+            respond_continue(listener_fd, notif)
+        }
+        libc::SYS_connect => {
+            // connect(sockfd, addr, addrlen)
+            handle_connect(
+                listener_fd,
+                notif,
+                audit_fd,
+                config,
+                dropped,
+                args[1],
+                args[2],
+            )
+        }
+        libc::SYS_sendto => {
+            // sendto(sockfd, buf, len, flags, dest_addr, addrlen)
+            if args[4] == 0 {
+                // NULL dest_addr: connected socket send, allow through.
+                respond_continue(listener_fd, notif)
+            } else {
+                handle_connect(
+                    listener_fd,
+                    notif,
+                    audit_fd,
+                    config,
+                    dropped,
+                    args[4],
+                    args[5],
+                )
+            }
+        }
+        libc::SYS_sendmsg => {
+            // sendmsg(sockfd, &msghdr, flags)
+            handle_sendmsg(listener_fd, notif, audit_fd, config, dropped, args[1])
+        }
+        libc::SYS_sendmmsg => {
+            // sendmmsg(sockfd, &mmsghdr_vec, vlen, flags)
+            // Validate ALL messages before responding — a single
+            // respond_continue resumes the entire batch.
+            // sizeof(struct mmsghdr) = 64 on LP64 (msghdr=56 + msg_len=4 + pad=4).
+            const MAX_SENDMMSG_INSPECT: u64 = 64;
+            let pid = notif.pid;
+            if args[2] > MAX_SENDMMSG_INSPECT && config.enforce_network {
+                return respond_errno(listener_fd, notif, libc::ECONNREFUSED);
+            }
+            let vlen = args[2].min(MAX_SENDMMSG_INSPECT);
+            const MMSGHDR_SIZE: u64 = 64;
+            let mut block = false;
+            for i in 0..vlen {
+                let msghdr_addr = args[1] + i * MMSGHDR_SIZE;
+                if sendmsg_should_block(pid, msghdr_addr, config) {
+                    // Emit audit event for this blocked destination.
+                    let msg_name = read_u64_from_pid(pid, msghdr_addr);
+                    let msg_namelen = read_u32_from_pid(pid, msghdr_addr + 8);
+                    if let (Some(addr), Some(len)) = (msg_name, msg_namelen) {
+                        if addr != 0 && len > 0 {
+                            if let SockaddrResult::Inet(info) = read_sockaddr(pid, addr, len as u64)
+                            {
+                                write_audit_line(
+                                    audit_fd,
+                                    dropped,
+                                    &format!(
+                                        "{{\"type\":\"network_blocked\",\"pid\":{pid},\"dest\":\"{}\",\"protocol\":\"udp\"}}",
+                                        crate::wrapper::json_escape(&info.destination),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    block = true;
+                }
+            }
+            if block && config.enforce_network {
+                respond_errno(listener_fd, notif, libc::ECONNREFUSED)
+            } else {
+                respond_continue(listener_fd, notif)
+            }
+        }
+        _ => {
+            // Unexpected syscall — allow through.
+            respond_continue(listener_fd, notif)
+        }
+    }
+}
+
+/// Handle a connect-like syscall (connect, sendto with non-NULL addr).
+///
+/// SECURITY: The TOCTOU race inherent to SECCOMP_USER_NOTIF_FLAG_CONTINUE
+/// means a multi-threaded target can modify the sockaddr between the
+/// supervisor's read and the kernel's re-execution. Network blocking via
+/// unotify is defense-in-depth only — the network namespace (use_netns)
+/// is the primary security boundary.
+fn handle_connect(
+    listener_fd: RawFd,
+    notif: &libc::seccomp_notif,
+    audit_fd: RawFd,
+    config: &UnotifyConfig,
+    dropped: &mut u64,
+    addr: u64,
+    addrlen: u64,
+) -> bool {
+    let pid = notif.pid;
+
+    match read_sockaddr(pid, addr, addrlen) {
+        SockaddrResult::Inet(info) => {
+            if is_bridge_addr(&info, config) {
+                respond_continue(listener_fd, notif)
+            } else {
+                write_audit_line(
+                    audit_fd,
+                    dropped,
+                    &format!(
+                        "{{\"type\":\"network_blocked\",\"pid\":{pid},\"dest\":\"{}\",\"protocol\":\"tcp\"}}",
+                        crate::wrapper::json_escape(&info.destination),
+                    ),
+                );
+                if config.enforce_network {
+                    respond_errno(listener_fd, notif, libc::ECONNREFUSED)
+                } else {
+                    respond_continue(listener_fd, notif)
+                }
+            }
+        }
+        SockaddrResult::NonInet(_) => {
+            // AF_UNIX, AF_NETLINK, etc. — not INET, allow through.
+            respond_continue(listener_fd, notif)
+        }
+        SockaddrResult::ReadFailed => {
+            // Failed to read sockaddr. Fail-closed for enforcement mode:
+            // we can't verify the destination, so block it.
+            if config.enforce_network {
+                respond_errno(listener_fd, notif, libc::ECONNREFUSED)
+            } else {
+                respond_continue(listener_fd, notif)
+            }
+        }
+    }
+}
+
+/// Handle sendmsg: extract msg_name from msghdr.
+/// Check if a msghdr's destination address should be blocked.
+///
+/// Returns true if the destination is a non-bridge INET address
+/// (i.e., would be blocked by network enforcement). Does NOT emit
+/// a seccomp response — the caller must respond after checking all
+/// messages in a batch.
+fn sendmsg_should_block(pid: u32, msghdr_addr: u64, config: &UnotifyConfig) -> bool {
+    let msg_name = read_u64_from_pid(pid, msghdr_addr);
+    let msg_namelen = read_u32_from_pid(pid, msghdr_addr + 8);
+
+    match (msg_name, msg_namelen) {
+        (Some(name_addr), Some(namelen)) if name_addr != 0 && namelen > 0 => {
+            match read_sockaddr(pid, name_addr, namelen as u64) {
+                SockaddrResult::Inet(info) => !is_bridge_addr(&info, config),
+                SockaddrResult::NonInet(_) => false,
+                SockaddrResult::ReadFailed => config.enforce_network,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn handle_sendmsg(
+    listener_fd: RawFd,
+    notif: &libc::seccomp_notif,
+    audit_fd: RawFd,
+    config: &UnotifyConfig,
+    dropped: &mut u64,
+    msghdr_addr: u64,
+) -> bool {
+    let pid = notif.pid;
+    // Read msg_name (pointer) and msg_namelen from msghdr.
+    // struct msghdr { void *msg_name; socklen_t msg_namelen; ... }
+    // On 64-bit: msg_name at offset 0 (8 bytes), msg_namelen at offset 8 (4 bytes).
+    let msg_name = read_u64_from_pid(pid, msghdr_addr);
+    let msg_namelen = read_u32_from_pid(pid, msghdr_addr + 8);
+
+    match (msg_name, msg_namelen) {
+        (Some(name_addr), Some(namelen)) if name_addr != 0 && namelen > 0 => handle_connect(
+            listener_fd,
+            notif,
+            audit_fd,
+            config,
+            dropped,
+            name_addr,
+            namelen as u64,
+        ),
+        _ => {
+            // NULL msg_name or failed read — connected socket, allow.
+            respond_continue(listener_fd, notif)
+        }
+    }
+}
+
+/// Check if a sockaddr points to the bridge address.
+fn is_bridge_addr(info: &SockaddrInfo, config: &UnotifyConfig) -> bool {
+    let Some(bridge_port) = config.bridge_port else {
+        return false;
+    };
+    if info.port != bridge_port {
+        return false;
+    }
+    // Bridge is always on 127.0.0.1.
+    info.destination.starts_with("127.0.0.1:")
+}
+
+/// Read a u64 from a target process's memory.
+fn read_u64_from_pid(pid: u32, addr: u64) -> Option<u64> {
+    if addr == 0 {
+        return None;
+    }
+    let mem_path = format!("/proc/{pid}/mem\0");
+    let fd = unsafe { libc::open(mem_path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let mut val = 0u64;
+    let n = unsafe {
+        libc::pread(
+            fd,
+            &mut val as *mut u64 as *mut libc::c_void,
+            8,
+            addr as libc::off_t,
+        )
+    };
+    unsafe { libc::close(fd) };
+    if n == 8 { Some(val) } else { None }
+}
+
+/// Read a u32 from a target process's memory.
+fn read_u32_from_pid(pid: u32, addr: u64) -> Option<u32> {
+    if addr == 0 {
+        return None;
+    }
+    let mem_path = format!("/proc/{pid}/mem\0");
+    let fd = unsafe { libc::open(mem_path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let mut val = 0u32;
+    let n = unsafe {
+        libc::pread(
+            fd,
+            &mut val as *mut u32 as *mut libc::c_void,
+            4,
+            addr as libc::off_t,
+        )
+    };
+    unsafe { libc::close(fd) };
+    if n == 4 { Some(val) } else { None }
+}
+
+// ─── Response helpers ─────────────────────────────────────────────
+
+/// Respond with CONTINUE (allow the syscall through).
+fn respond_continue(listener_fd: RawFd, notif: &libc::seccomp_notif) -> bool {
+    if !notif_id_valid(listener_fd, notif.id) {
+        return false;
+    }
+    let resp = libc::seccomp_notif_resp {
+        id: notif.id,
+        val: 0,
+        error: 0,
+        flags: libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32,
+    };
+    notif_send(listener_fd, &resp).is_ok()
+}
+
+/// Respond with an errno (block the syscall).
+fn respond_errno(listener_fd: RawFd, notif: &libc::seccomp_notif, errno: i32) -> bool {
+    if !notif_id_valid(listener_fd, notif.id) {
+        return false;
+    }
+    let resp = libc::seccomp_notif_resp {
+        id: notif.id,
+        val: 0,
+        error: -errno,
+        flags: 0,
+    };
+    notif_send(listener_fd, &resp).is_ok()
+}
+
+/// Write an NDJSON audit line to the audit pipe.
+///
+/// The audit pipe is O_NONBLOCK. On EAGAIN, increments the drop counter
+/// and skips the write. When the pipe becomes writable again and there
+/// were drops, flushes a summary line.
+fn write_audit_line(audit_fd: RawFd, dropped: &mut u64, line: &str) {
+    // Flush drop summary if there were previous drops.
+    if *dropped > 0 {
+        let summary = format!("{{\"type\":\"dropped\",\"count\":{}}}\n", *dropped);
+        let ret = unsafe { libc::write(audit_fd, summary.as_ptr().cast(), summary.len()) };
+        if ret > 0 {
+            *dropped = 0;
+        }
+        // If this write also fails, keep accumulating.
+    }
+
+    // Cap line length to fit within PIPE_BUF (4096) with the trailing
+    // newline. json_escape can expand paths significantly (each '\'
+    // doubles), so the formatted line may exceed PIPE_BUF. A partial
+    // write on O_NONBLOCK corrupts the NDJSON stream.
+    const MAX_LINE: usize = 4095; // 4096 - 1 for '\n'
+    let truncated = if line.len() > MAX_LINE {
+        let mut end = MAX_LINE;
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        &line[..end]
+    } else {
+        line
+    };
+
+    let data = format!("{truncated}\n");
+    let ret = unsafe { libc::write(audit_fd, data.as_ptr().cast(), data.len()) };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            *dropped += 1;
+        }
+    }
+}
+
+// ─── Supervisor loop ──────────────────────────────────────────────
+
+/// Main notification processing loop. Runs in the supervisor child.
+///
+/// Loops on `notif_recv()`, dispatches each notification to
+/// `handle_notification()`, and exits when the listener FD becomes
+/// invalid (target process exited, filter destroyed → ENOENT).
+pub fn supervisor_loop(listener_fd: RawFd, audit_fd: RawFd, config: &UnotifyConfig) -> ! {
+    let mut dropped: u64 = 0;
+
+    loop {
+        match notif_recv(listener_fd) {
+            Ok(notif) => {
+                handle_notification(listener_fd, &notif, audit_fd, config, &mut dropped);
+            }
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(0);
+                if errno == libc::EINTR {
+                    continue;
+                }
+                // ENOENT: filter destroyed (target exited). Normal exit.
+                // EBADF: listener FD closed. Also normal.
+                if errno != libc::ENOENT && errno != libc::EBADF {
+                    log::warn!("unotify supervisor: recv error: {e}");
+                }
+                break;
+            }
+        }
+    }
+
+    // Flush final drop count.
+    if dropped > 0 {
+        let summary = format!("{{\"type\":\"dropped\",\"count\":{dropped}}}\n");
+        let _ = unsafe { libc::write(audit_fd, summary.as_ptr().cast(), summary.len()) };
+    }
+
+    unsafe { libc::_exit(0) }
+}
+
 // ─── Availability probe ───────────────────────────────────────────
 
 static AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -438,6 +1007,11 @@ pub struct UnotifyConfig {
     pub audit_network: bool,
     /// Bridge port to allow through (127.0.0.1:<port>).
     pub bridge_port: Option<u16>,
+    /// When true, block non-bridge INET connections with ECONNREFUSED.
+    /// When false, log connections and allow them through (audit-only).
+    /// Should only be true when `use_netns` is active (netns is the
+    /// primary security boundary; unotify blocking is defense-in-depth).
+    pub enforce_network: bool,
 }
 
 impl UnotifyConfig {
@@ -626,6 +1200,7 @@ mod tests {
                 audit_file_access: false,
                 audit_network: false,
                 bridge_port: None,
+                enforce_network: false,
             }
             .any_enabled()
         );
@@ -634,6 +1209,7 @@ mod tests {
                 audit_file_access: true,
                 audit_network: false,
                 bridge_port: None,
+                enforce_network: false,
             }
             .any_enabled()
         );
@@ -642,6 +1218,7 @@ mod tests {
                 audit_file_access: false,
                 audit_network: true,
                 bridge_port: Some(8080),
+                enforce_network: true,
             }
             .any_enabled()
         );
