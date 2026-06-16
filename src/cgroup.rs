@@ -17,6 +17,8 @@ use std::time::Duration;
 use crate::{Error, ResourceUsage};
 
 const CGROUP_PREFIX: &str = "arapuca-";
+const LEAF_NAME: &str = "leaf";
+const NEEDED_CONTROLLERS: &[&str] = &["memory", "pids", "cpu"];
 const DESTROY_RETRIES: u32 = 3;
 const DESTROY_BACKOFF: Duration = Duration::from_millis(100);
 const CPU_PERIOD: i64 = 100_000; // microseconds
@@ -59,7 +61,9 @@ impl CgroupLimits {
 /// Manages per-agent cgroups v2 resource limits.
 ///
 /// The base path is discovered from `/proc/self/cgroup` at startup.
-/// Controllers are read from `cgroup.subtree_control`.
+/// Available controllers are detected from `cgroup.controllers`, then
+/// enabled in `cgroup.subtree_control`. The `controllers` field holds
+/// the final set of enabled controllers (what child cgroups inherit).
 pub struct CgroupManager {
     base_path: PathBuf,
     controllers: Vec<String>,
@@ -80,19 +84,30 @@ impl CgroupManager {
             }
         };
 
-        let controllers = match read_subtree_control(&base_path) {
+        let available = match read_cgroup_list(&base_path, "cgroup.controllers") {
             Ok(c) => c,
             Err(e) => {
-                log::info!("cgroup: cannot read subtree_control: {e}");
+                log::info!("cgroup: cannot read controllers: {e}");
                 return Ok(None);
             }
         };
 
-        if controllers.is_empty() {
+        if available.is_empty() {
             log::info!(
-                "cgroup: no controllers delegated at {}",
+                "cgroup: no controllers available at {}",
                 base_path.display()
             );
+            return Ok(None);
+        }
+
+        if let Err(e) = enable_subtree_control(&base_path, &available) {
+            log::warn!("cgroup: enable_subtree_control: {e}");
+        }
+
+        let controllers =
+            read_cgroup_list(&base_path, "cgroup.subtree_control").unwrap_or_default();
+        if controllers.is_empty() {
+            log::info!("cgroup: no controllers enabled at {}", base_path.display());
             return Ok(None);
         }
 
@@ -300,12 +315,25 @@ impl CgroupManager {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if !name_str.starts_with(CGROUP_PREFIX) {
-                continue;
-            }
             if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 continue;
             }
+
+            if name_str == LEAF_NAME {
+                // Stale leaf from a previous run: rmdir only (never
+                // cgroup.kill — it could contain a sibling orchestrator).
+                let leaf = entry.path();
+                let procs = fs::read_to_string(leaf.join("cgroup.procs")).unwrap_or_default();
+                if procs.trim().is_empty() && fs::remove_dir(&leaf).is_ok() {
+                    log::info!("cgroup: cleaned up stale leaf");
+                }
+                continue;
+            }
+
+            if !name_str.starts_with(CGROUP_PREFIX) {
+                continue;
+            }
+
             let cg_path = entry.path();
             let kill_path = cg_path.join("cgroup.kill");
             if fs::write(&kill_path, "1").is_err() {
@@ -350,7 +378,13 @@ fn discover_cgroup_path() -> crate::Result<PathBuf> {
         let line = line.map_err(|e| Error::Cgroup(format!("read /proc/self/cgroup: {e}")))?;
         // cgroups v2 unified hierarchy: "0::/<path>"
         if let Some(rel_path) = line.strip_prefix("0::") {
-            let full_path = PathBuf::from("/sys/fs/cgroup").join(rel_path.trim_start_matches('/'));
+            let mut full_path =
+                PathBuf::from("/sys/fs/cgroup").join(rel_path.trim_start_matches('/'));
+            // Strip trailing /leaf segments left by previous leaf
+            // dances, so we always operate on the scope root.
+            while full_path.file_name().is_some_and(|n| n == LEAF_NAME) {
+                full_path.pop();
+            }
             if !full_path.is_dir() {
                 return Err(Error::Cgroup(format!(
                     "cgroup path {} is not a directory",
@@ -366,10 +400,130 @@ fn discover_cgroup_path() -> crate::Result<PathBuf> {
     ))
 }
 
-/// Read delegated controllers from cgroup.subtree_control.
-fn read_subtree_control(cg_path: &Path) -> crate::Result<Vec<String>> {
-    let data = fs::read_to_string(cg_path.join("cgroup.subtree_control"))
-        .map_err(|e| Error::Cgroup(format!("read subtree_control: {e}")))?;
+/// Enable controllers in `cgroup.subtree_control` so child cgroups
+/// inherit them. Handles the cgroups v2 "no internal processes"
+/// constraint via a leaf cgroup dance when needed.
+fn enable_subtree_control(base_path: &Path, available: &[String]) -> crate::Result<()> {
+    let filtered: Vec<&str> = available
+        .iter()
+        .filter(|c| NEEDED_CONTROLLERS.contains(&c.as_str()))
+        .map(String::as_str)
+        .collect();
+
+    if filtered.is_empty() {
+        return Ok(());
+    }
+
+    let current = read_cgroup_list(base_path, "cgroup.subtree_control").unwrap_or_default();
+    let missing: Vec<&str> = filtered
+        .iter()
+        .filter(|c| !current.iter().any(|e| e == *c))
+        .copied()
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let batch: String = missing
+        .iter()
+        .map(|c| format!("+{c}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sc_path = base_path.join("cgroup.subtree_control");
+
+    match fs::write(&sc_path, &batch) {
+        Ok(()) => {
+            log::info!("cgroup: enabled subtree_control: {batch}");
+            return Ok(());
+        }
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+            // "No internal processes" constraint: move ALL processes
+            // from the scope root into a leaf cgroup, then retry.
+            // This handles the case where a parent process (e.g.,
+            // viveiro or bash) shares the same delegated scope.
+            let leaf_path = base_path.join(LEAF_NAME);
+            if let Err(e) = fs::create_dir(&leaf_path) {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(Error::Cgroup(format!("mkdir {}: {e}", leaf_path.display())));
+                }
+            }
+
+            let leaf_procs = leaf_path.join("cgroup.procs");
+            let root_procs = base_path.join("cgroup.procs");
+            const MAX_DRAIN_ATTEMPTS: u32 = 3;
+
+            for attempt in 0..MAX_DRAIN_ATTEMPTS {
+                let data = fs::read_to_string(&root_procs).unwrap_or_default();
+                let pids: Vec<&str> = data
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+
+                if pids.is_empty() {
+                    break;
+                }
+
+                for pid in &pids {
+                    match fs::write(&leaf_procs, pid) {
+                        Ok(()) => {}
+                        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
+                        Err(e) => {
+                            log::warn!("cgroup: cannot move PID {pid} to leaf: {e}");
+                        }
+                    }
+                }
+
+                if attempt + 1 < MAX_DRAIN_ATTEMPTS {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+
+            match fs::write(&sc_path, &batch) {
+                Ok(()) => {
+                    log::info!("cgroup: enabled subtree_control: {batch} (via leaf dance)");
+                    return Ok(());
+                }
+                Err(retry_err) => {
+                    return Err(Error::Cgroup(format!(
+                        "enable subtree_control: {retry_err}",
+                    )));
+                }
+            }
+        }
+        Err(e) => {
+            log::debug!("cgroup: batch subtree_control failed: {e}, trying per-controller");
+        }
+    }
+
+    // Per-controller fallback: try enabling one at a time.
+    let mut enabled = 0u32;
+    for controller in &missing {
+        let enable = format!("+{controller}");
+        match fs::write(&sc_path, &enable) {
+            Ok(()) => {
+                log::info!("cgroup: enabled controller: {controller}");
+                enabled += 1;
+            }
+            Err(e) => log::warn!("cgroup: cannot enable {controller}: {e}"),
+        }
+    }
+
+    if enabled == 0 {
+        return Err(Error::Cgroup(
+            "per-controller fallback: no controllers enabled".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Read a space-separated list from a cgroup control file.
+fn read_cgroup_list(cg_path: &Path, filename: &str) -> crate::Result<Vec<String>> {
+    let path = cg_path.join(filename);
+    let data = fs::read_to_string(&path)
+        .map_err(|e| Error::Cgroup(format!("read {}: {e}", path.display())))?;
     Ok(data.split_whitespace().map(String::from).collect())
 }
 
@@ -460,5 +614,153 @@ mod tests {
         let stats = mgr.read_stats(Path::new("/nonexistent-cgroup"));
         assert_eq!(stats.memory_current_bytes, 0);
         assert_eq!(stats.pid_count, 0);
+    }
+
+    #[test]
+    fn read_cgroup_list_parses_space_separated() {
+        let dir = std::env::temp_dir().join("arapuca-test-cgroup-list");
+        let _ = fs::create_dir(&dir);
+        fs::write(dir.join("controllers"), "memory pids cpu\n").unwrap();
+        let result = read_cgroup_list(&dir, "controllers").unwrap();
+        assert_eq!(result, vec!["memory", "pids", "cpu"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_cgroup_list_empty_file() {
+        let dir = std::env::temp_dir().join("arapuca-test-cgroup-empty");
+        let _ = fs::create_dir(&dir);
+        fs::write(dir.join("controllers"), "").unwrap();
+        let result = read_cgroup_list(&dir, "controllers").unwrap();
+        assert!(result.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_cgroup_list_trailing_whitespace() {
+        let dir = std::env::temp_dir().join("arapuca-test-cgroup-ws");
+        let _ = fs::create_dir(&dir);
+        fs::write(dir.join("controllers"), "  memory  pids  \n").unwrap();
+        let result = read_cgroup_list(&dir, "controllers").unwrap();
+        assert_eq!(result, vec!["memory", "pids"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_cgroup_list_missing_file() {
+        let dir = std::env::temp_dir().join("arapuca-test-cgroup-missing");
+        let _ = fs::create_dir(&dir);
+        assert!(read_cgroup_list(&dir, "nonexistent").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enable_subtree_control_already_enabled() {
+        let dir = std::env::temp_dir().join("arapuca-test-esc-noop");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cgroup.subtree_control"), "memory pids cpu\n").unwrap();
+        let available = vec!["memory".into(), "pids".into(), "cpu".into()];
+        let result = enable_subtree_control(&dir, &available);
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enable_subtree_control_filters_needed() {
+        let dir = std::env::temp_dir().join("arapuca-test-esc-filter");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cgroup.subtree_control"), "memory pids cpu\n").unwrap();
+        let available: Vec<String> = vec![
+            "memory".into(),
+            "pids".into(),
+            "cpu".into(),
+            "io".into(),
+            "rdma".into(),
+        ];
+        let result = enable_subtree_control(&dir, &available);
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enable_subtree_control_no_needed_available() {
+        let dir = std::env::temp_dir().join("arapuca-test-esc-none");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let available: Vec<String> = vec!["io".into(), "rdma".into()];
+        let result = enable_subtree_control(&dir, &available);
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enable_subtree_control_writes_batch_when_none_enabled() {
+        let dir = std::env::temp_dir().join("arapuca-test-esc-write-all");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cgroup.subtree_control"), "\n").unwrap();
+        let available: Vec<String> = vec!["memory".into(), "pids".into(), "cpu".into()];
+        let result = enable_subtree_control(&dir, &available);
+        assert!(result.is_ok());
+        let written = fs::read_to_string(dir.join("cgroup.subtree_control")).unwrap();
+        assert!(written.contains("+memory"));
+        assert!(written.contains("+pids"));
+        assert!(written.contains("+cpu"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enable_subtree_control_writes_only_missing() {
+        let dir = std::env::temp_dir().join("arapuca-test-esc-partial");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cgroup.subtree_control"), "memory\n").unwrap();
+        let available: Vec<String> = vec!["memory".into(), "pids".into(), "cpu".into()];
+        let result = enable_subtree_control(&dir, &available);
+        assert!(result.is_ok());
+        let written = fs::read_to_string(dir.join("cgroup.subtree_control")).unwrap();
+        assert!(written.contains("+pids"));
+        assert!(written.contains("+cpu"));
+        assert!(!written.contains("+memory"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_stale_removes_empty_leaf() {
+        let dir = std::env::temp_dir().join("arapuca-test-cleanup-leaf");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let leaf = dir.join("leaf");
+        fs::create_dir(&leaf).unwrap();
+        // No cgroup.procs file: read_to_string returns Err,
+        // unwrap_or_default gives "", which is "empty". On a real
+        // cgroupfs the kernel pseudo-files don't block rmdir; here
+        // the empty directory lets remove_dir succeed.
+        let mgr = CgroupManager {
+            base_path: dir.clone(),
+            controllers: vec!["memory".into()],
+        };
+        mgr.cleanup_stale();
+        assert!(!leaf.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_stale_preserves_occupied_leaf() {
+        let dir = std::env::temp_dir().join("arapuca-test-cleanup-leaf-busy");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let leaf = dir.join("leaf");
+        fs::create_dir(&leaf).unwrap();
+        fs::write(leaf.join("cgroup.procs"), "12345\n").unwrap();
+        let mgr = CgroupManager {
+            base_path: dir.clone(),
+            controllers: vec!["memory".into()],
+        };
+        mgr.cleanup_stale();
+        assert!(leaf.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
