@@ -37,6 +37,8 @@ pub mod seccomp;
 pub mod selfexec;
 #[cfg(unix)]
 pub mod terminal;
+#[cfg(seccomp_supported)]
+pub mod unotify;
 mod validate;
 #[cfg(target_os = "linux")]
 pub mod vm;
