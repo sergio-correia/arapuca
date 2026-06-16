@@ -1028,6 +1028,375 @@ pub struct UnotifyFds {
     pub readiness_read: RawFd,
 }
 
+// ─── Fork supervisor ──────────────────────────────────────────────
+
+/// Fork the unotify supervisor child process.
+///
+/// The supervisor is forked BEFORE any seccomp filters are installed
+/// to avoid inheriting the USER_NOTIF filter (which would deadlock
+/// on the supervisor's own openat calls). The listener FD is passed
+/// to the supervisor via SCM_RIGHTS after filter installation.
+///
+/// Uses a **deferred readiness protocol**: the readiness pipe is
+/// returned to the caller, not polled internally. The caller must:
+/// 1. Poll `readiness_read` (confirms supervisor is alive)
+/// 2. Install normal seccomp filters
+/// 3. Install USER_NOTIF filter LAST → get listener FD
+/// 4. Send listener FD via `send_fd(socketpair_parent, listener_fd)`
+/// 5. Close socketpair_parent + listener_fd
+///
+/// The supervisor blocks on `recv_fd` until step 4 completes.
+///
+/// `audit_write_fd` is the write end of the audit pipe (created by
+/// the library, passed via ARAPUCA_UNOTIFY_AUDIT_FD).
+pub fn fork_unotify_supervisor(
+    config: &UnotifyConfig,
+    audit_write_fd: RawFd,
+) -> crate::Result<UnotifyFds> {
+    // Create Unix socketpair for SCM_RIGHTS FD passing.
+    let mut sv = [0i32; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(Error::Process(format!(
+            "unotify: socketpair: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let sp_parent = sv[0];
+    let sp_child = sv[1];
+
+    // Create readiness pipe.
+    let mut pipe_fds = [0i32; 2];
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        unsafe {
+            libc::close(sp_parent);
+            libc::close(sp_child);
+        }
+        return Err(Error::Process(format!(
+            "unotify: pipe2: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let readiness_read = pipe_fds[0];
+    let readiness_write = pipe_fds[1];
+
+    let parent_pid = unsafe { libc::getpid() };
+
+    // Serialize config for the child (consumed after fork via COW).
+    let child_config = UnotifyConfig {
+        audit_file_access: config.audit_file_access,
+        audit_network: config.audit_network,
+        bridge_port: config.bridge_port,
+        enforce_network: config.enforce_network,
+    };
+
+    // SAFETY: single-threaded at this point (between bridge fork and
+    // seccomp apply, no threads spawned).
+    let child_pid = unsafe { libc::fork() };
+    if child_pid < 0 {
+        unsafe {
+            libc::close(sp_parent);
+            libc::close(sp_child);
+            libc::close(readiness_read);
+            libc::close(readiness_write);
+        }
+        return Err(Error::Process(format!(
+            "unotify: fork: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    if child_pid == 0 {
+        // ── Supervisor child ─────────────────────────────────
+        // All error exits use _exit (child can never return).
+
+        unsafe { libc::close(sp_parent) };
+        unsafe { libc::close(readiness_read) };
+
+        // Close all FDs >= 3 except those we need.
+        unsafe {
+            crate::bridge::close_fds_except(&[sp_child, readiness_write, audit_write_fd]);
+        }
+
+        // Ignore SIGPIPE (audit pipe writes may fail).
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+        if unsafe { libc::getppid() } != parent_pid {
+            unsafe { libc::_exit(1) };
+        }
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+
+        // Apply the supervisor's own seccomp allowlist.
+        #[cfg(seccomp_supported)]
+        if let Err(_e) = apply_supervisor_seccomp() {
+            crate::wrapper::write_stderr("unotify supervisor: seccomp failed\n");
+            unsafe { libc::_exit(1) };
+        }
+
+        // Set audit pipe to non-blocking to avoid stalling on full pipe.
+        unsafe {
+            let flags = libc::fcntl(audit_write_fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(audit_write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+
+        // Signal readiness: supervisor is alive, seccomp applied,
+        // waiting for the listener FD.
+        unsafe {
+            libc::write(readiness_write, [1u8].as_ptr().cast(), 1);
+            libc::close(readiness_write);
+        }
+
+        // Block until the caller sends the listener FD.
+        let listener_fd = match recv_fd(sp_child) {
+            Ok(fd) => fd,
+            Err(_) => unsafe { libc::_exit(1) },
+        };
+        unsafe { libc::close(sp_child) };
+
+        // Enter the supervisor loop (never returns).
+        supervisor_loop(listener_fd, audit_write_fd, &child_config);
+    }
+
+    // ── Parent (wrapper) ─────────────────────────────────────
+    unsafe {
+        libc::close(sp_child);
+        libc::close(readiness_write);
+    }
+
+    Ok(UnotifyFds {
+        socketpair_parent: sp_parent,
+        readiness_read,
+    })
+}
+
+/// Apply the supervisor's own seccomp filter.
+///
+/// Derived from the bridge's allowlist (bridge.rs:build_bridge_filters)
+/// but tailored for the supervisor's workload: ioctl (for seccomp
+/// notification recv/send/id_valid), openat+pread64 (for /proc/pid/mem),
+/// recvmsg (for SCM_RIGHTS), and standard runtime syscalls.
+#[cfg(seccomp_supported)]
+fn apply_supervisor_seccomp() -> crate::Result<()> {
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+    };
+    use std::collections::HashMap;
+
+    let arch = crate::seccomp::target_arch()?;
+    let mut allow: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+
+    // I/O: /proc/<pid>/mem reading, audit pipe writing, socketpair recv.
+    for nr in [
+        libc::SYS_openat,
+        libc::SYS_read,
+        libc::SYS_pread64,
+        libc::SYS_write,
+        libc::SYS_close,
+        libc::SYS_writev,
+        libc::SYS_lseek,
+        libc::SYS_recvmsg,
+        libc::SYS_ppoll,
+        libc::SYS_fcntl,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // ioctl: restrict to seccomp notification commands only.
+    let allowed_ioctls: [u64; 4] = [
+        SECCOMP_IOCTL_NOTIF_RECV as _,
+        SECCOMP_IOCTL_NOTIF_SEND as _,
+        SECCOMP_IOCTL_NOTIF_ID_VALID_NEW as _,
+        SECCOMP_IOCTL_NOTIF_ID_VALID_OLD as _,
+    ];
+    let mut ioctl_rules = Vec::new();
+    for cmd in allowed_ioctls {
+        ioctl_rules.push(
+            SeccompRule::new(vec![
+                SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, cmd)
+                    .map_err(|e| Error::Seccomp(format!("ioctl condition: {e}")))?,
+            ])
+            .map_err(|e| Error::Seccomp(format!("ioctl rule: {e}")))?,
+        );
+    }
+    allow.insert(libc::SYS_ioctl, ioctl_rules);
+    #[cfg(target_arch = "x86_64")]
+    {
+        allow.insert(libc::SYS_poll, vec![]);
+    }
+
+    // Memory management.
+    for nr in [
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_brk,
+        libc::SYS_mremap,
+        libc::SYS_madvise,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // mprotect: deny PROT_EXEC.
+    let mprotect_rule = SeccompRule::new(vec![
+        SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(libc::PROT_EXEC as u64),
+            0,
+        )
+        .map_err(|e| Error::Seccomp(format!("supervisor mprotect condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("supervisor mprotect rule: {e}")))?;
+    allow.insert(libc::SYS_mprotect, vec![mprotect_rule]);
+
+    // Signals.
+    for nr in [
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // Process lifecycle.
+    for nr in [libc::SYS_exit, libc::SYS_exit_group] {
+        allow.insert(nr, vec![]);
+    }
+
+    // Thread management + runtime.
+    for nr in [
+        libc::SYS_futex,
+        libc::SYS_set_robust_list,
+        libc::SYS_sched_yield,
+        libc::SYS_sched_getaffinity,
+        libc::SYS_gettid,
+        libc::SYS_getpid,
+        libc::SYS_tgkill,
+        libc::SYS_getrandom,
+        libc::SYS_clock_gettime,
+        libc::SYS_prlimit64,
+        libc::SYS_rseq,
+        libc::SYS_newfstatat,
+        libc::SYS_fstat,
+        libc::SYS_nanosleep,
+    ] {
+        allow.insert(nr, vec![]);
+
+        // clone3 in allowlist so the stacked ENOSYS filter wins over
+        // KillProcess (ENOSYS is more restrictive than Allow, less
+        // restrictive than KillProcess).
+        allow.insert(libc::SYS_clone3, vec![]);
+    }
+
+    // Allowlist: matched syscalls → Allow, everything else → KillProcess.
+    let filter = SeccompFilter::new(
+        allow.into_iter().collect(),
+        SeccompAction::KillProcess,
+        SeccompAction::Allow,
+        arch,
+    )
+    .map_err(|e| Error::Seccomp(format!("build supervisor filter: {e}")))?;
+
+    let prog: seccompiler::BpfProgram =
+        filter.try_into().map_err(|e: seccompiler::BackendError| {
+            Error::Seccomp(format!("compile supervisor filter: {e}"))
+        })?;
+
+    // clone3 → ENOSYS so glibc falls back to clone (which is not in
+    // the allowlist either — the supervisor is single-threaded). This
+    // must be a separate stacked filter because seccompiler only
+    // supports one match action per filter.
+    let mut clone3_deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    clone3_deny.insert(libc::SYS_clone3, vec![]);
+    let clone3_filter = SeccompFilter::new(
+        clone3_deny.into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )
+    .map_err(|e| Error::Seccomp(format!("build supervisor clone3 filter: {e}")))?;
+    let clone3_prog: seccompiler::BpfProgram =
+        clone3_filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| {
+                Error::Seccomp(format!("compile supervisor clone3 filter: {e}"))
+            })?;
+
+    // Install clone3 ENOSYS first, then allowlist (last installed is
+    // checked first; most restrictive action wins).
+    seccompiler::apply_filter(&clone3_prog)
+        .map_err(|e| Error::Seccomp(format!("install supervisor clone3 filter: {e}")))?;
+    seccompiler::apply_filter(&prog)
+        .map_err(|e| Error::Seccomp(format!("install supervisor filter: {e}")))?;
+
+    log::info!("unotify supervisor: seccomp filter applied");
+    Ok(())
+}
+
+/// Poll the readiness pipe with a timeout.
+///
+/// Used by the caller after `fork_unotify_supervisor` returns to
+/// confirm the supervisor child is alive before proceeding.
+pub fn poll_readiness(readiness_fd: RawFd, timeout_ms: i32) -> crate::Result<()> {
+    let mut pfd = libc::pollfd {
+        fd: readiness_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    let poll_ret = loop {
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break ret;
+        }
+    };
+
+    if poll_ret == 0 {
+        return Err(Error::Process(
+            "unotify supervisor readiness timeout".into(),
+        ));
+    }
+    if poll_ret < 0 {
+        return Err(Error::Process(format!(
+            "unotify supervisor poll: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let mut buf = [0u8; 1];
+    let n = loop {
+        let ret = unsafe { libc::read(readiness_fd, buf.as_mut_ptr().cast(), 1) };
+        if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break ret;
+        }
+    };
+
+    if n != 1 {
+        return Err(Error::Process(
+            "unotify supervisor readiness signal failed".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1229,5 +1598,38 @@ mod tests {
         // Just verify the probe doesn't panic or hang.
         // The actual result depends on kernel version.
         let _ = unotify_available();
+    }
+
+    #[test]
+    fn supervisor_seccomp_allows_required_syscalls() {
+        // Smoke test: fork a child, apply the supervisor seccomp,
+        // verify write(2) succeeds (if the filter is inverted,
+        // write is in the allowlist and would be killed).
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64);
+            }
+            #[cfg(seccomp_supported)]
+            if apply_supervisor_seccomp().is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            // If the filter is correct, write succeeds.
+            // If inverted, SECCOMP_RET_KILL_PROCESS kills us here.
+            let ret = unsafe { libc::write(2, b"ok\n".as_ptr().cast(), 3) };
+            if ret < 0 {
+                unsafe { libc::_exit(3) };
+            }
+            unsafe { libc::_exit(0) };
+        }
+        let mut status: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(ret > 0, "waitpid failed");
+        assert!(
+            libc::WIFEXITED(status),
+            "child should exit normally, not be killed by seccomp"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 }
