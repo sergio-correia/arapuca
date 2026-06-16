@@ -190,9 +190,8 @@ pub enum AuditEvent {
     /// A sandboxed process attempted a blocked network connection.
     ///
     /// On Linux, this captures DNS queries intercepted by the bridge's
-    /// DNS server. Direct IP connections (no DNS involved) are blocked
-    /// by the network namespace but do NOT generate this event — their
-    /// capture requires seccomp-unotify (future work).
+    /// DNS server and direct IP connections intercepted by the
+    /// seccomp-unotify supervisor (when `audit_network` is enabled).
     ///
     /// On macOS, this captures Seatbelt network-outbound denials
     /// parsed from the unified log after the process exits.
@@ -203,6 +202,41 @@ pub enum AuditEvent {
         destination: String,
         protocol: String,
         detail: Option<String>,
+    },
+
+    /// File opened by the sandboxed process.
+    ///
+    /// Observed via seccomp user notification (`SECCOMP_RET_USER_NOTIF`)
+    /// on `openat`/`openat2`/`open` syscalls. The syscall is always
+    /// allowed through after observation — this is audit-only.
+    ///
+    /// Requires `audit_file_access: true` in the profile and
+    /// kernel ≥ 5.5.
+    #[non_exhaustive]
+    FileAccess {
+        timestamp: AuditTimestamp,
+        pid: u32,
+        path: String,
+        /// Raw open flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, etc.).
+        flags: u32,
+        /// True if flags indicate a write operation (O_WRONLY, O_RDWR,
+        /// O_CREAT, or O_TRUNC).
+        is_write: bool,
+    },
+
+    /// Process spawned by the sandboxed process.
+    ///
+    /// Observed via seccomp user notification on `execve`/`execveat`
+    /// syscalls. The syscall is always allowed through after
+    /// observation — this is audit-only.
+    ///
+    /// Requires `audit_file_access: true` in the profile and
+    /// kernel ≥ 5.5.
+    #[non_exhaustive]
+    ProcessSpawn {
+        timestamp: AuditTimestamp,
+        pid: u32,
+        binary: String,
     },
 }
 
@@ -243,6 +277,7 @@ pub enum SandboxLayer {
     ProcessSpawn,
     DnsCapture,
     PidNamespace,
+    UnotifySupervisor,
 }
 
 /// Structured detail for a successfully applied layer.
@@ -655,5 +690,72 @@ mod tests {
     fn dns_capture_sandbox_layer_exists() {
         let layer = SandboxLayer::DnsCapture;
         assert_eq!(layer, SandboxLayer::DnsCapture);
+    }
+
+    #[test]
+    fn file_access_event_can_be_constructed() {
+        let vec_sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+        let sink: Arc<dyn AuditSink> = Arc::clone(&vec_sink) as Arc<dyn AuditSink>;
+        let ctx = AuditContext::new(sink, AuditVerbosity::Standard);
+        let event = AuditEvent::FileAccess {
+            timestamp: ctx.timestamp(),
+            pid: 1234,
+            path: "/etc/passwd".into(),
+            flags: 0,
+            is_write: false,
+        };
+        ctx.emit(event).unwrap();
+        let events = vec_sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn process_spawn_event_can_be_constructed() {
+        let vec_sink = Arc::new(VecSink(Mutex::new(Vec::new())));
+        let sink: Arc<dyn AuditSink> = Arc::clone(&vec_sink) as Arc<dyn AuditSink>;
+        let ctx = AuditContext::new(sink, AuditVerbosity::Standard);
+        let event = AuditEvent::ProcessSpawn {
+            timestamp: ctx.timestamp(),
+            pid: 5678,
+            binary: "/usr/bin/ls".into(),
+        };
+        ctx.emit(event).unwrap();
+        let events = vec_sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn file_access_event_serializes() {
+        let event = AuditEvent::FileAccess {
+            timestamp: AuditTimestamp(100),
+            pid: 1234,
+            path: "/etc/passwd".into(),
+            flags: 0,
+            is_write: false,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event_type\":\"FileAccess\""));
+        assert!(json.contains("\"path\":\"/etc/passwd\""));
+        assert!(json.contains("\"is_write\":false"));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn process_spawn_event_serializes() {
+        let event = AuditEvent::ProcessSpawn {
+            timestamp: AuditTimestamp(200),
+            pid: 5678,
+            binary: "/usr/bin/ls".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event_type\":\"ProcessSpawn\""));
+        assert!(json.contains("\"binary\":\"/usr/bin/ls\""));
+    }
+
+    #[test]
+    fn unotify_supervisor_layer_exists() {
+        let layer = SandboxLayer::UnotifySupervisor;
+        assert_eq!(layer, SandboxLayer::UnotifySupervisor);
     }
 }
