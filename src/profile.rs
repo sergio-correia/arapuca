@@ -140,6 +140,26 @@ pub struct Profile {
     pub dns_capture: bool,
     /// Seccomp filter profile. Defaults to Strict.
     pub seccomp_profile: SeccompProfile,
+    /// Audit file access via seccomp user notification.
+    ///
+    /// Intercepts `openat`/`openat2`/`open`/`execve` syscalls and emits
+    /// `FileAccess` and `ProcessSpawn` audit events. The syscalls are
+    /// always allowed through — this is observation only.
+    ///
+    /// Requires kernel ≥ 5.5 (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`).
+    /// Silently skipped on older kernels or when Yama `ptrace_scope`
+    /// blocks cross-process `/proc/<pid>/mem` access (unless a user
+    /// namespace is active via `use_netns` or `use_pidns`).
+    pub audit_file_access: bool,
+    /// Audit network connections via seccomp user notification.
+    ///
+    /// Intercepts `connect`/`sendto`/`sendmsg`/`sendmmsg` syscalls.
+    /// When `use_netns` is active, allows connections to the bridge
+    /// address and blocks all other INET connections with ECONNREFUSED.
+    /// When `use_netns` is not active, logs connections without blocking.
+    ///
+    /// Requires kernel ≥ 5.5. Same Yama constraints as `audit_file_access`.
+    pub audit_network: bool,
 }
 
 /// Full configuration for launching a sandboxed process.
