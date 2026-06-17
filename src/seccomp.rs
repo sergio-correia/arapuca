@@ -362,7 +362,6 @@ fn tier1_kill_syscalls() -> Vec<i64> {
         libc::SYS_fsconfig,
         libc::SYS_fsmount,
         libc::SYS_fspick,
-        libc::SYS_pidfd_open,
         libc::SYS_pidfd_getfd,
         libc::SYS_pidfd_send_signal,
         libc::SYS_process_madvise,
@@ -480,7 +479,6 @@ fn baseline_kill_syscalls() -> Vec<i64> {
         SYS_LSM_SET_SELF_ATTR,
         // io_uring_* in ENOSYS tier — libraries probe and fall back.
         libc::SYS_memfd_create,
-        libc::SYS_pidfd_open,
         libc::SYS_pidfd_getfd,
         libc::SYS_pidfd_send_signal,
         libc::SYS_kcmp,
@@ -760,7 +758,7 @@ mod tests {
     fn tier1_count_is_exact() {
         assert_eq!(
             tier1_kill_syscalls().len(),
-            46,
+            45,
             "tier1 count changed — update this assertion if intentional"
         );
     }
@@ -846,16 +844,6 @@ mod tests {
         } else {
             panic!("unexpected wait status: {wstatus}");
         }
-    }
-
-    #[test]
-    fn tier1_pidfd_open_kills() {
-        let (exited, sig) = run_in_filtered_child(|| {
-            // SAFETY: syscall with valid args.
-            unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
-        });
-        assert!(!exited, "child should be killed, not exit normally");
-        assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from seccomp KILL");
     }
 
     #[test]
