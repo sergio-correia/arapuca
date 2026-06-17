@@ -498,6 +498,7 @@ pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
         // Name resolution and dynamic linking.
         PathBuf::from("/etc/resolv.conf"),
         PathBuf::from("/etc/hosts"),
+        PathBuf::from("/etc/host.conf"),
         PathBuf::from("/etc/nsswitch.conf"),
         PathBuf::from("/etc/ld.so.cache"),
         // Locale and user info.
