@@ -40,6 +40,9 @@ pub struct Process {
     /// DNS audit pipe read end. Read in wait() after child exits.
     #[cfg(target_os = "linux")]
     pub(crate) dns_audit_pipe: Option<std::os::unix::io::OwnedFd>,
+    /// Unotify audit pipe read end. Read in wait() after child exits.
+    #[cfg(target_os = "linux")]
+    pub(crate) unotify_audit_pipe: Option<std::os::unix::io::OwnedFd>,
     /// pidfd for the sandboxed process (Linux 5.3+). Enables
     /// race-free signaling via pidfd_send_signal. None on older
     /// kernels or non-Linux platforms.
@@ -209,6 +212,7 @@ impl Process {
         // ProcessExited, so NetworkBlocked events appear before
         // the exit event.
         self.read_dns_audit_pipe(pid);
+        self.read_unotify_audit_pipe(pid);
         self.read_seatbelt_denials(pid);
 
         // Capture stats while cgroup still exists (before cleanup
@@ -420,6 +424,149 @@ impl Process {
     #[cfg(not(target_os = "linux"))]
     #[cfg_attr(windows, allow(dead_code))]
     fn read_dns_audit_pipe(&mut self, _pid: u32) {}
+
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(not(feature = "serde"), allow(unused_variables))]
+    fn read_unotify_audit_pipe(&mut self, pid: u32) {
+        let owned_fd = match self.unotify_audit_pipe.take() {
+            Some(fd) => fd,
+            None => return,
+        };
+
+        let ctx = match self.audit_ctx.as_ref() {
+            Some(ctx) => ctx,
+            None => return,
+        };
+
+        // Same read pattern as read_dns_audit_pipe: poll + nonblock + drain.
+        use std::os::unix::io::AsRawFd;
+        let raw_fd = owned_fd.as_raw_fd();
+
+        let mut pfd = libc::pollfd {
+            fd: raw_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_ret = loop {
+            let ret = unsafe { libc::poll(&mut pfd, 1, 1000) };
+            if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break ret;
+            }
+        };
+        if poll_ret <= 0 {
+            return;
+        }
+
+        unsafe {
+            let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(raw_fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                data.extend_from_slice(&buf[..n as usize]);
+            } else if n == 0 {
+                break;
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    let mut pfd2 = libc::pollfd {
+                        fd: raw_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ret = unsafe { libc::poll(&mut pfd2, 1, 1000) };
+                    if ret <= 0 {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        drop(owned_fd);
+
+        #[cfg(feature = "serde")]
+        if !data.is_empty() {
+            let text = String::from_utf8_lossy(&data);
+            for line in text.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                #[derive(serde::Deserialize)]
+                struct UnotifyLine {
+                    #[serde(rename = "type")]
+                    event_type: String,
+                    #[serde(default)]
+                    pid: u32,
+                    #[serde(default)]
+                    path: Option<String>,
+                    #[serde(default)]
+                    flags: Option<u32>,
+                    #[serde(default)]
+                    is_write: Option<bool>,
+                    #[serde(default)]
+                    binary: Option<String>,
+                    #[serde(default)]
+                    dest: Option<String>,
+                    #[serde(default)]
+                    protocol: Option<String>,
+                    #[serde(default)]
+                    count: Option<u64>,
+                }
+                match serde_json::from_str::<UnotifyLine>(line) {
+                    Ok(entry) => {
+                        let event_pid = if entry.pid > 0 { entry.pid } else { pid };
+                        let result = match entry.event_type.as_str() {
+                            "file_access" => ctx.emit(AuditEvent::FileAccess {
+                                timestamp: ctx.timestamp(),
+                                pid: event_pid,
+                                path: entry.path.unwrap_or_default(),
+                                flags: entry.flags.unwrap_or(0),
+                                is_write: entry.is_write.unwrap_or(false),
+                            }),
+                            "process_spawn" => ctx.emit(AuditEvent::ProcessSpawn {
+                                timestamp: ctx.timestamp(),
+                                pid: event_pid,
+                                binary: entry.binary.unwrap_or_default(),
+                            }),
+                            "network_blocked" => ctx.emit(AuditEvent::NetworkBlocked {
+                                timestamp: ctx.timestamp(),
+                                pid: event_pid,
+                                destination: entry.dest.unwrap_or_default(),
+                                protocol: entry.protocol.unwrap_or_else(|| "tcp".into()),
+                                detail: Some("unotify".into()),
+                            }),
+                            "dropped" => {
+                                if let Some(count) = entry.count {
+                                    log::warn!("unotify: {count} audit events dropped (pipe full)");
+                                }
+                                Ok(())
+                            }
+                            _ => {
+                                log::debug!("unotify: unknown event type: {}", entry.event_type);
+                                Ok(())
+                            }
+                        };
+                        if let Err(e) = result {
+                            log::error!("unotify audit emit failed: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("unotify audit: skipping malformed line: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
+    fn read_unotify_audit_pipe(&mut self, _pid: u32) {}
 
     #[cfg(target_os = "macos")]
     fn read_seatbelt_denials(&mut self, pid: u32) {
@@ -693,6 +840,8 @@ impl Drop for Process {
 
         #[cfg(target_os = "linux")]
         drop(self.dns_audit_pipe.take());
+        #[cfg(target_os = "linux")]
+        drop(self.unotify_audit_pipe.take());
 
         #[cfg(target_os = "linux")]
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
@@ -774,6 +923,8 @@ mod tests {
                 cgroup_mgr: None,
                 #[cfg(target_os = "linux")]
                 dns_audit_pipe: None,
+                #[cfg(target_os = "linux")]
+                unotify_audit_pipe: None,
                 #[cfg(target_os = "linux")]
                 pidfd: None,
                 #[cfg(target_os = "linux")]
@@ -872,6 +1023,7 @@ mod tests {
             cgroup_path: None,
             cgroup_mgr: None,
             dns_audit_pipe: Some(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(pipe_read) }),
+            unotify_audit_pipe: None,
             pidfd: None,
             target_pid: None,
             waited: false,
@@ -936,6 +1088,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             dns_audit_pipe: None,
             #[cfg(target_os = "linux")]
+            unotify_audit_pipe: None,
+            #[cfg(target_os = "linux")]
             pidfd: None,
             #[cfg(target_os = "linux")]
             target_pid: None,
@@ -976,6 +1130,8 @@ mod tests {
             cgroup_mgr: None,
             #[cfg(target_os = "linux")]
             dns_audit_pipe: None,
+            #[cfg(target_os = "linux")]
+            unotify_audit_pipe: None,
             #[cfg(target_os = "linux")]
             pidfd: None,
             #[cfg(target_os = "linux")]

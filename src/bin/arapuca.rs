@@ -282,6 +282,48 @@ fn main() {
             }
         }
 
+        // ── Unotify supervisor ─────────────────────────────────
+        // Fork the supervisor BEFORE PID namespace and seccomp.
+        // The supervisor must be in the host PID namespace so
+        // /proc/<pid>/mem accesses the right process.
+        #[cfg(seccomp_supported)]
+        let unotify_fds = {
+            let unotify_config = arapuca::env::parse_unotify_config();
+            if let Some(ref config) = unotify_config {
+                if arapuca::unotify::unotify_available() {
+                    let unotify_audit_fd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
+                        .ok()
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(-1);
+                    if unotify_audit_fd >= 0 {
+                        match arapuca::unotify::fork_unotify_supervisor(config, unotify_audit_fd) {
+                            Ok(fds) => {
+                                audit_layer(audit_fd, "UnotifySupervisor", true, None);
+                                Some(fds)
+                            }
+                            Err(e) => {
+                                audit_layer(
+                                    audit_fd,
+                                    "UnotifySupervisor",
+                                    false,
+                                    Some(&e.to_string()),
+                                );
+                                eprintln!("arapuca: unotify supervisor: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    log::info!("unotify: not available on this kernel");
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
         // PID namespace: unshare + fork between bridge and seccomp.
         // The parent (in host PID ns) stays as a signal relay; the
         // child (PID 1 in new ns) continues to seccomp + exec.
@@ -335,6 +377,48 @@ fn main() {
             log::warn!("seccomp not available on this architecture — skipping");
             audit_layer(audit_fd, "Seccomp", true, None);
         }
+
+        // ── Install USER_NOTIF filter LAST + send listener FD ─────
+        // Must be after normal seccomp filters so USER_NOTIF is the
+        // most recently installed filter (required for CONTINUE flag).
+        #[cfg(seccomp_supported)]
+        if let Some(ref fds) = unotify_fds {
+            // Poll readiness first — confirms supervisor is alive.
+            if arapuca::unotify::poll_readiness(fds.readiness_read, 5000).is_ok() {
+                unsafe { libc::close(fds.readiness_read) };
+
+                let unotify_config = arapuca::env::parse_unotify_config();
+                if let Some(ref config) = unotify_config {
+                    let syscalls = arapuca::unotify::target_syscalls(
+                        config.audit_file_access,
+                        config.audit_network,
+                    );
+                    match arapuca::unotify::build_unotify_bpf(&syscalls)
+                        .and_then(|bpf| arapuca::unotify::install_unotify_filter(&bpf))
+                    {
+                        Ok(listener_fd) => {
+                            let _ = arapuca::unotify::send_fd(fds.socketpair_parent, listener_fd);
+                            unsafe {
+                                libc::close(listener_fd);
+                                libc::close(fds.socketpair_parent);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("arapuca: unotify filter: {e}");
+                            unsafe { libc::close(fds.socketpair_parent) };
+                        }
+                    }
+                } else {
+                    unsafe { libc::close(fds.socketpair_parent) };
+                }
+            } else {
+                eprintln!("arapuca: unotify supervisor readiness timeout");
+                unsafe {
+                    libc::close(fds.readiness_read);
+                    libc::close(fds.socketpair_parent);
+                }
+            }
+        }
     }
 
     // 3. Resource limits from env vars (Unix only).
@@ -355,6 +439,13 @@ fn main() {
     }
     #[cfg(unix)]
     if let Some(fd) = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+    {
+        unsafe { libc::close(fd) };
+    }
+    #[cfg(unix)]
+    if let Some(fd) = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
         .ok()
         .and_then(|s| s.parse::<i32>().ok())
     {

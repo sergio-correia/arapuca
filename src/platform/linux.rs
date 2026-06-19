@@ -534,6 +534,58 @@ impl Sandbox for Linux {
             }
         }
 
+        // ── Unotify audit pipe ─────────────────────────────────────
+        // When file access or network auditing is enabled, create a
+        // pipe for the unotify supervisor to write NDJSON audit lines.
+        let unotify_wants =
+            (cfg.profile.audit_file_access || cfg.profile.audit_network) && use_wrapper;
+        let unotify_audit_pipe = if unotify_wants {
+            let mut fds = [0i32; 2];
+            let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            if ret == 0 {
+                let target_fd = 3 + fds_to_inherit.len() as i32;
+                fds_to_inherit.push(fds[1]);
+                command.env("ARAPUCA_UNOTIFY_AUDIT_FD", target_fd.to_string());
+                pipe_guard.push(fds[0]);
+                pipe_guard.push(fds[1]);
+                // Also set the config env var.
+                if let Some(kv) = crate::env::unotify_env(&cfg.profile) {
+                    command.env(&kv.0, &kv.1);
+                }
+                Some((fds[0], fds[1]))
+            } else {
+                log::warn!("unotify audit pipe creation failed, continuing without");
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(ref ctx) = audit_ctx {
+            if unotify_audit_pipe.is_some() {
+                ctx.emit(AuditEvent::LayerApplied {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::UnotifySupervisor,
+                    detail: None,
+                })?;
+                applied_layers.push(SandboxLayer::UnotifySupervisor);
+            } else {
+                let reason = if !cfg.profile.audit_file_access && !cfg.profile.audit_network {
+                    SkipReason::NotConfigured
+                } else if !use_wrapper {
+                    SkipReason::ComponentMissing("wrapper binary not available".into())
+                } else {
+                    SkipReason::PartialFailure("pipe creation failed".into())
+                };
+                ctx.emit(AuditEvent::LayerSkipped {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::UnotifySupervisor,
+                    reason,
+                })?;
+                skipped_layers.push(SandboxLayer::UnotifySupervisor);
+            }
+        }
+
         // ── PID namespace pipe ─────────────────────────────────────
         // When PID namespace is active, create a pipe for the wrapper
         // parent to report the target's host PID. Set ARAPUCA_PID_NS
@@ -872,6 +924,12 @@ impl Sandbox for Linux {
                     libc::close(write_fd);
                 }
             }
+            if let Some((read_fd, write_fd)) = unotify_audit_pipe {
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+            }
             if let Some((read_fd, write_fd)) = pid_report_pipe {
                 unsafe {
                     libc::close(read_fd);
@@ -962,6 +1020,12 @@ impl Sandbox for Linux {
                         libc::close(write_fd);
                     }
                 }
+                if let Some((read_fd, write_fd)) = unotify_audit_pipe {
+                    unsafe {
+                        libc::close(read_fd);
+                        libc::close(write_fd);
+                    }
+                }
                 #[cfg(unix)]
                 if let Some(m) = pty_master_fd {
                     unsafe { libc::close(m) };
@@ -999,6 +1063,12 @@ impl Sandbox for Linux {
                     }
                 }
                 if let Some((r, w)) = dns_audit_pipe {
+                    unsafe {
+                        libc::close(r);
+                        libc::close(w);
+                    }
+                }
+                if let Some((r, w)) = unotify_audit_pipe {
                     unsafe {
                         libc::close(r);
                         libc::close(w);
@@ -1066,6 +1136,14 @@ impl Sandbox for Linux {
             None
         };
 
+        // Close unotify audit pipe write end in parent.
+        let unotify_audit_read_fd = if let Some((read_fd, write_fd)) = unotify_audit_pipe {
+            unsafe { libc::close(write_fd) };
+            Some(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(read_fd) })
+        } else {
+            None
+        };
+
         // ── Emit ProcessStarted ────────────────────────────────────
         if let Some(ref ctx) = audit_ctx {
             ctx.emit(AuditEvent::ProcessStarted {
@@ -1080,6 +1158,7 @@ impl Sandbox for Linux {
             cgroup_path,
             cgroup_mgr: self.cgroup_mgr.clone(),
             dns_audit_pipe: dns_audit_read_fd,
+            unotify_audit_pipe: unotify_audit_read_fd,
             pidfd,
             target_pid: stored_target_pid,
             waited: false,

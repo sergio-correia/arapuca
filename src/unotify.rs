@@ -1298,12 +1298,12 @@ fn apply_supervisor_seccomp() -> crate::Result<()> {
         libc::SYS_nanosleep,
     ] {
         allow.insert(nr, vec![]);
-
-        // clone3 in allowlist so the stacked ENOSYS filter wins over
-        // KillProcess (ENOSYS is more restrictive than Allow, less
-        // restrictive than KillProcess).
-        allow.insert(libc::SYS_clone3, vec![]);
     }
+
+    // clone3 in allowlist so the stacked ENOSYS filter wins over
+    // KillProcess (ENOSYS is more restrictive than Allow, less
+    // restrictive than KillProcess).
+    allow.insert(libc::SYS_clone3, vec![]);
 
     // Allowlist: matched syscalls → Allow, everything else → KillProcess.
     let filter = SeccompFilter::new(

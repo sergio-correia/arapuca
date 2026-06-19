@@ -401,6 +401,61 @@ pub fn bridge_env(
     )))
 }
 
+/// Build the `ARAPUCA_UNOTIFY_CONFIG` env var for the wrapper binary.
+///
+/// Encodes which unotify audit features are enabled and the bridge port
+/// for network enforcement. Format: comma-separated flags.
+pub fn unotify_env(profile: &crate::Profile) -> Option<(String, String)> {
+    if !profile.audit_file_access && !profile.audit_network {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if profile.audit_file_access {
+        parts.push("file".to_string());
+    }
+    if profile.audit_network {
+        parts.push("network".to_string());
+        if profile.use_netns {
+            parts.push(format!("bridge_port={BRIDGE_PORT}"));
+            parts.push("enforce".to_string());
+        }
+    }
+    Some(("ARAPUCA_UNOTIFY_CONFIG".into(), parts.join(",")))
+}
+
+/// Parse the `ARAPUCA_UNOTIFY_CONFIG` env var in the wrapper binary.
+#[cfg(seccomp_supported)]
+pub fn parse_unotify_config() -> Option<crate::unotify::UnotifyConfig> {
+    let val = std::env::var("ARAPUCA_UNOTIFY_CONFIG").ok()?;
+    let mut audit_file_access = false;
+    let mut audit_network = false;
+    let mut bridge_port = None;
+    let mut enforce_network = false;
+
+    for part in val.split(',') {
+        match part {
+            "file" => audit_file_access = true,
+            "network" => audit_network = true,
+            "enforce" => enforce_network = true,
+            s if s.starts_with("bridge_port=") => {
+                bridge_port = s.strip_prefix("bridge_port=").and_then(|p| p.parse().ok());
+            }
+            _ => {}
+        }
+    }
+
+    if !audit_file_access && !audit_network {
+        return None;
+    }
+
+    Some(crate::unotify::UnotifyConfig {
+        audit_file_access,
+        audit_network,
+        bridge_port,
+        enforce_network,
+    })
+}
+
 /// Per-platform default read and write paths for `arapuca run`.
 ///
 /// Returns `(read_paths, write_paths)` with the minimal filesystem

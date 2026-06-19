@@ -270,6 +270,38 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         }
     }
 
+    // ── Unotify supervisor ────────────────────────────────────
+    #[cfg(seccomp_supported)]
+    let unotify_fds = {
+        let unotify_config = crate::env::parse_unotify_config();
+        if let Some(ref config) = unotify_config {
+            if crate::unotify::unotify_available() {
+                let unotify_audit_fd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(-1);
+                if unotify_audit_fd >= 0 {
+                    match crate::unotify::fork_unotify_supervisor(config, unotify_audit_fd) {
+                        Ok(fds) => {
+                            audit_layer(audit_fd, "UnotifySupervisor", true, None);
+                            Some(fds)
+                        }
+                        Err(_) => {
+                            audit_layer(audit_fd, "UnotifySupervisor", false, None);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     // ── PID namespace ────────────────────────────────────────────
     if std::env::var("ARAPUCA_PID_NS").as_deref() == Ok("1") {
         let pid_report_fd: Option<i32> = std::env::var("ARAPUCA_PID_REPORT_FD")
@@ -318,6 +350,39 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         audit_layer(audit_fd, "Seccomp", true, None);
     }
 
+    // ── Install USER_NOTIF filter LAST + send listener FD ────────
+    #[cfg(seccomp_supported)]
+    if let Some(ref fds) = unotify_fds {
+        if crate::unotify::poll_readiness(fds.readiness_read, 5000).is_ok() {
+            unsafe { libc::close(fds.readiness_read) };
+            let unotify_config = crate::env::parse_unotify_config();
+            if let Some(ref config) = unotify_config {
+                let syscalls =
+                    crate::unotify::target_syscalls(config.audit_file_access, config.audit_network);
+                if let Ok(bpf) = crate::unotify::build_unotify_bpf(&syscalls) {
+                    if let Ok(listener_fd) = crate::unotify::install_unotify_filter(&bpf) {
+                        let _ = crate::unotify::send_fd(fds.socketpair_parent, listener_fd);
+                        unsafe {
+                            libc::close(listener_fd);
+                            libc::close(fds.socketpair_parent);
+                        }
+                    } else {
+                        unsafe { libc::close(fds.socketpair_parent) };
+                    }
+                } else {
+                    unsafe { libc::close(fds.socketpair_parent) };
+                }
+            } else {
+                unsafe { libc::close(fds.socketpair_parent) };
+            }
+        } else {
+            unsafe {
+                libc::close(fds.readiness_read);
+                libc::close(fds.socketpair_parent);
+            }
+        }
+    }
+
     // ── Rlimits ──────────────────────────────────────────────────
     #[cfg(unix)]
     if let Err(e) = crate::rlimit::apply_from_env() {
@@ -335,6 +400,12 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         unsafe { libc::close(fd) };
     }
     if let Some(fd) = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+    {
+        unsafe { libc::close(fd) };
+    }
+    if let Some(fd) = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
         .ok()
         .and_then(|s| s.parse::<i32>().ok())
     {
