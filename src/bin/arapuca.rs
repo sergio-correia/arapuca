@@ -547,6 +547,8 @@ fn run_subcommand(args: &[String]) {
     let mut allowed_hosts: Vec<arapuca::bridge::AllowedHost> = Vec::new();
     let mut deny_network = false;
     let mut no_pid_ns = false;
+    let mut audit_files = false;
+    let mut audit_network = false;
 
     // Find -- separator.
     let sep_pos = args.iter().position(|a| a == "--");
@@ -572,6 +574,8 @@ fn run_subcommand(args: &[String]) {
             eprintln!(
                 "  --deny-network     block all network; capture DNS queries as audit events"
             );
+            eprintln!("  --audit-files      emit file access and process spawn audit events");
+            eprintln!("  --audit-network    emit network connection audit events");
             eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
             eprintln!("  --no-pid-ns        disable PID namespace isolation");
             eprintln!("  -t, --tty          allocate a PTY for interactive programs");
@@ -761,6 +765,12 @@ fn run_subcommand(args: &[String]) {
             "--no-pid-ns" => {
                 no_pid_ns = true;
             }
+            "--audit-files" => {
+                audit_files = true;
+            }
+            "--audit-network" => {
+                audit_network = true;
+            }
             "--cwd" => {
                 i += 1;
                 let path = flag_args.get(i).unwrap_or_else(|| {
@@ -875,6 +885,8 @@ fn run_subcommand(args: &[String]) {
         use_pidns: use_netns && !no_pid_ns,
         dns_capture: deny_network,
         seccomp_profile,
+        audit_file_access: audit_files,
+        audit_network: audit_network || deny_network,
         ..Default::default()
     };
 
