@@ -363,6 +363,9 @@ pub fn wrapper_env(profile: &crate::Profile) -> crate::Result<Vec<(String, Strin
         "ARAPUCA_SECCOMP_PROFILE".into(),
         profile.seccomp_profile.as_str().into(),
     ));
+    if profile.seccomp_debug {
+        env.push(("ARAPUCA_SECCOMP_DEBUG".into(), "1".into()));
+    }
     Ok(env)
 }
 

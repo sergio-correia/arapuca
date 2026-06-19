@@ -1052,6 +1052,7 @@ pub struct UnotifyFds {
 pub fn fork_unotify_supervisor(
     config: &UnotifyConfig,
     audit_write_fd: RawFd,
+    seccomp_debug: bool,
 ) -> crate::Result<UnotifyFds> {
     // Create Unix socketpair for SCM_RIGHTS FD passing.
     let mut sv = [0i32; 2];
@@ -1143,7 +1144,7 @@ pub fn fork_unotify_supervisor(
 
         // Apply the supervisor's own seccomp allowlist.
         #[cfg(seccomp_supported)]
-        if let Err(_e) = apply_supervisor_seccomp() {
+        if let Err(_e) = apply_supervisor_seccomp(seccomp_debug) {
             crate::wrapper::write_stderr("unotify supervisor: seccomp failed\n");
             unsafe { libc::_exit(1) };
         }
@@ -1193,7 +1194,10 @@ pub fn fork_unotify_supervisor(
 /// notification recv/send/id_valid), openat+pread64 (for /proc/pid/mem),
 /// recvmsg (for SCM_RIGHTS), and standard runtime syscalls.
 #[cfg(seccomp_supported)]
-fn apply_supervisor_seccomp() -> crate::Result<()> {
+fn apply_supervisor_seccomp(debug: bool) -> crate::Result<()> {
+    if debug {
+        crate::seccomp::install_seccomp_debug_handler();
+    }
     use seccompiler::{
         SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
     };
@@ -1325,10 +1329,14 @@ fn apply_supervisor_seccomp() -> crate::Result<()> {
     .map_err(|e| Error::Seccomp(format!("prctl PR_SET_NAME rule: {e}")))?;
     allow.insert(libc::SYS_prctl, vec![prctl_set_vma, prctl_set_name]);
 
-    // Allowlist: matched syscalls → Allow, everything else → KillProcess.
+    let mismatch = if debug {
+        SeccompAction::Trap
+    } else {
+        SeccompAction::KillProcess
+    };
     let filter = SeccompFilter::new(
         allow.into_iter().collect(),
-        SeccompAction::KillProcess,
+        mismatch,
         SeccompAction::Allow,
         arch,
     )
@@ -1632,7 +1640,7 @@ mod tests {
                 libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64);
             }
             #[cfg(seccomp_supported)]
-            if apply_supervisor_seccomp().is_err() {
+            if apply_supervisor_seccomp(false).is_err() {
                 unsafe { libc::_exit(2) };
             }
             // If the filter is correct, write succeeds.

@@ -108,6 +108,8 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
     let audit_fd: Option<i32> =
         std::env::var_os("ARAPUCA_AUDIT_FD").and_then(|v| v.to_str().and_then(|s| s.parse().ok()));
 
+    let seccomp_debug = std::env::var("ARAPUCA_SECCOMP_DEBUG").as_deref() == Ok("1");
+
     // ── Resolve command path before Landlock ─────────────────────
     let cmd = if std::fs::metadata(cmd).is_ok() {
         std::fs::canonicalize(cmd)
@@ -227,7 +229,7 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
                 .ok()
                 .and_then(|s| s.parse::<i32>().ok())
                 .filter(|&fd| fd >= 0);
-            match crate::bridge::fork_bridge(port, Some(&uds_path), dns_audit_fd) {
+            match crate::bridge::fork_bridge(port, Some(&uds_path), dns_audit_fd, seccomp_debug) {
                 Ok(bridge_port) => {
                     let proxy = format!("http://127.0.0.1:{bridge_port}");
                     // SAFETY: single-threaded (Go runtime not started).
@@ -252,7 +254,7 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
                 .and_then(|s| s.parse::<i32>().ok())
                 .filter(|&fd| fd >= 0);
             if let Some(dns_fd) = dns_audit_fd {
-                match crate::bridge::fork_bridge(0, None, Some(dns_fd)) {
+                match crate::bridge::fork_bridge(0, None, Some(dns_fd), seccomp_debug) {
                     Ok(_) => {
                         audit_layer(audit_fd, "DnsCapture", true, None);
                     }
@@ -281,7 +283,11 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
                     .and_then(|s| s.parse::<i32>().ok())
                     .unwrap_or(-1);
                 if unotify_audit_fd >= 0 {
-                    match crate::unotify::fork_unotify_supervisor(config, unotify_audit_fd) {
+                    match crate::unotify::fork_unotify_supervisor(
+                        config,
+                        unotify_audit_fd,
+                        seccomp_debug,
+                    ) {
                         Ok(fds) => {
                             audit_layer(audit_fd, "UnotifySupervisor", true, None);
                             Some(fds)

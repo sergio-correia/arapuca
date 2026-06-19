@@ -293,6 +293,7 @@ pub fn fork_bridge(
     port: u16,
     uds_path: Option<&Path>,
     dns_audit_fd: Option<RawFd>,
+    seccomp_debug: bool,
 ) -> crate::Result<u16> {
     #[cfg(seccomp_supported)]
     {
@@ -407,7 +408,7 @@ pub fn fork_bridge(
         }
 
         #[cfg(seccomp_supported)]
-        if let Err(e) = apply_bridge_seccomp() {
+        if let Err(e) = apply_bridge_seccomp(seccomp_debug) {
             child_stderr(&format!("bridge: seccomp: {e}\n"));
             unsafe { libc::_exit(1) };
         }
@@ -546,12 +547,12 @@ const CLONE_NS_FLAGS: u64 = libc::CLONE_NEWNS as u64
 ///
 /// Returns an error if the filter cannot be built or installed.
 #[cfg(seccomp_supported)]
-pub fn apply_bridge_seccomp() -> crate::Result<()> {
-    let (clone3_prog, main_prog) = build_bridge_filters()?;
+pub fn apply_bridge_seccomp(debug: bool) -> crate::Result<()> {
+    if debug {
+        crate::seccomp::install_seccomp_debug_handler();
+    }
+    let (clone3_prog, main_prog) = build_bridge_filters(debug)?;
 
-    // Install clone3 ENOSYS filter first. Seccomp filter stacking:
-    // last installed is checked first, and the kernel takes the
-    // most restrictive action across all filters.
     seccompiler::apply_filter(&clone3_prog)
         .map_err(|e| crate::Error::Seccomp(format!("install clone3 filter: {e}")))?;
 
@@ -563,7 +564,9 @@ pub fn apply_bridge_seccomp() -> crate::Result<()> {
 }
 
 #[cfg(seccomp_supported)]
-fn build_bridge_filters() -> crate::Result<(seccompiler::BpfProgram, seccompiler::BpfProgram)> {
+fn build_bridge_filters(
+    debug: bool,
+) -> crate::Result<(seccompiler::BpfProgram, seccompiler::BpfProgram)> {
     use seccompiler::{
         SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
     };
@@ -758,11 +761,14 @@ fn build_bridge_filters() -> crate::Result<(seccompiler::BpfProgram, seccompiler
             })?;
 
     // Main allowlist filter.
-    //   mismatch_action = KillProcess (unknown syscalls → kill)
-    //   match_action    = Allow       (listed syscalls → allow)
+    let mismatch = if debug {
+        SeccompAction::Trap
+    } else {
+        SeccompAction::KillProcess
+    };
     let filter = SeccompFilter::new(
         allow.into_iter().collect(),
-        SeccompAction::KillProcess,
+        mismatch,
         SeccompAction::Allow,
         arch,
     )
@@ -1409,8 +1415,11 @@ fn handle_connect(mut uds: UnixStream, allowlist: &[AllowedHost]) -> io::Result<
 /// pre-initialized via a dummy DNS resolution before this function is
 /// called (`mprotect(PROT_EXEC)` is denied).
 #[cfg(seccomp_supported)]
-pub fn apply_connect_proxy_seccomp() -> crate::Result<()> {
-    let (clone3_prog, main_prog) = build_connect_proxy_filters()?;
+pub fn apply_connect_proxy_seccomp(debug: bool) -> crate::Result<()> {
+    if debug {
+        crate::seccomp::install_seccomp_debug_handler();
+    }
+    let (clone3_prog, main_prog) = build_connect_proxy_filters(debug)?;
 
     seccompiler::apply_filter(&clone3_prog)
         .map_err(|e| crate::Error::Seccomp(format!("install clone3 filter: {e}")))?;
@@ -1423,8 +1432,9 @@ pub fn apply_connect_proxy_seccomp() -> crate::Result<()> {
 }
 
 #[cfg(seccomp_supported)]
-fn build_connect_proxy_filters() -> crate::Result<(seccompiler::BpfProgram, seccompiler::BpfProgram)>
-{
+fn build_connect_proxy_filters(
+    debug: bool,
+) -> crate::Result<(seccompiler::BpfProgram, seccompiler::BpfProgram)> {
     use seccompiler::{
         SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
     };
@@ -1667,10 +1677,14 @@ fn build_connect_proxy_filters() -> crate::Result<(seccompiler::BpfProgram, secc
                 crate::Error::Seccomp(format!("compile clone3 filter: {e}"))
             })?;
 
-    // Main allowlist (default KillProcess).
+    let mismatch = if debug {
+        SeccompAction::Trap
+    } else {
+        SeccompAction::KillProcess
+    };
     let filter = SeccompFilter::new(
         allow.into_iter().collect(),
-        SeccompAction::KillProcess,
+        mismatch,
         SeccompAction::Allow,
         arch,
     )
@@ -1690,7 +1704,7 @@ mod tests {
     #[cfg(seccomp_supported)]
     #[test]
     fn bridge_seccomp_filters_build() {
-        let (clone3_prog, main_prog) = build_bridge_filters().unwrap();
+        let (clone3_prog, main_prog) = build_bridge_filters(false).unwrap();
         assert!(!clone3_prog.is_empty());
         assert!(!main_prog.is_empty());
     }
@@ -2165,7 +2179,7 @@ mod tests {
     #[cfg(seccomp_supported)]
     #[test]
     fn connect_proxy_seccomp_filters_build() {
-        let (clone3_prog, main_prog) = build_connect_proxy_filters().unwrap();
+        let (clone3_prog, main_prog) = build_connect_proxy_filters(false).unwrap();
         assert!(!clone3_prog.is_empty());
         assert!(!main_prog.is_empty());
     }

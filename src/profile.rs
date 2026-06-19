@@ -160,6 +160,14 @@ pub struct Profile {
     ///
     /// Requires kernel ≥ 5.5. Same Yama constraints as `audit_file_access`.
     pub audit_network: bool,
+    /// Switch child process seccomp filters to debug mode.
+    ///
+    /// When enabled, internal child processes (bridge, connect proxy,
+    /// unotify supervisor) use `SECCOMP_RET_TRAP` instead of
+    /// `SECCOMP_RET_KILL_PROCESS`, with a SIGSYS handler that prints
+    /// blocked syscall names to stderr. Does NOT affect the main
+    /// sandbox filter protecting the untrusted process.
+    pub seccomp_debug: bool,
 }
 
 /// Full configuration for launching a sandboxed process.

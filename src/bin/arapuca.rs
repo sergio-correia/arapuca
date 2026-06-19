@@ -214,6 +214,8 @@ fn main() {
             ..Default::default()
         };
 
+        let seccomp_debug = std::env::var("ARAPUCA_SECCOMP_DEBUG").as_deref() == Ok("1");
+
         // Bind-mount resolv.conf when DNS capture is active (before
         // Landlock, since we need to write a temp file).
         if std::env::var("ARAPUCA_DNS_AUDIT_FD").is_ok() {
@@ -236,15 +238,19 @@ fn main() {
                     .ok()
                     .and_then(|s| s.parse::<i32>().ok())
                     .filter(|&fd| fd >= 0);
-                let bridge_port =
-                    match arapuca::bridge::fork_bridge(port, Some(&uds_path), dns_audit_fd) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            audit_layer(audit_fd, "ProxyBridge", false, Some(&e.to_string()));
-                            eprintln!("arapuca: bridge: {e}");
-                            std::process::exit(1);
-                        }
-                    };
+                let bridge_port = match arapuca::bridge::fork_bridge(
+                    port,
+                    Some(&uds_path),
+                    dns_audit_fd,
+                    seccomp_debug,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        audit_layer(audit_fd, "ProxyBridge", false, Some(&e.to_string()));
+                        eprintln!("arapuca: bridge: {e}");
+                        std::process::exit(1);
+                    }
+                };
                 let proxy = format!("http://127.0.0.1:{bridge_port}");
                 // SAFETY: single-threaded at this point (between
                 // Landlock apply and seccomp apply, no threads spawned).
@@ -264,7 +270,7 @@ fn main() {
                     .and_then(|s| s.parse::<i32>().ok())
                     .filter(|&fd| fd >= 0);
                 if let Some(dns_fd) = dns_audit_fd {
-                    match arapuca::bridge::fork_bridge(0, None, Some(dns_fd)) {
+                    match arapuca::bridge::fork_bridge(0, None, Some(dns_fd), seccomp_debug) {
                         Ok(_) => {
                             audit_layer(audit_fd, "DnsCapture", true, None);
                         }
@@ -296,7 +302,11 @@ fn main() {
                         .and_then(|s| s.parse::<i32>().ok())
                         .unwrap_or(-1);
                     if unotify_audit_fd >= 0 {
-                        match arapuca::unotify::fork_unotify_supervisor(config, unotify_audit_fd) {
+                        match arapuca::unotify::fork_unotify_supervisor(
+                            config,
+                            unotify_audit_fd,
+                            seccomp_debug,
+                        ) {
                             Ok(fds) => {
                                 audit_layer(audit_fd, "UnotifySupervisor", true, None);
                                 Some(fds)
@@ -548,6 +558,8 @@ fn run_subcommand(args: &[String]) {
     let mut deny_network = false;
     let mut no_pid_ns = false;
     let mut audit_files = false;
+    #[allow(unused_mut, unused_variables)]
+    let mut seccomp_debug = false;
     let mut audit_network = false;
 
     // Find -- separator.
@@ -804,7 +816,7 @@ fn run_subcommand(args: &[String]) {
     #[cfg(target_os = "linux")]
     let (connect_proxy_socket, connect_proxy_pid, connect_proxy_pidfd) =
         if !allowed_hosts.is_empty() {
-            let (path, pid, pidfd) = fork_connect_proxy(&allowed_hosts);
+            let (path, pid, pidfd) = fork_connect_proxy(&allowed_hosts, seccomp_debug);
             (Some(path), Some(pid), Some(pidfd))
         } else {
             (None, None, None)
@@ -1584,7 +1596,10 @@ fn parse_allow_host(spec: &str) -> (String, u16) {
 }
 
 #[cfg(target_os = "linux")]
-fn fork_connect_proxy(allowed_hosts: &[arapuca::bridge::AllowedHost]) -> (PathBuf, i32, i32) {
+fn fork_connect_proxy(
+    allowed_hosts: &[arapuca::bridge::AllowedHost],
+    seccomp_debug: bool,
+) -> (PathBuf, i32, i32) {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
 
@@ -1640,6 +1655,10 @@ fn fork_connect_proxy(allowed_hosts: &[arapuca::bridge::AllowedHost]) -> (PathBu
 
         // Close all FDs >= 3 except pipe_write and listener_fd.
         unsafe { arapuca::bridge::close_fds_except(&[pipe_write, listener_fd]) };
+
+        // Ignore SIGPIPE so that writing to a broken UDS connection
+        // returns EPIPE instead of killing the proxy process.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
 
         // setsid clears PR_SET_PDEATHSIG, so pdeathsig must be re-set
         // after. The getppid race check below covers the window between
@@ -1730,7 +1749,7 @@ fn fork_connect_proxy(allowed_hosts: &[arapuca::bridge::AllowedHost]) -> (PathBu
         let _ = ("_arapuca-nss-init.invalid.", 0u16).to_socket_addrs();
 
         #[cfg(seccomp_supported)]
-        if let Err(e) = arapuca::bridge::apply_connect_proxy_seccomp() {
+        if let Err(e) = arapuca::bridge::apply_connect_proxy_seccomp(seccomp_debug) {
             eprintln!("arapuca run: proxy seccomp: {e}");
             unsafe { libc::_exit(1) };
         }
