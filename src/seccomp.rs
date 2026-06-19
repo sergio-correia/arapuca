@@ -930,6 +930,141 @@ pub(crate) fn syscall_name(nr: i64) -> &'static str {
     }
 }
 
+// ─── Seccomp debug handler ────────────────────────────────────────
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+static HANDLER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static REPORTED_SYSCALLS: [AtomicU64; 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+// SAFETY: This handler MUST remain async-signal-safe.
+// - No heap allocation (no format!(), no Vec, no String)
+// - No Rust I/O (no eprintln!, no stderr().write())
+// - Only libc::write(2, ...) for output
+// - syscall_name() is a pure match returning &'static str
+// - SYS_write MUST remain in all seccomp allowlists
+// Violating any of these causes infinite SIGSYS recursion under SA_NODEFER.
+extern "C" fn sigsys_handler(
+    _sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ucontext: *mut libc::c_void,
+) {
+    // Re-entrance guard: if our write(2) was itself trapped, bail.
+    if HANDLER_ACTIVE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    if info.is_null() {
+        HANDLER_ACTIVE.store(false, Ordering::Relaxed);
+        return;
+    }
+
+    // Extract si_syscall from siginfo_t at byte offset 0x18 (24).
+    // This is offsetof(_sifields) + sizeof(void*) = 16 + 8 on LP64.
+    // Stable kernel ABI on both x86_64 and aarch64.
+    let nr = unsafe {
+        let ptr = info as *const u8;
+        *(ptr.add(0x18) as *const i32)
+    } as i64;
+
+    // Dedup: only report each syscall number once.
+    // 512-bit bitset covers syscalls 0-511 (all current Linux syscalls).
+    let nr_u = nr as u64;
+    let idx = (nr_u / 64) as usize;
+    if idx < REPORTED_SYSCALLS.len() {
+        let bit = 1u64 << (nr_u % 64);
+        let prev = REPORTED_SYSCALLS[idx].fetch_or(bit, Ordering::Relaxed);
+        if prev & bit != 0 {
+            HANDLER_ACTIVE.store(false, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    let name = syscall_name(nr);
+
+    // Format into a stack buffer: "seccomp: blocked syscall NNN (name)\n"
+    let mut buf = [0u8; 128];
+    let prefix = b"seccomp: blocked syscall ";
+    let mut pos = prefix.len();
+    buf[..pos].copy_from_slice(prefix);
+
+    // Integer to decimal (async-signal-safe, no allocation).
+    let nr_abs = if nr < 0 { -(nr as i128) } else { nr as i128 } as u64;
+    if nr < 0 {
+        buf[pos] = b'-';
+        pos += 1;
+    }
+    let mut digits = [0u8; 20];
+    let mut dpos = 0;
+    let mut n = nr_abs;
+    if n == 0 {
+        digits[0] = b'0';
+        dpos = 1;
+    } else {
+        while n > 0 {
+            digits[dpos] = b'0' + (n % 10) as u8;
+            n /= 10;
+            dpos += 1;
+        }
+    }
+    for i in (0..dpos).rev() {
+        if pos < buf.len() {
+            buf[pos] = digits[i];
+            pos += 1;
+        }
+    }
+
+    // Append " (name)\n"
+    let suffix_len = 2 + name.len() + 2; // " (" + name + ")\n"
+    if pos + suffix_len <= buf.len() {
+        buf[pos] = b' ';
+        buf[pos + 1] = b'(';
+        pos += 2;
+        buf[pos..pos + name.len()].copy_from_slice(name.as_bytes());
+        pos += name.len();
+        buf[pos] = b')';
+        buf[pos + 1] = b'\n';
+        pos += 2;
+    } else if pos < buf.len() {
+        buf[pos] = b'\n';
+        pos += 1;
+    }
+
+    unsafe { libc::write(2, buf.as_ptr().cast(), pos) };
+
+    HANDLER_ACTIVE.store(false, Ordering::Relaxed);
+}
+
+/// Install a SIGSYS handler for seccomp debug mode.
+///
+/// When seccomp filters use `SECCOMP_RET_TRAP` (debug mode) instead
+/// of `SECCOMP_RET_KILL_PROCESS`, blocked syscalls deliver SIGSYS.
+/// This handler prints the blocked syscall number and name to stderr,
+/// then returns (the syscall returns -ENOSYS to the caller).
+///
+/// Must be called BEFORE seccomp filters are applied. Each blocked
+/// syscall number is reported only once (deduplication via bitset).
+pub(crate) fn install_seccomp_debug_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigsys_handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
+        if libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut()) != 0 {
+            let msg = b"seccomp debug: failed to install SIGSYS handler\n";
+            libc::write(2, msg.as_ptr().cast(), msg.len());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
