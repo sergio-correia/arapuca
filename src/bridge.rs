@@ -693,6 +693,17 @@ fn build_bridge_filters(
     .map_err(|e| crate::Error::Seccomp(format!("socket rule: {e}")))?;
     allow.insert(libc::SYS_socket, vec![socket_unix_rule]);
 
+    // File I/O (glibc NSS, /etc/resolv.conf, UDS path resolution).
+    for nr in [
+        libc::SYS_openat,
+        libc::SYS_newfstatat,
+        libc::SYS_fstat,
+        libc::SYS_lseek,
+        libc::SYS_pread64,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
     // Misc (needed by glibc/Rust runtime).
     for nr in [
         libc::SYS_getrandom,
