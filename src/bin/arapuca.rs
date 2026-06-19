@@ -587,6 +587,7 @@ fn run_subcommand(args: &[String]) {
                 "  --deny-network     block all network; capture DNS queries as audit events"
             );
             eprintln!("  --audit-files      emit file access and process spawn audit events");
+            eprintln!("  --seccomp-debug    log blocked syscalls to stderr instead of killing");
             eprintln!("  --audit-network    emit network connection audit events");
             eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
             eprintln!("  --no-pid-ns        disable PID namespace isolation");
@@ -783,6 +784,9 @@ fn run_subcommand(args: &[String]) {
             "--audit-network" => {
                 audit_network = true;
             }
+            "--seccomp-debug" => {
+                seccomp_debug = true;
+            }
             "--cwd" => {
                 i += 1;
                 let path = flag_args.get(i).unwrap_or_else(|| {
@@ -899,6 +903,7 @@ fn run_subcommand(args: &[String]) {
         seccomp_profile,
         audit_file_access: audit_files,
         audit_network: audit_network || deny_network,
+        seccomp_debug,
         ..Default::default()
     };
 
