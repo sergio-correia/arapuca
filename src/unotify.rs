@@ -1305,6 +1305,26 @@ fn apply_supervisor_seccomp() -> crate::Result<()> {
     // restrictive than KillProcess).
     allow.insert(libc::SYS_clone3, vec![]);
 
+    // prctl: allow VMA naming (glibc malloc arena labeling under
+    // concurrent thread load) and thread naming.
+    const PR_SET_VMA: u64 = 0x53564d41;
+    let prctl_set_vma = SeccompRule::new(vec![
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, PR_SET_VMA)
+            .map_err(|e| Error::Seccomp(format!("prctl PR_SET_VMA condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("prctl PR_SET_VMA rule: {e}")))?;
+    let prctl_set_name = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::PR_SET_NAME as u64,
+        )
+        .map_err(|e| Error::Seccomp(format!("prctl PR_SET_NAME condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("prctl PR_SET_NAME rule: {e}")))?;
+    allow.insert(libc::SYS_prctl, vec![prctl_set_vma, prctl_set_name]);
+
     // Allowlist: matched syscalls → Allow, everything else → KillProcess.
     let filter = SeccompFilter::new(
         allow.into_iter().collect(),

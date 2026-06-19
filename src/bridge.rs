@@ -705,6 +705,28 @@ fn build_bridge_filters() -> crate::Result<(seccompiler::BpfProgram, seccompiler
         allow.insert(nr, vec![]);
     }
 
+    // prctl: allow VMA naming and thread naming only.
+    // glibc >= 2.35 calls prctl(PR_SET_VMA) to label malloc arenas.
+    // Under concurrent thread load, new arenas are created, and the
+    // missing prctl kills the bridge via SECCOMP_RET_KILL_PROCESS.
+    const PR_SET_VMA: u64 = 0x53564d41;
+    let prctl_set_vma = SeccompRule::new(vec![
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, PR_SET_VMA)
+            .map_err(|e| crate::Error::Seccomp(format!("prctl PR_SET_VMA condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("prctl PR_SET_VMA rule: {e}")))?;
+    let prctl_set_name = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::PR_SET_NAME as u64,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("prctl PR_SET_NAME condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("prctl PR_SET_NAME rule: {e}")))?;
+    allow.insert(libc::SYS_prctl, vec![prctl_set_vma, prctl_set_name]);
+
     // clone3: return ENOSYS to force glibc fallback to clone
     // (where our flag filter applies). Allowing clone3 would let
     // the bridge create processes with arbitrary namespace flags,
@@ -788,23 +810,27 @@ pub(crate) fn relay_connected(
     let tcp_write = tcp_read.try_clone()?;
     let uds_write = uds_read.try_clone()?;
 
-    let t1 = std::thread::spawn(move || {
-        let mut src = &tcp_read;
-        let mut dst = &uds_write;
-        if let Err(e) = io::copy(&mut src, &mut dst) {
-            log::debug!("relay tcp→uds: {e}");
-        }
-        let _ = uds_write.shutdown(Shutdown::Write);
-    });
+    let t1 = std::thread::Builder::new()
+        .spawn(move || {
+            let mut src = &tcp_read;
+            let mut dst = &uds_write;
+            if let Err(e) = io::copy(&mut src, &mut dst) {
+                log::debug!("relay tcp→uds: {e}");
+            }
+            let _ = uds_write.shutdown(Shutdown::Write);
+        })
+        .map_err(io::Error::other)?;
 
-    let t2 = std::thread::spawn(move || {
-        let mut src = &uds_read;
-        let mut dst = &tcp_write;
-        if let Err(e) = io::copy(&mut src, &mut dst) {
-            log::debug!("relay uds→tcp: {e}");
-        }
-        let _ = tcp_write.shutdown(Shutdown::Write);
-    });
+    let t2 = std::thread::Builder::new()
+        .spawn(move || {
+            let mut src = &uds_read;
+            let mut dst = &tcp_write;
+            if let Err(e) = io::copy(&mut src, &mut dst) {
+                log::debug!("relay uds→tcp: {e}");
+            }
+            let _ = tcp_write.shutdown(Shutdown::Write);
+        })
+        .map_err(io::Error::other)?;
 
     let _ = t1.join();
     let _ = t2.join();
@@ -864,13 +890,21 @@ pub fn listen_and_relay(listener: TcpListener, uds_path: &Path, ready_fd: RawFd)
             continue;
         }
 
-        let active = Arc::clone(&active);
+        let thread_active = Arc::clone(&active);
         let path = uds_path.to_path_buf();
 
-        std::thread::spawn(move || {
-            let _ = relay(tcp, &path);
+        if std::thread::Builder::new()
+            .spawn(move || {
+                if let Err(e) = relay(tcp, &path) {
+                    log::debug!("bridge: relay: {e}");
+                }
+                thread_active.fetch_sub(1, Ordering::Release);
+            })
+            .is_err()
+        {
             active.fetch_sub(1, Ordering::Release);
-        });
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     Ok(())
@@ -1297,12 +1331,17 @@ pub fn connect_proxy_listen(
 
         let hosts = Arc::clone(&allowed);
 
-        std::thread::spawn(move || {
-            let _guard = guard;
-            if let Err(e) = handle_connect(uds, &hosts) {
-                log::debug!("connect proxy: {e}");
-            }
-        });
+        if std::thread::Builder::new()
+            .spawn(move || {
+                let _guard = guard;
+                if let Err(e) = handle_connect(uds, &hosts) {
+                    log::debug!("connect proxy: {e}");
+                }
+            })
+            .is_err()
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     Ok(())
@@ -1418,9 +1457,11 @@ fn build_connect_proxy_filters() -> crate::Result<(seccompiler::BpfProgram, secc
         allow.insert(nr, vec![]);
     }
 
-    // DNS resolution.
+    // DNS resolution (glibc getaddrinfo uses ioctl(FIONREAD),
+    // sendmmsg, and recvmmsg internally for UDP DNS queries).
     for nr in [
         libc::SYS_sendmmsg,
+        libc::SYS_recvmmsg,
         libc::SYS_recvmsg,
         libc::SYS_bind,
         libc::SYS_getsockname,
@@ -1428,6 +1469,21 @@ fn build_connect_proxy_filters() -> crate::Result<(seccompiler::BpfProgram, secc
     ] {
         allow.insert(nr, vec![]);
     }
+
+    // ioctl: restrict to FIONREAD (DNS) and FIONBIO (non-blocking).
+    const IOCTL_FIONREAD: u64 = 0x541B;
+    const IOCTL_FIONBIO: u64 = 0x5421;
+    let ioctl_fionread = SeccompRule::new(vec![
+        SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, IOCTL_FIONREAD)
+            .map_err(|e| crate::Error::Seccomp(format!("ioctl FIONREAD condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("ioctl FIONREAD rule: {e}")))?;
+    let ioctl_fionbio = SeccompRule::new(vec![
+        SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, IOCTL_FIONBIO)
+            .map_err(|e| crate::Error::Seccomp(format!("ioctl FIONBIO condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("ioctl FIONBIO rule: {e}")))?;
+    allow.insert(libc::SYS_ioctl, vec![ioctl_fionread, ioctl_fionbio]);
 
     // NSS file I/O.
     for nr in [
@@ -1568,9 +1624,29 @@ fn build_connect_proxy_filters() -> crate::Result<(seccompiler::BpfProgram, secc
         libc::SYS_getgid,
         libc::SYS_geteuid,
         libc::SYS_getegid,
+        libc::SYS_uname,
     ] {
         allow.insert(nr, vec![]);
     }
+
+    // prctl: allow VMA naming and thread naming (same as bridge).
+    const PR_SET_VMA: u64 = 0x53564d41;
+    let prctl_set_vma = SeccompRule::new(vec![
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, PR_SET_VMA)
+            .map_err(|e| crate::Error::Seccomp(format!("prctl PR_SET_VMA condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("prctl PR_SET_VMA rule: {e}")))?;
+    let prctl_set_name = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::PR_SET_NAME as u64,
+        )
+        .map_err(|e| crate::Error::Seccomp(format!("prctl PR_SET_NAME condition: {e}")))?,
+    ])
+    .map_err(|e| crate::Error::Seccomp(format!("prctl PR_SET_NAME rule: {e}")))?;
+    allow.insert(libc::SYS_prctl, vec![prctl_set_vma, prctl_set_name]);
 
     // clone3 ENOSYS filter (same pattern as bridge).
     let mut clone3_deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
