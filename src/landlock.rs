@@ -78,12 +78,23 @@ pub fn apply(profile: &Profile) -> crate::Result<()> {
         .map_err(|e| Error::Landlock(format!("restrict self: {e}")))?;
 
     match status.ruleset {
-        RulesetStatus::FullyEnforced | RulesetStatus::PartiallyEnforced => {
-            log::info!(
-                "landlock: applied ({:?}, ABI {:?})",
-                status.ruleset,
-                abi_version()
-            );
+        RulesetStatus::FullyEnforced => {
+            log::info!("landlock: applied (FullyEnforced, ABI {:?})", abi_version());
+            Ok(())
+        }
+        RulesetStatus::PartiallyEnforced => {
+            let abi = abi_version();
+            let missing: &[&str] = match abi {
+                0..=1 => &["Refer", "Truncate", "IOCTL_DEV", "SCOPE_UNIX"],
+                2 => &["Truncate", "IOCTL_DEV", "SCOPE_UNIX"],
+                3 => &["IOCTL_DEV", "SCOPE_UNIX"],
+                4 => &["SCOPE_UNIX"],
+                _ => &[],
+            };
+            log::info!("landlock: applied (PartiallyEnforced, ABI {abi})");
+            if !missing.is_empty() {
+                log::warn!("landlock: ABI {abi} — not enforced: {}", missing.join(", "));
+            }
             Ok(())
         }
         RulesetStatus::NotEnforced => Err(Error::Landlock("ruleset not enforced".into())),
