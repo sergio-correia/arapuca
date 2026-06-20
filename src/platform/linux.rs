@@ -163,12 +163,25 @@ impl Sandbox for Linux {
         } else {
             // Wrapper binary not available — no
             // Landlock/seccomp/rlimit/NO_NEW_PRIVS.
+            //
+            // On seccomp-supported architectures (x86_64, aarch64),
+            // always fail: the sandbox is meaningless without the
+            // wrapper applying Landlock + seccomp + rlimits.
+            // On other architectures, only fail if filesystem
+            // restrictions were explicitly requested.
+            if cfg!(seccomp_supported) {
+                return Err(Error::Process(
+                    "arapuca wrapper binary not found — refusing to launch \
+                     without Landlock/seccomp enforcement"
+                        .into(),
+                ));
+            }
             let has_paths =
                 !cfg.profile.read_paths.is_empty() || !cfg.profile.write_paths.is_empty();
             if has_paths {
                 return Err(Error::Process(
                     "filesystem restrictions requested but arapuca wrapper binary \
-                     not found — refusing to launch without Landlock/seccomp enforcement"
+                     not found"
                         .into(),
                 ));
             }
