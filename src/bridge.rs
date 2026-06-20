@@ -100,6 +100,23 @@ pub fn loopback_up() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
+    // Timeout prevents hanging in doubly-nested user namespaces
+    // (e.g., rootless containers) where the kernel may not deliver
+    // the RTM_SETLINK ACK.
+    let tv = libc::timeval {
+        tv_sec: 3,
+        tv_usec: 0,
+    };
+    unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+
     let mut resp = std::mem::MaybeUninit::<Response>::uninit();
 
     // SAFETY: fd is valid, resp is a stack-local buffer with correct
@@ -273,10 +290,12 @@ pub unsafe fn close_fds_except(keep: &[i32]) {
         return;
     }
 
-    // Last resort: brute-force close from 3 to sysconf(_SC_OPEN_MAX).
+    // Last resort: brute-force close from 3 to sysconf(_SC_OPEN_MAX),
+    // capped at 65536 to avoid hanging on systemd systems where
+    // _SC_OPEN_MAX returns ~1 billion (fs.nr_open).
     // SAFETY: sysconf(_SC_OPEN_MAX) returns the system FD limit.
     let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } as i32;
-    let limit = max_fd.min(4096);
+    let limit = if max_fd > 0 { max_fd.min(65536) } else { 4096 };
     for fd in 3..limit {
         if !keep.contains(&fd) {
             // SAFETY: closing an already-closed FD is harmless.
