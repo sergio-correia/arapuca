@@ -407,9 +407,28 @@ fn main() {
                         .and_then(|bpf| arapuca::unotify::install_unotify_filter(&bpf))
                     {
                         Ok(listener_fd) => {
-                            let _ = arapuca::unotify::send_fd(fds.socketpair_parent, listener_fd);
+                            // Send the FD number via write() instead of
+                            // sendmsg(SCM_RIGHTS) — sendmsg is intercepted
+                            // by the USER_NOTIF filter we just installed.
+                            let fd_bytes = listener_fd.to_ne_bytes();
+                            let ret = unsafe {
+                                libc::write(
+                                    fds.socketpair_parent,
+                                    fd_bytes.as_ptr().cast(),
+                                    fd_bytes.len(),
+                                )
+                            };
+                            if ret != fd_bytes.len() as isize {
+                                eprintln!(
+                                    "arapuca: send unotify fd number: {}",
+                                    std::io::Error::last_os_error()
+                                );
+                                unsafe { libc::_exit(1) };
+                            }
+                            // Keep listener_fd open — supervisor duplicates
+                            // it via pidfd_getfd. CLOEXEC ensures it closes
+                            // on exec.
                             unsafe {
-                                libc::close(listener_fd);
                                 libc::close(fds.socketpair_parent);
                             }
                         }

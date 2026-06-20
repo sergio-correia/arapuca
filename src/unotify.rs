@@ -8,8 +8,10 @@
 //!
 //! The supervisor is forked BEFORE any seccomp filters are installed
 //! (to avoid inheriting the USER_NOTIF filter, which would deadlock
-//! on the supervisor's own `openat` calls). The listener FD is passed
-//! to the supervisor via `SCM_RIGHTS` after filter installation.
+//! on the supervisor's own `openat` calls). The listener FD number is
+//! sent via `write()` on a socketpair; the supervisor duplicates it
+//! via `pidfd_getfd`. This avoids `sendmsg` (SCM_RIGHTS) which would
+//! be intercepted by the USER_NOTIF filter.
 //!
 //! Requires kernel ≥ 5.5 (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`).
 
@@ -43,9 +45,9 @@ const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = ioc(IOC_WRITE | IOC_READ, 0, 80)
 const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = ioc(IOC_WRITE | IOC_READ, 1, 24);
 
 /// `ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id)` — check if notification is still valid.
-/// Kernel 5.17+ uses `_IOWR`; kernels 5.0–5.16 use `_IOR`. The 5.17+
+/// Kernel 5.17+ uses `_IOW`; kernels 5.0–5.16 use `_IOR`. The 5.17+
 /// kernel accepts both, so we try the new one first and fall back.
-const SECCOMP_IOCTL_NOTIF_ID_VALID_NEW: libc::c_ulong = ioc(IOC_WRITE | IOC_READ, 2, 8);
+const SECCOMP_IOCTL_NOTIF_ID_VALID_NEW: libc::c_ulong = ioc(IOC_WRITE, 2, 8);
 const SECCOMP_IOCTL_NOTIF_ID_VALID_OLD: libc::c_ulong = ioc(IOC_READ, 2, 8);
 
 // ─── BPF construction ─────────────────────────────────────────────
@@ -225,105 +227,14 @@ pub fn notif_id_valid(listener_fd: RawFd, id: u64) -> bool {
     if ret == 0 {
         return true;
     }
-    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTTY) {
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    if errno == Some(libc::ENOTTY) || errno == Some(libc::EINVAL) {
         id_mut = id;
         let ret =
             unsafe { libc::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ID_VALID_OLD, &mut id_mut) };
         return ret == 0;
     }
     false
-}
-
-// ─── SCM_RIGHTS helpers ───────────────────────────────────────────
-
-/// Send a file descriptor over a Unix socket using SCM_RIGHTS.
-pub fn send_fd(socket_fd: RawFd, fd_to_send: RawFd) -> std::io::Result<()> {
-    let iov = libc::iovec {
-        iov_base: b"\x00" as *const u8 as *mut libc::c_void,
-        iov_len: 1,
-    };
-
-    // cmsg buffer: header + one i32 FD
-    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; cmsg_space];
-
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg_space as _;
-
-    // SAFETY: CMSG_FIRSTHDR on a valid msghdr with allocated control buffer.
-    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-    if cmsg.is_null() {
-        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
-    }
-    unsafe {
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
-        std::ptr::copy_nonoverlapping(
-            &fd_to_send as *const i32 as *const u8,
-            libc::CMSG_DATA(cmsg),
-            std::mem::size_of::<i32>(),
-        );
-    }
-
-    let ret = unsafe { libc::sendmsg(socket_fd, &msg, 0) };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Receive a file descriptor from a Unix socket using SCM_RIGHTS.
-///
-/// Blocks until the FD is received.
-pub fn recv_fd(socket_fd: RawFd) -> std::io::Result<RawFd> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: byte.as_mut_ptr().cast(),
-        iov_len: 1,
-    };
-
-    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; cmsg_space];
-
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg_space as _;
-
-    let ret = unsafe { libc::recvmsg(socket_fd, &mut msg, 0) };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if ret == 0 {
-        return Err(std::io::Error::from_raw_os_error(libc::ECONNRESET));
-    }
-
-    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-    if cmsg.is_null() {
-        return Err(std::io::Error::from_raw_os_error(libc::ENODATA));
-    }
-    unsafe {
-        if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-            return Err(std::io::Error::from_raw_os_error(libc::ENODATA));
-        }
-        let mut fd: i32 = -1;
-        std::ptr::copy_nonoverlapping(
-            libc::CMSG_DATA(cmsg),
-            &mut fd as *mut i32 as *mut u8,
-            std::mem::size_of::<i32>(),
-        );
-        if fd < 0 {
-            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
-        }
-        // Set CLOEXEC on the received FD.
-        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-        Ok(fd)
-    }
 }
 
 // ─── /proc/<pid>/mem reader ────────────────────────────────────────
@@ -741,16 +652,22 @@ fn handle_sendmsg(
     }
 }
 
-/// Check if a sockaddr points to the bridge address.
+/// Check if a sockaddr points to the bridge or DNS capture address.
 fn is_bridge_addr(info: &SockaddrInfo, config: &UnotifyConfig) -> bool {
-    let Some(bridge_port) = config.bridge_port else {
-        return false;
-    };
-    if info.port != bridge_port {
+    if !info.destination.starts_with("127.0.0.1:") {
         return false;
     }
-    // Bridge is always on 127.0.0.1.
-    info.destination.starts_with("127.0.0.1:")
+    if let Some(bridge_port) = config.bridge_port {
+        if info.port == bridge_port {
+            return true;
+        }
+    }
+    if let Some(dns_port) = config.dns_port {
+        if info.port == dns_port {
+            return true;
+        }
+    }
+    false
 }
 
 /// Read a u64 from a target process's memory.
@@ -1021,6 +938,8 @@ pub struct UnotifyConfig {
     pub audit_network: bool,
     /// Bridge port to allow through (127.0.0.1:<port>).
     pub bridge_port: Option<u16>,
+    /// DNS capture port to allow through (127.0.0.1:<port>).
+    pub dns_port: Option<u16>,
     /// When true, block non-bridge INET connections with ECONNREFUSED.
     /// When false, log connections and allow them through (audit-only).
     /// Should only be true when `use_netns` is active (netns is the
@@ -1056,10 +975,10 @@ pub struct UnotifyFds {
 /// 1. Poll `readiness_read` (confirms supervisor is alive)
 /// 2. Install normal seccomp filters
 /// 3. Install USER_NOTIF filter LAST → get listener FD
-/// 4. Send listener FD via `send_fd(socketpair_parent, listener_fd)`
-/// 5. Close socketpair_parent + listener_fd
+/// 4. Write listener FD number via `write(socketpair_parent, &fd)`
+/// 5. Close socketpair_parent (keep listener_fd for pidfd_getfd)
 ///
-/// The supervisor blocks on `recv_fd` until step 4 completes.
+/// The supervisor reads the FD number, duplicates it via pidfd_getfd.
 ///
 /// `audit_write_fd` is the write end of the audit pipe (created by
 /// the library, passed via ARAPUCA_UNOTIFY_AUDIT_FD).
@@ -1109,6 +1028,7 @@ pub fn fork_unotify_supervisor(
         audit_file_access: config.audit_file_access,
         audit_network: config.audit_network,
         bridge_port: config.bridge_port,
+        dns_port: config.dns_port,
         enforce_network: config.enforce_network,
     };
 
@@ -1178,12 +1098,29 @@ pub fn fork_unotify_supervisor(
             libc::close(readiness_write);
         }
 
-        // Block until the caller sends the listener FD.
-        let listener_fd = match recv_fd(sp_child) {
-            Ok(fd) => fd,
-            Err(_) => unsafe { libc::_exit(1) },
-        };
+        // Read the listener FD number from the socketpair, then
+        // duplicate it via pidfd_getfd. We use write/read instead of
+        // sendmsg/recvmsg (SCM_RIGHTS) because sendmsg is intercepted
+        // by the USER_NOTIF filter when audit_network is enabled.
+        let mut fd_bytes = [0u8; 4];
+        let ret = unsafe { libc::read(sp_child, fd_bytes.as_mut_ptr().cast(), 4) };
         unsafe { libc::close(sp_child) };
+        if ret != 4 {
+            unsafe { libc::_exit(1) };
+        }
+        let remote_fd = i32::from_ne_bytes(fd_bytes);
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, parent_pid, 0i32) } as i32;
+        if pidfd < 0 {
+            crate::wrapper::write_stderr("unotify supervisor: pidfd_open failed\n");
+            unsafe { libc::_exit(1) };
+        }
+        let listener_fd =
+            unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, remote_fd, 0u32) } as i32;
+        unsafe { libc::close(pidfd) };
+        if listener_fd < 0 {
+            crate::wrapper::write_stderr("unotify supervisor: pidfd_getfd failed\n");
+            unsafe { libc::_exit(1) };
+        }
 
         // Enter the supervisor loop (never returns).
         supervisor_loop(listener_fd, audit_write_fd, &child_config);
@@ -1206,7 +1143,8 @@ pub fn fork_unotify_supervisor(
 /// Derived from the bridge's allowlist (bridge.rs:build_bridge_filters)
 /// but tailored for the supervisor's workload: ioctl (for seccomp
 /// notification recv/send/id_valid), openat+pread64 (for /proc/pid/mem),
-/// recvmsg (for SCM_RIGHTS), and standard runtime syscalls.
+/// pidfd_open+pidfd_getfd (for listener FD transfer), and standard
+/// runtime syscalls.
 #[cfg(seccomp_supported)]
 fn apply_supervisor_seccomp(debug: bool) -> crate::Result<()> {
     if debug {
@@ -1220,7 +1158,8 @@ fn apply_supervisor_seccomp(debug: bool) -> crate::Result<()> {
     let arch = crate::seccomp::target_arch()?;
     let mut allow: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
 
-    // I/O: /proc/<pid>/mem reading, audit pipe writing, socketpair recv.
+    // I/O: /proc/<pid>/mem reading, audit pipe writing, socketpair recv,
+    // pidfd_open+pidfd_getfd for listener FD transfer.
     for nr in [
         libc::SYS_openat,
         libc::SYS_read,
@@ -1229,9 +1168,10 @@ fn apply_supervisor_seccomp(debug: bool) -> crate::Result<()> {
         libc::SYS_close,
         libc::SYS_writev,
         libc::SYS_lseek,
-        libc::SYS_recvmsg,
         libc::SYS_ppoll,
         libc::SYS_fcntl,
+        libc::SYS_pidfd_open,
+        libc::SYS_pidfd_getfd,
     ] {
         allow.insert(nr, vec![]);
     }
@@ -1562,55 +1502,13 @@ mod tests {
     }
 
     #[test]
-    fn scm_rights_round_trip() {
-        // Create a socketpair, send a pipe FD through it, verify receipt.
-        let mut sv = [0i32; 2];
-        let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
-        assert_eq!(ret, 0, "socketpair failed");
-
-        // Create a pipe to use as the FD to send.
-        let mut pipe_fds = [0i32; 2];
-        let ret = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
-        assert_eq!(ret, 0, "pipe failed");
-
-        // Send pipe read end through the socketpair.
-        send_fd(sv[0], pipe_fds[0]).expect("send_fd failed");
-
-        // Receive it on the other end.
-        let received_fd = recv_fd(sv[1]).expect("recv_fd failed");
-        assert!(received_fd >= 0, "received FD should be valid");
-        assert_ne!(
-            received_fd, pipe_fds[0],
-            "received FD should be a new descriptor"
-        );
-
-        // Verify it's actually the same pipe: write on write-end, read on received.
-        let msg = b"hello";
-        let written = unsafe { libc::write(pipe_fds[1], msg.as_ptr().cast(), msg.len()) };
-        assert_eq!(written, 5);
-
-        let mut buf = [0u8; 5];
-        let read = unsafe { libc::read(received_fd, buf.as_mut_ptr().cast(), buf.len()) };
-        assert_eq!(read, 5);
-        assert_eq!(&buf, b"hello");
-
-        // Cleanup.
-        unsafe {
-            libc::close(sv[0]);
-            libc::close(sv[1]);
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-            libc::close(received_fd);
-        }
-    }
-
-    #[test]
     fn unotify_config_any_enabled() {
         assert!(
             !UnotifyConfig {
                 audit_file_access: false,
                 audit_network: false,
                 bridge_port: None,
+                dns_port: None,
                 enforce_network: false,
             }
             .any_enabled()
@@ -1620,6 +1518,7 @@ mod tests {
                 audit_file_access: true,
                 audit_network: false,
                 bridge_port: None,
+                dns_port: None,
                 enforce_network: false,
             }
             .any_enabled()
@@ -1629,6 +1528,7 @@ mod tests {
                 audit_file_access: false,
                 audit_network: true,
                 bridge_port: Some(8080),
+                dns_port: None,
                 enforce_network: true,
             }
             .any_enabled()
