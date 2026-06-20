@@ -347,9 +347,14 @@ impl Process {
                 libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
         }
+        const MAX_AUDIT_DRAIN: usize = 16 * 1024 * 1024;
         let mut data = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
+            if data.len() >= MAX_AUDIT_DRAIN {
+                log::warn!("dns audit pipe: truncating at {MAX_AUDIT_DRAIN} bytes");
+                break;
+            }
             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n < 0 {
                 let err = std::io::Error::last_os_error();
@@ -406,9 +411,9 @@ impl Process {
                         if let Err(e) = ctx.emit(AuditEvent::NetworkBlocked {
                             timestamp: ctx.timestamp(),
                             pid,
-                            destination: entry.domain,
+                            destination: crate::audit::sanitize_audit_string(&entry.domain),
                             protocol: "dns".into(),
-                            detail: Some(entry.qtype),
+                            detail: Some(crate::audit::sanitize_audit_string(&entry.qtype)),
                         }) {
                             log::error!("audit emit failed: {e}");
                         }
@@ -464,9 +469,14 @@ impl Process {
             }
         }
 
+        const MAX_AUDIT_DRAIN: usize = 16 * 1024 * 1024;
         let mut data = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
+            if data.len() >= MAX_AUDIT_DRAIN {
+                log::warn!("unotify audit pipe: truncating at {MAX_AUDIT_DRAIN} bytes");
+                break;
+            }
             let n = unsafe { libc::read(raw_fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 data.extend_from_slice(&buf[..n as usize]);
@@ -526,19 +536,25 @@ impl Process {
                             "file_access" => ctx.emit(AuditEvent::FileAccess {
                                 timestamp: ctx.timestamp(),
                                 pid: event_pid,
-                                path: entry.path.unwrap_or_default(),
+                                path: crate::audit::sanitize_audit_string(
+                                    &entry.path.unwrap_or_default(),
+                                ),
                                 flags: entry.flags.unwrap_or(0),
                                 is_write: entry.is_write.unwrap_or(false),
                             }),
                             "process_spawn" => ctx.emit(AuditEvent::ProcessSpawn {
                                 timestamp: ctx.timestamp(),
                                 pid: event_pid,
-                                binary: entry.binary.unwrap_or_default(),
+                                binary: crate::audit::sanitize_audit_string(
+                                    &entry.binary.unwrap_or_default(),
+                                ),
                             }),
                             "network_blocked" => ctx.emit(AuditEvent::NetworkBlocked {
                                 timestamp: ctx.timestamp(),
                                 pid: event_pid,
-                                destination: entry.dest.unwrap_or_default(),
+                                destination: crate::audit::sanitize_audit_string(
+                                    &entry.dest.unwrap_or_default(),
+                                ),
                                 protocol: entry.protocol.unwrap_or_else(|| "tcp".into()),
                                 detail: Some("unotify".into()),
                             }),
