@@ -545,6 +545,7 @@ pub fn handle_notification(
                 dropped,
                 args[1],
                 args[2],
+                "connect",
             )
         }
         libc::SYS_sendto => {
@@ -561,12 +562,21 @@ pub fn handle_notification(
                     dropped,
                     args[4],
                     args[5],
+                    "sendto",
                 )
             }
         }
         libc::SYS_sendmsg => {
             // sendmsg(sockfd, &msghdr, flags)
-            handle_sendmsg(listener_fd, notif, audit_fd, config, dropped, args[1])
+            handle_sendmsg(
+                listener_fd,
+                notif,
+                audit_fd,
+                config,
+                dropped,
+                args[1],
+                "sendmsg",
+            )
         }
         libc::SYS_sendmmsg => {
             // sendmmsg(sockfd, &mmsghdr_vec, vlen, flags)
@@ -595,7 +605,7 @@ pub fn handle_notification(
                                     audit_fd,
                                     dropped,
                                     &format!(
-                                        "{{\"type\":\"network_blocked\",\"pid\":{pid},\"dest\":\"{}\",\"protocol\":\"udp\"}}",
+                                        "{{\"type\":\"network_blocked\",\"pid\":{pid},\"dest\":\"{}\",\"syscall\":\"sendmmsg\"}}",
                                         crate::wrapper::json_escape(&info.destination),
                                     ),
                                 );
@@ -625,6 +635,7 @@ pub fn handle_notification(
 /// supervisor's read and the kernel's re-execution. Network blocking via
 /// unotify is defense-in-depth only — the network namespace (use_netns)
 /// is the primary security boundary.
+#[allow(clippy::too_many_arguments)]
 fn handle_connect(
     listener_fd: RawFd,
     notif: &libc::seccomp_notif,
@@ -633,6 +644,7 @@ fn handle_connect(
     dropped: &mut u64,
     addr: u64,
     addrlen: u64,
+    syscall: &str,
 ) -> bool {
     let pid = notif.pid;
 
@@ -645,7 +657,7 @@ fn handle_connect(
                     audit_fd,
                     dropped,
                     &format!(
-                        "{{\"type\":\"network_blocked\",\"pid\":{pid},\"dest\":\"{}\",\"protocol\":\"tcp\"}}",
+                        "{{\"type\":\"network_blocked\",\"pid\":{pid},\"dest\":\"{}\",\"syscall\":\"{syscall}\"}}",
                         crate::wrapper::json_escape(&info.destination),
                     ),
                 );
@@ -702,6 +714,7 @@ fn handle_sendmsg(
     config: &UnotifyConfig,
     dropped: &mut u64,
     msghdr_addr: u64,
+    syscall: &str,
 ) -> bool {
     let pid = notif.pid;
     // Read msg_name (pointer) and msg_namelen from msghdr.
@@ -719,6 +732,7 @@ fn handle_sendmsg(
             dropped,
             name_addr,
             namelen as u64,
+            syscall,
         ),
         _ => {
             // NULL msg_name or failed read — connected socket, allow.

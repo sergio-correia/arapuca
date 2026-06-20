@@ -527,6 +527,8 @@ impl Process {
                     #[serde(default)]
                     protocol: Option<String>,
                     #[serde(default)]
+                    syscall: Option<String>,
+                    #[serde(default)]
                     count: Option<u64>,
                 }
                 match serde_json::from_str::<UnotifyLine>(line) {
@@ -555,7 +557,11 @@ impl Process {
                                 destination: crate::audit::sanitize_audit_string(
                                     &entry.dest.unwrap_or_default(),
                                 ),
-                                protocol: entry.protocol.unwrap_or_else(|| "tcp".into()),
+                                protocol: entry
+                                    .syscall
+                                    .clone()
+                                    .or(entry.protocol)
+                                    .unwrap_or_else(|| "tcp".into()),
                                 detail: Some("unotify".into()),
                             }),
                             "dropped" => {
