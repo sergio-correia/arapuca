@@ -66,18 +66,28 @@ impl Darwin {
     ///
     /// This is a best-effort mechanism — the 500ms polling window means
     /// a process can briefly exceed the limit before being killed.
-    fn start_memory_monitor(pid: u32, limit_mb: u64) {
+    fn start_memory_monitor(
+        pid: u32,
+        limit_mb: u64,
+    ) -> Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )> {
         if limit_mb == 0 {
-            return;
+            return None;
         }
         let limit_kb = limit_mb * 1024;
-        std::thread::spawn(move || {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_clone = std::sync::Arc::clone(&cancel);
+        let handle = std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
 
+                if cancel_clone.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+
                 // Check if process still exists.
-                // SAFETY: kill with signal 0 checks process existence
-                // without sending a signal.
                 let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
                 if !alive {
                     break;
@@ -103,9 +113,6 @@ impl Darwin {
                         "memory limit exceeded: {rss_kb}KB > {limit_kb}KB, \
                          killing process group {pid}"
                     );
-                    // Kill the entire process group.
-                    // SAFETY: Sending SIGKILL to a process group. The
-                    // negative PID targets the group.
                     unsafe {
                         libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                     }
@@ -113,6 +120,7 @@ impl Darwin {
                 }
             }
         });
+        Some((cancel, handle))
     }
 
     /// Start a parent-PID watchdog thread.
@@ -620,7 +628,11 @@ impl Sandbox for Darwin {
         }
 
         // Start memory monitor thread (best-effort RSS polling).
-        Self::start_memory_monitor(pid, cfg.profile.max_memory_mb);
+        let monitor = Self::start_memory_monitor(pid, cfg.profile.max_memory_mb);
+        let (monitor_cancel, monitor_handle) = match monitor {
+            Some((c, h)) => (Some(c), Some(h)),
+            None => (None, None),
+        };
 
         if let Some(ref ctx) = audit_ctx {
             let _ = ctx.emit(AuditEvent::LayerApplied {
@@ -653,6 +665,8 @@ impl Sandbox for Darwin {
             } else {
                 None
             },
+            monitor_cancel,
+            monitor_handle,
             audit_ctx,
             final_stats: None,
         })

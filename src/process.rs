@@ -59,6 +59,12 @@ pub struct Process {
     /// Launch timestamp for macOS Seatbelt denial log querying.
     #[cfg(target_os = "macos")]
     pub(crate) launch_timestamp: Option<std::time::SystemTime>,
+    /// Cancellation flag for macOS memory monitor thread.
+    #[cfg(target_os = "macos")]
+    pub(crate) monitor_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Join handle for macOS memory monitor thread.
+    #[cfg(target_os = "macos")]
+    pub(crate) monitor_handle: Option<std::thread::JoinHandle<()>>,
     /// Reference to the cgroup manager for stats/cleanup. Linux only.
     #[cfg(target_os = "linux")]
     pub(crate) cgroup_mgr: Option<std::sync::Arc<crate::cgroup::CgroupManager>>,
@@ -185,6 +191,38 @@ impl Process {
             return Err(crate::Error::Process("process already waited".into()));
         }
         let pid = self.pid();
+
+        // macOS: wait for child to exit without reaping (WNOWAIT),
+        // then cancel the memory monitor, join it, then reap.
+        // This prevents PID recycling between reap and monitor stop.
+        #[cfg(target_os = "macos")]
+        if self.monitor_cancel.is_some() {
+            let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            loop {
+                let ret = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut siginfo,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if ret == 0 {
+                    break;
+                }
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+            // Child is dead but still a zombie — safe to stop monitor.
+            if let Some(cancel) = self.monitor_cancel.take() {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            if let Some(handle) = self.monitor_handle.take() {
+                let _ = handle.join();
+            }
+        }
+
         let status = match &mut self.child {
             ChildHandle::Managed(c) => c
                 .wait()
@@ -484,6 +522,9 @@ impl Process {
                 break;
             } else {
                 let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
                 if err.kind() == std::io::ErrorKind::WouldBlock {
                     let mut pfd2 = libc::pollfd {
                         fd: raw_fd,
@@ -557,11 +598,13 @@ impl Process {
                                 destination: crate::audit::sanitize_audit_string(
                                     &entry.dest.unwrap_or_default(),
                                 ),
-                                protocol: entry
-                                    .syscall
-                                    .clone()
-                                    .or(entry.protocol)
-                                    .unwrap_or_else(|| "tcp".into()),
+                                protocol: crate::audit::sanitize_audit_string(
+                                    &entry
+                                        .syscall
+                                        .clone()
+                                        .or(entry.protocol)
+                                        .unwrap_or_else(|| "tcp".into()),
+                                ),
                                 detail: Some("unotify".into()),
                             }),
                             "dropped" => {
@@ -800,6 +843,18 @@ impl Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
+        // macOS: cancel the memory monitor before killing/reaping
+        // the child to prevent PID recycling races.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(cancel) = self.monitor_cancel.take() {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            if let Some(handle) = self.monitor_handle.take() {
+                let _ = handle.join();
+            }
+        }
+
         // Kill the child process first to ensure resources can be
         // reclaimed. Without this, cgroups can't be destroyed while
         // occupied, and a live process would run unsupervised after
@@ -954,6 +1009,10 @@ mod tests {
                 waited: false,
                 #[cfg(target_os = "macos")]
                 launch_timestamp: None,
+                #[cfg(target_os = "macos")]
+                monitor_cancel: None,
+                #[cfg(target_os = "macos")]
+                monitor_handle: None,
                 #[cfg(all(target_os = "linux", feature = "microvm"))]
                 passt: None,
                 pty_master: None,
@@ -1051,6 +1110,10 @@ mod tests {
             waited: false,
             #[cfg(target_os = "macos")]
             launch_timestamp: None,
+            #[cfg(target_os = "macos")]
+            monitor_cancel: None,
+            #[cfg(target_os = "macos")]
+            monitor_handle: None,
             #[cfg(all(target_os = "linux", feature = "microvm"))]
             passt: None,
             pty_master: None,
@@ -1118,6 +1181,10 @@ mod tests {
             waited: false,
             #[cfg(target_os = "macos")]
             launch_timestamp: None,
+            #[cfg(target_os = "macos")]
+            monitor_cancel: None,
+            #[cfg(target_os = "macos")]
+            monitor_handle: None,
             #[cfg(all(target_os = "linux", feature = "microvm"))]
             passt: None,
             pty_master: None,
@@ -1161,6 +1228,10 @@ mod tests {
             waited: false,
             #[cfg(target_os = "macos")]
             launch_timestamp: None,
+            #[cfg(target_os = "macos")]
+            monitor_cancel: None,
+            #[cfg(target_os = "macos")]
+            monitor_handle: None,
             #[cfg(all(target_os = "linux", feature = "microvm"))]
             passt: None,
             pty_master: None,
