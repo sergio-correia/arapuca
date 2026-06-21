@@ -293,8 +293,9 @@ fn main() {
         // The supervisor must be in the host PID namespace so
         // /proc/<pid>/mem accesses the right process.
         #[cfg(seccomp_supported)]
+        let unotify_config = arapuca::env::parse_unotify_config();
+        #[cfg(seccomp_supported)]
         let unotify_fds = {
-            let unotify_config = arapuca::env::parse_unotify_config();
             if let Some(ref config) = unotify_config {
                 if arapuca::unotify::unotify_available() {
                     let unotify_audit_fd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
@@ -397,7 +398,6 @@ fn main() {
             if arapuca::unotify::poll_readiness(fds.readiness_read, 5000).is_ok() {
                 unsafe { libc::close(fds.readiness_read) };
 
-                let unotify_config = arapuca::env::parse_unotify_config();
                 if let Some(ref config) = unotify_config {
                     let syscalls = arapuca::unotify::target_syscalls(
                         config.audit_file_access,

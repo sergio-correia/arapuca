@@ -274,8 +274,9 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
 
     // ── Unotify supervisor ────────────────────────────────────
     #[cfg(seccomp_supported)]
+    let unotify_config = crate::env::parse_unotify_config();
+    #[cfg(seccomp_supported)]
     let unotify_fds = {
-        let unotify_config = crate::env::parse_unotify_config();
         if let Some(ref config) = unotify_config {
             if crate::unotify::unotify_available() {
                 let unotify_audit_fd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
@@ -361,7 +362,6 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
     if let Some(ref fds) = unotify_fds {
         if crate::unotify::poll_readiness(fds.readiness_read, 5000).is_ok() {
             unsafe { libc::close(fds.readiness_read) };
-            let unotify_config = crate::env::parse_unotify_config();
             if let Some(ref config) = unotify_config {
                 let syscalls =
                     crate::unotify::target_syscalls(config.audit_file_access, config.audit_network);
