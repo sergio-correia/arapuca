@@ -356,12 +356,16 @@ pub fn wrapper_env(profile: &crate::Profile) -> crate::Result<Vec<(String, Strin
             profile.max_open_files.to_string(),
         ));
     }
-    // Always emit — never rely on absence encoding Strict.
+    // Always emit — never rely on absence encoding a default.
     // Linux::launch() calls env_clear() so ambient vars don't leak,
     // but defense-in-depth: explicit is better than implicit.
     env.push((
         "ARAPUCA_SECCOMP_PROFILE".into(),
         profile.seccomp_profile.as_str().into(),
+    ));
+    env.push((
+        "ARAPUCA_ALLOW_EXEC".into(),
+        if profile.allow_exec { "1" } else { "0" }.into(),
     ));
     if profile.seccomp_debug {
         env.push(("ARAPUCA_SECCOMP_DEBUG".into(), "1".into()));

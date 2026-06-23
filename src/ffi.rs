@@ -1008,7 +1008,7 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
         }
     }
     #[cfg(target_os = "linux")]
-    if let Err(e) = crate::landlock::apply(inner) {
+    if let Err(e) = crate::landlock::apply(inner, None) {
         set_error(&format!("landlock: {e}"));
         return -1;
     }

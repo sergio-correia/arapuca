@@ -200,10 +200,12 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
     {
         let read_paths = env_paths_os("ARAPUCA_READ_PATHS");
         let write_paths = env_paths_os("ARAPUCA_WRITE_PATHS");
+        let allow_exec = std::env::var("ARAPUCA_ALLOW_EXEC").as_deref() != Ok("0");
 
         let profile = crate::Profile {
             read_paths,
             write_paths,
+            allow_exec,
             ..Default::default()
         };
 
@@ -213,7 +215,8 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
             audit_layer(audit_fd, "ResolvConfOverride", ok, None);
         }
 
-        if let Err(e) = crate::landlock::apply(&profile) {
+        let target = std::path::Path::new(&cmd);
+        if let Err(e) = crate::landlock::apply(&profile, Some(target)) {
             audit_layer(audit_fd, "Landlock", false, Some(&e.to_string()));
             write_stderr(&format!("arapuca: selfexec: landlock: {e}\n"));
             unsafe { libc::_exit(1) };

@@ -207,10 +207,12 @@ fn main() {
     {
         let read_paths = env_paths("ARAPUCA_READ_PATHS");
         let write_paths = env_paths("ARAPUCA_WRITE_PATHS");
+        let allow_exec = std::env::var("ARAPUCA_ALLOW_EXEC").as_deref() != Ok("0");
 
         let profile = arapuca::Profile {
             read_paths,
             write_paths,
+            allow_exec,
             ..Default::default()
         };
 
@@ -223,7 +225,8 @@ fn main() {
             audit_layer(audit_fd, "ResolvConfOverride", ok, None);
         }
 
-        if let Err(e) = arapuca::landlock::apply(&profile) {
+        let target = std::path::Path::new(&cmd);
+        if let Err(e) = arapuca::landlock::apply(&profile, Some(target)) {
             audit_layer(audit_fd, "Landlock", false, Some(&e.to_string()));
             eprintln!("arapuca: landlock: {e}");
             std::process::exit(1);
@@ -1757,7 +1760,7 @@ fn fork_connect_proxy(
                     read_paths: proxy_read_paths,
                     ..Default::default()
                 };
-                if let Err(e) = arapuca::landlock::apply(&proxy_profile) {
+                if let Err(e) = arapuca::landlock::apply(&proxy_profile, None) {
                     eprintln!("arapuca: connect proxy: landlock: {e}");
                     unsafe { libc::_exit(1) };
                 }
