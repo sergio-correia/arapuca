@@ -542,6 +542,14 @@ impl Process {
         }
         drop(owned_fd);
 
+        #[cfg(not(feature = "serde"))]
+        if !data.is_empty() {
+            log::warn!(
+                "unotify audit: {} bytes discarded (compile with 'serde' feature to emit events)",
+                data.len()
+            );
+        }
+
         #[cfg(feature = "serde")]
         if !data.is_empty() {
             let text = String::from_utf8_lossy(&data);
