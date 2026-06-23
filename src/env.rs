@@ -427,6 +427,9 @@ pub fn unotify_env(profile: &crate::Profile) -> Option<(String, String)> {
             parts.push("enforce".to_string());
         }
     }
+    if profile.dns_capture && profile.use_netns {
+        parts.push("dns_port=53".to_string());
+    }
     Some(("ARAPUCA_UNOTIFY_CONFIG".into(), parts.join(",")))
 }
 
@@ -437,6 +440,7 @@ pub fn parse_unotify_config() -> Option<crate::unotify::UnotifyConfig> {
     let mut audit_file_access = false;
     let mut audit_network = false;
     let mut bridge_port = None;
+    let mut dns_port = None;
     let mut enforce_network = false;
 
     for part in val.split(',') {
@@ -446,6 +450,9 @@ pub fn parse_unotify_config() -> Option<crate::unotify::UnotifyConfig> {
             "enforce" => enforce_network = true,
             s if s.starts_with("bridge_port=") => {
                 bridge_port = s.strip_prefix("bridge_port=").and_then(|p| p.parse().ok());
+            }
+            s if s.starts_with("dns_port=") => {
+                dns_port = s.strip_prefix("dns_port=").and_then(|p| p.parse().ok());
             }
             _ => {}
         }
@@ -459,6 +466,7 @@ pub fn parse_unotify_config() -> Option<crate::unotify::UnotifyConfig> {
         audit_file_access,
         audit_network,
         bridge_port,
+        dns_port,
         enforce_network,
     })
 }

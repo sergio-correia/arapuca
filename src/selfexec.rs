@@ -195,6 +195,46 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         }
     }
 
+    // ── Unotify supervisor ────────────────────────────────────
+    // Fork BEFORE Landlock, PID namespace, and seccomp.
+    // The supervisor reads /proc/<pid>/mem which Landlock
+    // excludes, and must be in the host PID namespace.
+    #[cfg(seccomp_supported)]
+    let unotify_config = crate::env::parse_unotify_config();
+    #[cfg(seccomp_supported)]
+    let unotify_fds = {
+        if let Some(ref config) = unotify_config {
+            if crate::unotify::unotify_available() {
+                let unotify_audit_fd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(-1);
+                if unotify_audit_fd >= 0 {
+                    match crate::unotify::fork_unotify_supervisor(
+                        config,
+                        unotify_audit_fd,
+                        seccomp_debug,
+                    ) {
+                        Ok(fds) => {
+                            audit_layer(audit_fd, "UnotifySupervisor", true, None);
+                            Some(fds)
+                        }
+                        Err(_) => {
+                            audit_layer(audit_fd, "UnotifySupervisor", false, None);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     // ── Landlock ─────────────────────────────────────────────────
     #[cfg(target_os = "linux")]
     {
@@ -274,43 +314,6 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
             unsafe { libc::_exit(1) };
         }
     }
-
-    // ── Unotify supervisor ────────────────────────────────────
-    #[cfg(seccomp_supported)]
-    let unotify_config = crate::env::parse_unotify_config();
-    #[cfg(seccomp_supported)]
-    let unotify_fds = {
-        if let Some(ref config) = unotify_config {
-            if crate::unotify::unotify_available() {
-                let unotify_audit_fd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
-                    .ok()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(-1);
-                if unotify_audit_fd >= 0 {
-                    match crate::unotify::fork_unotify_supervisor(
-                        config,
-                        unotify_audit_fd,
-                        seccomp_debug,
-                    ) {
-                        Ok(fds) => {
-                            audit_layer(audit_fd, "UnotifySupervisor", true, None);
-                            Some(fds)
-                        }
-                        Err(_) => {
-                            audit_layer(audit_fd, "UnotifySupervisor", false, None);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
 
     // ── PID namespace ────────────────────────────────────────────
     if std::env::var("ARAPUCA_PID_NS").as_deref() == Ok("1") {

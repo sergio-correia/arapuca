@@ -225,76 +225,10 @@ fn main() {
             audit_layer(audit_fd, "ResolvConfOverride", ok, None);
         }
 
-        let target = std::path::Path::new(&cmd);
-        if let Err(e) = arapuca::landlock::apply(&profile, Some(target)) {
-            audit_layer(audit_fd, "Landlock", false, Some(&e.to_string()));
-            eprintln!("arapuca: landlock: {e}");
-            std::process::exit(1);
-        }
-        audit_layer(audit_fd, "Landlock", true, None);
-
-        // Bridge: fork a TCP-to-UDS relay before seccomp is applied.
-        // Activated when ARAPUCA_PROXY_BRIDGE=<port>:<uds_path> is set.
-        match arapuca::bridge::parse_bridge_env() {
-            Ok(Some((port, uds_path))) => {
-                let dns_audit_fd = std::env::var("ARAPUCA_DNS_AUDIT_FD")
-                    .ok()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .filter(|&fd| fd >= 0);
-                let bridge_port = match arapuca::bridge::fork_bridge(
-                    port,
-                    Some(&uds_path),
-                    dns_audit_fd,
-                    seccomp_debug,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        audit_layer(audit_fd, "ProxyBridge", false, Some(&e.to_string()));
-                        eprintln!("arapuca: bridge: {e}");
-                        std::process::exit(1);
-                    }
-                };
-                let proxy = format!("http://127.0.0.1:{bridge_port}");
-                // SAFETY: single-threaded at this point (between
-                // Landlock apply and seccomp apply, no threads spawned).
-                unsafe {
-                    std::env::set_var("HTTP_PROXY", &proxy);
-                    std::env::set_var("HTTPS_PROXY", &proxy);
-                    std::env::set_var("http_proxy", &proxy);
-                    std::env::set_var("https_proxy", &proxy);
-                }
-                audit_layer(audit_fd, "ProxyBridge", true, None);
-            }
-            Ok(None) => {
-                // DNS-only bridge: fork bridge for DNS capture without
-                // TCP relay when ARAPUCA_DNS_AUDIT_FD is set.
-                let dns_audit_fd = std::env::var("ARAPUCA_DNS_AUDIT_FD")
-                    .ok()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .filter(|&fd| fd >= 0);
-                if let Some(dns_fd) = dns_audit_fd {
-                    match arapuca::bridge::fork_bridge(0, None, Some(dns_fd), seccomp_debug) {
-                        Ok(_) => {
-                            audit_layer(audit_fd, "DnsCapture", true, None);
-                        }
-                        Err(e) => {
-                            audit_layer(audit_fd, "DnsCapture", false, Some(&e.to_string()));
-                            eprintln!("arapuca: dns bridge: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("arapuca: bridge: {e}");
-                std::process::exit(1);
-            }
-        }
-
         // ── Unotify supervisor ─────────────────────────────────
-        // Fork the supervisor BEFORE PID namespace and seccomp.
-        // The supervisor must be in the host PID namespace so
-        // /proc/<pid>/mem accesses the right process.
+        // Fork BEFORE Landlock, PID namespace, and seccomp.
+        // The supervisor reads /proc/<pid>/mem which Landlock
+        // excludes, and must be in the host PID namespace.
         #[cfg(seccomp_supported)]
         let unotify_config = arapuca::env::parse_unotify_config();
         #[cfg(seccomp_supported)]
@@ -337,6 +271,70 @@ fn main() {
                 None
             }
         };
+
+        let target = std::path::Path::new(&cmd);
+        if let Err(e) = arapuca::landlock::apply(&profile, Some(target)) {
+            audit_layer(audit_fd, "Landlock", false, Some(&e.to_string()));
+            eprintln!("arapuca: landlock: {e}");
+            std::process::exit(1);
+        }
+        audit_layer(audit_fd, "Landlock", true, None);
+
+        // Bridge: fork a TCP-to-UDS relay before seccomp is applied.
+        // Activated when ARAPUCA_PROXY_BRIDGE=<port>:<uds_path> is set.
+        match arapuca::bridge::parse_bridge_env() {
+            Ok(Some((port, uds_path))) => {
+                let dns_audit_fd = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .filter(|&fd| fd >= 0);
+                let bridge_port = match arapuca::bridge::fork_bridge(
+                    port,
+                    Some(&uds_path),
+                    dns_audit_fd,
+                    seccomp_debug,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        audit_layer(audit_fd, "ProxyBridge", false, Some(&e.to_string()));
+                        eprintln!("arapuca: bridge: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let proxy = format!("http://127.0.0.1:{bridge_port}");
+                unsafe {
+                    std::env::set_var("HTTP_PROXY", &proxy);
+                    std::env::set_var("HTTPS_PROXY", &proxy);
+                    std::env::set_var("http_proxy", &proxy);
+                    std::env::set_var("https_proxy", &proxy);
+                }
+                audit_layer(audit_fd, "ProxyBridge", true, None);
+            }
+            Ok(None) => {
+                // DNS-only bridge: fork bridge for DNS capture without
+                // TCP relay when ARAPUCA_DNS_AUDIT_FD is set.
+                let dns_audit_fd = std::env::var("ARAPUCA_DNS_AUDIT_FD")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .filter(|&fd| fd >= 0);
+                if let Some(dns_fd) = dns_audit_fd {
+                    match arapuca::bridge::fork_bridge(0, None, Some(dns_fd), seccomp_debug) {
+                        Ok(_) => {
+                            audit_layer(audit_fd, "DnsCapture", true, None);
+                        }
+                        Err(e) => {
+                            audit_layer(audit_fd, "DnsCapture", false, Some(&e.to_string()));
+                            eprintln!("arapuca: dns bridge: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("arapuca: bridge: {e}");
+                std::process::exit(1);
+            }
+        }
 
         // PID namespace: unshare + fork between bridge and seccomp.
         // The parent (in host PID ns) stays as a signal relay; the
