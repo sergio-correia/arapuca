@@ -550,8 +550,9 @@ impl Sandbox for Linux {
         // ── Unotify audit pipe ─────────────────────────────────────
         // When file access or network auditing is enabled, create a
         // pipe for the unotify supervisor to write NDJSON audit lines.
-        let unotify_wants =
-            (cfg.profile.audit_file_access || cfg.profile.audit_network) && use_wrapper;
+        let unotify_wants = (cfg.profile.audit_file_access || cfg.profile.audit_network)
+            && use_wrapper
+            && cfg!(feature = "serde");
         let unotify_audit_pipe = if unotify_wants {
             let mut fds = [0i32; 2];
             let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
@@ -585,6 +586,10 @@ impl Sandbox for Linux {
             } else {
                 let reason = if !cfg.profile.audit_file_access && !cfg.profile.audit_network {
                     SkipReason::NotConfigured
+                } else if !cfg!(feature = "serde") {
+                    SkipReason::ComponentMissing(
+                        "serde feature required for unotify audit parsing".into(),
+                    )
                 } else if !use_wrapper {
                     SkipReason::ComponentMissing("wrapper binary not available".into())
                 } else {
