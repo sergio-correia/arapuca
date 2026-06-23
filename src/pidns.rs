@@ -32,12 +32,13 @@ pub fn unshare_pidns() -> std::io::Result<()> {
 /// where the parent died between fork and prctl (see
 /// `check_parent_liveness`).
 ///
-/// `audit_fd` and `dns_audit_fd` are closed in the parent (so the
-/// orchestrator's audit pipe reader sees EOF). `pid_report_fd` is
-/// written with the child's host PID and closed.
+/// `audit_fd`, `dns_audit_fd`, and `unotify_audit_fd` are closed in
+/// the parent (so the orchestrator's pipe readers see EOF).
+/// `pid_report_fd` is written with the child's host PID and closed.
 pub fn fork_into_pidns(
     audit_fd: Option<i32>,
     dns_audit_fd: Option<i32>,
+    unotify_audit_fd: Option<i32>,
     pid_report_fd: Option<i32>,
 ) -> Option<i32> {
     // Liveness pipe: parent holds write end, child reads it after
@@ -82,7 +83,13 @@ pub fn fork_into_pidns(
     // on _exit, causing EOF on the child's read end.
 
     // This path never returns.
-    parent_relay(child_pid, audit_fd, dns_audit_fd, pid_report_fd);
+    parent_relay(
+        child_pid,
+        audit_fd,
+        dns_audit_fd,
+        unotify_audit_fd,
+        pid_report_fd,
+    );
 }
 
 /// Check the liveness pipe after `prctl(PR_SET_PDEATHSIG)`.
@@ -116,6 +123,7 @@ fn parent_relay(
     child_pid: i32,
     audit_fd: Option<i32>,
     dns_audit_fd: Option<i32>,
+    unotify_audit_fd: Option<i32>,
     pid_report_fd: Option<i32>,
 ) -> ! {
     // 1. Hold a pidfd to prevent the kernel from recycling the
@@ -146,6 +154,9 @@ fn parent_relay(
         unsafe { libc::close(fd) };
     }
     if let Some(fd) = dns_audit_fd {
+        unsafe { libc::close(fd) };
+    }
+    if let Some(fd) = unotify_audit_fd {
         unsafe { libc::close(fd) };
     }
 

@@ -324,6 +324,10 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
             .ok()
             .and_then(|s| s.parse::<i32>().ok())
             .filter(|&fd| fd >= 0);
+        let unotify_audit_fd: Option<i32> = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .filter(|&fd| fd >= 0);
 
         if let Err(e) = crate::pidns::unshare_pidns() {
             audit_layer(audit_fd, "PidNamespace", false, Some(&e.to_string()));
@@ -332,7 +336,8 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         }
         audit_layer(audit_fd, "PidNamespace", true, None);
 
-        let liveness_fd = crate::pidns::fork_into_pidns(audit_fd, dns_audit_fd, pid_report_fd);
+        let liveness_fd =
+            crate::pidns::fork_into_pidns(audit_fd, dns_audit_fd, unotify_audit_fd, pid_report_fd);
 
         let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
         if ret != 0 {
