@@ -239,25 +239,54 @@ pub fn notif_id_valid(listener_fd: RawFd, id: u64) -> bool {
 
 // ─── /proc/<pid>/mem reader ────────────────────────────────────────
 
+/// RAII wrapper for a `/proc/<pid>/mem` file descriptor.
+///
+/// Opened once per notification and passed to all read helpers,
+/// avoiding repeated open/close cycles for the same PID.
+struct MemFd(RawFd);
+
+impl MemFd {
+    fn open(pid: u32) -> Option<Self> {
+        let mem_path = format!("/proc/{pid}/mem\0");
+        let fd = unsafe { libc::open(mem_path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 { None } else { Some(Self(fd)) }
+    }
+
+    fn pread(&self, buf: &mut [u8], offset: u64) -> isize {
+        unsafe {
+            libc::pread(
+                self.0,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                offset as libc::off_t,
+            )
+        }
+    }
+
+    fn fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl Drop for MemFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
 /// Read a NUL-terminated string from a target process's memory.
 ///
-/// Opens `/proc/<pid>/mem` and reads up to `max_len` bytes at `addr`,
-/// scanning for a NUL terminator. Returns `None` if the process exited,
-/// the address is unmapped, or the read fails for any reason.
-pub fn read_string_from_pid(pid: u32, addr: u64, max_len: usize) -> Option<String> {
+/// Reads up to `max_len` bytes at `addr` via the cached `MemFd`,
+/// scanning for a NUL terminator. Returns `None` if the address is
+/// NULL, unmapped, or the read fails for any reason.
+fn read_string(mem: &MemFd, addr: u64, max_len: usize) -> Option<String> {
     if addr == 0 {
-        return None;
-    }
-    let mem_path = format!("/proc/{pid}/mem\0");
-    let fd = unsafe { libc::open(mem_path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
         return None;
     }
 
     let cap = max_len.min(4096);
-    let mut buf = vec![0u8; cap];
-    let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), cap, addr as libc::off_t) };
-    unsafe { libc::close(fd) };
+    let mut buf = [0u8; 4096];
+    let n = mem.pread(&mut buf[..cap], addr);
 
     if n <= 0 {
         return None;
@@ -289,26 +318,20 @@ pub enum SockaddrResult {
     ReadFailed,
 }
 
-/// Wrapper around `read_sockaddr_from_pid` that returns a three-way result.
-pub fn read_sockaddr(pid: u32, addr: u64, addrlen: u64) -> SockaddrResult {
+/// Read a sockaddr from a target process's memory via the cached `MemFd`.
+fn read_sockaddr(mem: &MemFd, addr: u64, addrlen: u64) -> SockaddrResult {
     if addr == 0 || addrlen < 2 {
-        return SockaddrResult::ReadFailed;
-    }
-    let mem_path = format!("/proc/{pid}/mem\0");
-    let fd = unsafe { libc::open(mem_path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
         return SockaddrResult::ReadFailed;
     }
 
     let mut family_buf = [0u8; 2];
-    let n = unsafe { libc::pread(fd, family_buf.as_mut_ptr().cast(), 2, addr as libc::off_t) };
-    if n != 2 {
-        unsafe { libc::close(fd) };
+    if mem.pread(&mut family_buf, addr) != 2 {
         return SockaddrResult::ReadFailed;
     }
     let family = u16::from_ne_bytes(family_buf);
 
-    let result = match family as i32 {
+    let fd = mem.fd();
+    match family as i32 {
         libc::AF_INET if addrlen >= std::mem::size_of::<libc::sockaddr_in>() as u64 => {
             let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
             let n = unsafe {
@@ -355,10 +378,7 @@ pub fn read_sockaddr(pid: u32, addr: u64, addrlen: u64) -> SockaddrResult {
         }
         libc::AF_INET | libc::AF_INET6 => SockaddrResult::ReadFailed, // addrlen too short
         _ => SockaddrResult::NonInet(family),
-    };
-
-    unsafe { libc::close(fd) };
-    result
+    }
 }
 
 // ─── Notification handler ─────────────────────────────────────────
@@ -367,9 +387,10 @@ const SYS_OPENAT2: i64 = 437;
 
 /// Handle a single seccomp notification.
 ///
-/// Dispatches by syscall number, reads arguments from `/proc/<pid>/mem`,
-/// writes an NDJSON audit line, and responds with either CONTINUE
-/// (observation) or ECONNREFUSED (network blocking).
+/// Opens `/proc/<pid>/mem` once and passes it to all read helpers,
+/// dispatches by syscall number, writes an NDJSON audit line, and
+/// responds with either CONTINUE (observation) or ECONNREFUSED
+/// (network blocking).
 ///
 /// Returns `true` if a response was sent, `false` if the notification
 /// was stale (target exited between recv and send).
@@ -384,6 +405,10 @@ pub fn handle_notification(
     let nr = notif.data.nr as i64;
     let args = &notif.data.args;
 
+    let Some(mem) = MemFd::open(pid) else {
+        return respond_continue(listener_fd, notif);
+    };
+
     match nr {
         libc::SYS_openat | SYS_OPENAT2 => {
             // openat(dirfd, pathname, flags, mode)
@@ -391,12 +416,11 @@ pub fn handle_notification(
             let path_addr = args[1];
             let flags = if nr == SYS_OPENAT2 {
                 // open_how.flags is the first field (u64)
-                // Read it from /proc/<pid>/mem at args[2]
-                read_u64_from_pid(pid, args[2]).unwrap_or(0) as u32
+                read_u64(&mem, args[2]).unwrap_or(0) as u32
             } else {
                 args[2] as u32
             };
-            let path = read_string_from_pid(pid, path_addr, 3900).unwrap_or_default();
+            let path = read_string(&mem, path_addr, 3900).unwrap_or_default();
             let is_write =
                 flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32 != 0;
             write_audit_line(
@@ -414,7 +438,7 @@ pub fn handle_notification(
             // open(pathname, flags, mode) — x86_64 only
             let path_addr = args[0];
             let flags = args[1] as u32;
-            let path = read_string_from_pid(pid, path_addr, 3900).unwrap_or_default();
+            let path = read_string(&mem, path_addr, 3900).unwrap_or_default();
             let is_write =
                 flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32 != 0;
             write_audit_line(
@@ -435,7 +459,7 @@ pub fn handle_notification(
             } else {
                 args[0]
             };
-            let binary = read_string_from_pid(pid, path_addr, 3900).unwrap_or_default();
+            let binary = read_string(&mem, path_addr, 3900).unwrap_or_default();
             write_audit_line(
                 audit_fd,
                 dropped,
@@ -451,6 +475,7 @@ pub fn handle_notification(
             handle_connect(
                 listener_fd,
                 notif,
+                &mem,
                 audit_fd,
                 config,
                 dropped,
@@ -468,6 +493,7 @@ pub fn handle_notification(
                 handle_connect(
                     listener_fd,
                     notif,
+                    &mem,
                     audit_fd,
                     config,
                     dropped,
@@ -482,6 +508,7 @@ pub fn handle_notification(
             handle_sendmsg(
                 listener_fd,
                 notif,
+                &mem,
                 audit_fd,
                 config,
                 dropped,
@@ -495,7 +522,6 @@ pub fn handle_notification(
             // respond_continue resumes the entire batch.
             // sizeof(struct mmsghdr) = 64 on LP64 (msghdr=56 + msg_len=4 + pad=4).
             const MAX_SENDMMSG_INSPECT: u64 = 64;
-            let pid = notif.pid;
             if args[2] > MAX_SENDMMSG_INSPECT && config.enforce_network {
                 return respond_errno(listener_fd, notif, libc::ECONNREFUSED);
             }
@@ -504,13 +530,14 @@ pub fn handle_notification(
             let mut block = false;
             for i in 0..vlen {
                 let msghdr_addr = args[1] + i * MMSGHDR_SIZE;
-                if sendmsg_should_block(pid, msghdr_addr, config) {
+                if sendmsg_should_block(&mem, msghdr_addr, config) {
                     // Emit audit event for this blocked destination.
-                    let msg_name = read_u64_from_pid(pid, msghdr_addr);
-                    let msg_namelen = read_u32_from_pid(pid, msghdr_addr + 8);
+                    let msg_name = read_u64(&mem, msghdr_addr);
+                    let msg_namelen = read_u32(&mem, msghdr_addr + 8);
                     if let (Some(addr), Some(len)) = (msg_name, msg_namelen) {
                         if addr != 0 && len > 0 {
-                            if let SockaddrResult::Inet(info) = read_sockaddr(pid, addr, len as u64)
+                            if let SockaddrResult::Inet(info) =
+                                read_sockaddr(&mem, addr, len as u64)
                             {
                                 write_audit_line(
                                     audit_fd,
@@ -550,6 +577,7 @@ pub fn handle_notification(
 fn handle_connect(
     listener_fd: RawFd,
     notif: &libc::seccomp_notif,
+    mem: &MemFd,
     audit_fd: RawFd,
     config: &UnotifyConfig,
     dropped: &mut u64,
@@ -559,7 +587,7 @@ fn handle_connect(
 ) -> bool {
     let pid = notif.pid;
 
-    match read_sockaddr(pid, addr, addrlen) {
+    match read_sockaddr(mem, addr, addrlen) {
         SockaddrResult::Inet(info) => {
             if is_bridge_addr(&info, config) {
                 respond_continue(listener_fd, notif)
@@ -595,20 +623,19 @@ fn handle_connect(
     }
 }
 
-/// Handle sendmsg: extract msg_name from msghdr.
 /// Check if a msghdr's destination address should be blocked.
 ///
 /// Returns true if the destination is a non-bridge INET address
 /// (i.e., would be blocked by network enforcement). Does NOT emit
 /// a seccomp response — the caller must respond after checking all
 /// messages in a batch.
-fn sendmsg_should_block(pid: u32, msghdr_addr: u64, config: &UnotifyConfig) -> bool {
-    let msg_name = read_u64_from_pid(pid, msghdr_addr);
-    let msg_namelen = read_u32_from_pid(pid, msghdr_addr + 8);
+fn sendmsg_should_block(mem: &MemFd, msghdr_addr: u64, config: &UnotifyConfig) -> bool {
+    let msg_name = read_u64(mem, msghdr_addr);
+    let msg_namelen = read_u32(mem, msghdr_addr + 8);
 
     match (msg_name, msg_namelen) {
         (Some(name_addr), Some(namelen)) if name_addr != 0 && namelen > 0 => {
-            match read_sockaddr(pid, name_addr, namelen as u64) {
+            match read_sockaddr(mem, name_addr, namelen as u64) {
                 SockaddrResult::Inet(info) => !is_bridge_addr(&info, config),
                 SockaddrResult::NonInet(_) => false,
                 SockaddrResult::ReadFailed => config.enforce_network,
@@ -618,26 +645,28 @@ fn sendmsg_should_block(pid: u32, msghdr_addr: u64, config: &UnotifyConfig) -> b
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_sendmsg(
     listener_fd: RawFd,
     notif: &libc::seccomp_notif,
+    mem: &MemFd,
     audit_fd: RawFd,
     config: &UnotifyConfig,
     dropped: &mut u64,
     msghdr_addr: u64,
     syscall: &str,
 ) -> bool {
-    let pid = notif.pid;
     // Read msg_name (pointer) and msg_namelen from msghdr.
     // struct msghdr { void *msg_name; socklen_t msg_namelen; ... }
     // On 64-bit: msg_name at offset 0 (8 bytes), msg_namelen at offset 8 (4 bytes).
-    let msg_name = read_u64_from_pid(pid, msghdr_addr);
-    let msg_namelen = read_u32_from_pid(pid, msghdr_addr + 8);
+    let msg_name = read_u64(mem, msghdr_addr);
+    let msg_namelen = read_u32(mem, msghdr_addr + 8);
 
     match (msg_name, msg_namelen) {
         (Some(name_addr), Some(namelen)) if name_addr != 0 && namelen > 0 => handle_connect(
             listener_fd,
             notif,
+            mem,
             audit_fd,
             config,
             dropped,
@@ -670,50 +699,30 @@ fn is_bridge_addr(info: &SockaddrInfo, config: &UnotifyConfig) -> bool {
     false
 }
 
-/// Read a u64 from a target process's memory.
-fn read_u64_from_pid(pid: u32, addr: u64) -> Option<u64> {
+/// Read a u64 from a target process's memory via the cached `MemFd`.
+fn read_u64(mem: &MemFd, addr: u64) -> Option<u64> {
     if addr == 0 {
         return None;
     }
-    let mem_path = format!("/proc/{pid}/mem\0");
-    let fd = unsafe { libc::open(mem_path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return None;
+    let mut buf = [0u8; 8];
+    if mem.pread(&mut buf, addr) == 8 {
+        Some(u64::from_ne_bytes(buf))
+    } else {
+        None
     }
-    let mut val = 0u64;
-    let n = unsafe {
-        libc::pread(
-            fd,
-            &mut val as *mut u64 as *mut libc::c_void,
-            8,
-            addr as libc::off_t,
-        )
-    };
-    unsafe { libc::close(fd) };
-    if n == 8 { Some(val) } else { None }
 }
 
-/// Read a u32 from a target process's memory.
-fn read_u32_from_pid(pid: u32, addr: u64) -> Option<u32> {
+/// Read a u32 from a target process's memory via the cached `MemFd`.
+fn read_u32(mem: &MemFd, addr: u64) -> Option<u32> {
     if addr == 0 {
         return None;
     }
-    let mem_path = format!("/proc/{pid}/mem\0");
-    let fd = unsafe { libc::open(mem_path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return None;
+    let mut buf = [0u8; 4];
+    if mem.pread(&mut buf, addr) == 4 {
+        Some(u32::from_ne_bytes(buf))
+    } else {
+        None
     }
-    let mut val = 0u32;
-    let n = unsafe {
-        libc::pread(
-            fd,
-            &mut val as *mut u32 as *mut libc::c_void,
-            4,
-            addr as libc::off_t,
-        )
-    };
-    unsafe { libc::close(fd) };
-    if n == 4 { Some(val) } else { None }
 }
 
 // ─── Response helpers ─────────────────────────────────────────────
