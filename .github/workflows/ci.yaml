@@ -17,7 +17,7 @@ jobs:
       - name: Install deps
         run: dnf install -y gcc make cargo clippy rustfmt libkrun-devel openssl-devel clang-devel qemu-img
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Check (fmt + clippy + unit tests)
         run: make check
@@ -25,7 +25,7 @@ jobs:
   check-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -37,7 +37,7 @@ jobs:
   check-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -57,7 +57,7 @@ jobs:
       - name: Install deps
         run: dnf install -y gcc make cargo openssl-devel python3
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Integration tests
         run: make test-integration
