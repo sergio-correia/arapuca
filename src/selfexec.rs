@@ -326,7 +326,7 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         }
         audit_layer(audit_fd, "PidNamespace", true, None);
 
-        crate::pidns::fork_into_pidns(audit_fd, dns_audit_fd, pid_report_fd);
+        let liveness_fd = crate::pidns::fork_into_pidns(audit_fd, dns_audit_fd, pid_report_fd);
 
         let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
         if ret != 0 {
@@ -335,6 +335,9 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
                 std::io::Error::last_os_error()
             ));
             unsafe { libc::_exit(1) };
+        }
+        if let Some(fd) = liveness_fd {
+            crate::pidns::check_parent_liveness(fd);
         }
     }
 

@@ -355,7 +355,8 @@ fn main() {
             audit_layer(audit_fd, "PidNamespace", true, None);
 
             // Parent never returns; child continues to seccomp.
-            arapuca::pidns::fork_into_pidns(audit_fd, dns_audit_fd, pid_report_fd);
+            let liveness_fd =
+                arapuca::pidns::fork_into_pidns(audit_fd, dns_audit_fd, pid_report_fd);
 
             // Child: re-set pdeathsig (fork clears it). The
             // getppid() race check is skipped inside the PID
@@ -367,6 +368,9 @@ fn main() {
                     std::io::Error::last_os_error()
                 );
                 unsafe { libc::_exit(1) };
+            }
+            if let Some(fd) = liveness_fd {
+                arapuca::pidns::check_parent_liveness(fd);
             }
         }
 

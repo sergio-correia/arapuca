@@ -26,6 +26,12 @@ pub fn unshare_pidns() -> std::io::Result<()> {
 /// relays signals and exits with the child's status. The child
 /// returns normally so the caller can continue with seccomp + exec.
 ///
+/// Returns the read end of a liveness pipe. The parent holds the
+/// write end open until it exits. The child should check this FD
+/// after `prctl(PR_SET_PDEATHSIG)` to detect the TOCTOU race
+/// where the parent died between fork and prctl (see
+/// `check_parent_liveness`).
+///
 /// `audit_fd` and `dns_audit_fd` are closed in the parent (so the
 /// orchestrator's audit pipe reader sees EOF). `pid_report_fd` is
 /// written with the child's host PID and closed.
@@ -33,7 +39,19 @@ pub fn fork_into_pidns(
     audit_fd: Option<i32>,
     dns_audit_fd: Option<i32>,
     pid_report_fd: Option<i32>,
-) {
+) -> Option<i32> {
+    // Liveness pipe: parent holds write end, child reads it after
+    // prctl(PR_SET_PDEATHSIG) to detect if the parent already died.
+    // O_NONBLOCK so check_parent_liveness can read without fcntl.
+    let mut pipe_fds = [0i32; 2];
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        write_stderr(&format!(
+            "arapuca: pidns liveness pipe: {}\n",
+            std::io::Error::last_os_error()
+        ));
+        unsafe { libc::_exit(1) };
+    }
+
     // SAFETY: single-threaded, no async-signal-unsafe state.
     let child_pid = unsafe { libc::fork() };
 
@@ -51,12 +69,45 @@ pub fn fork_into_pidns(
         if let Some(fd) = pid_report_fd {
             unsafe { libc::close(fd) };
         }
-        return;
+        // Close the liveness pipe write end — only the parent should
+        // hold it. Without this, EOF never fires on the read end.
+        unsafe { libc::close(pipe_fds[1]) };
+        return Some(pipe_fds[0]);
     }
 
     // ── Parent: signal relay + waitpid ────────────────────────────
+    // Close the liveness pipe read end (child's responsibility).
+    unsafe { libc::close(pipe_fds[0]) };
+    // Write end (pipe_fds[1]) is intentionally leaked — it closes
+    // on _exit, causing EOF on the child's read end.
+
     // This path never returns.
     parent_relay(child_pid, audit_fd, dns_audit_fd, pid_report_fd);
+}
+
+/// Check the liveness pipe after `prctl(PR_SET_PDEATHSIG)`.
+///
+/// A non-blocking read on the pipe's read end distinguishes:
+/// - `read() == 0` (EOF): parent already exited, pdeathsig won't
+///   fire — the child must exit immediately.
+/// - `read() == -1` with EAGAIN: write end still open, parent is
+///   alive — safe to continue.
+///
+/// Closes the FD after the check.
+pub fn check_parent_liveness(liveness_fd: i32) {
+    // The pipe was created with O_NONBLOCK, so no fcntl needed.
+    let mut buf = [0u8; 1];
+    let n = unsafe { libc::read(liveness_fd, buf.as_mut_ptr().cast(), 1) };
+    unsafe { libc::close(liveness_fd) };
+    if n == 0 {
+        // EOF: parent died before pdeathsig took effect.
+        write_stderr("arapuca: pidns: parent died before pdeathsig\n");
+        unsafe { libc::_exit(1) };
+    }
+    if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+        write_stderr("arapuca: pidns: liveness check failed\n");
+        unsafe { libc::_exit(1) };
+    }
 }
 
 /// Parent relay loop. Writes child PID to the report pipe, closes
