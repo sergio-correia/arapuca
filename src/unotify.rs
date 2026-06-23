@@ -856,7 +856,7 @@ fn probe_unotify_support() -> bool {
     // Phase 1: Check that we can read a sibling process's /proc/<pid>/mem.
     // This catches Yama ptrace_scope=1 without a user namespace.
     if !probe_proc_mem_access() {
-        log::info!("unotify: /proc/<pid>/mem access blocked (Yama ptrace_scope?)");
+        log::info!("unotify: /proc/<pid>/mem access blocked (Landlock, Yama, or LSM restriction)");
         return false;
     }
 
