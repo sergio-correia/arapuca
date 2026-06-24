@@ -208,7 +208,20 @@ impl Sandbox for Linux {
         // ── Network namespace ──────────────────────────────────────
         let mut command = if cfg.profile.use_netns {
             let mut c = Command::new("unshare");
-            c.args(["--user", "--net", "--map-current-user", "--"]);
+            // When a proxy bridge is configured, the wrapper's bridge child
+            // needs to bring up the loopback interface via netlink
+            // (RTM_SETLINK / IFF_UP), which requires CAP_NET_ADMIN inside the
+            // network namespace. `--map-root-user` maps the current UID to
+            // uid 0 *within the user namespace only*, granting CAP_NET_ADMIN
+            // over the net namespace without any host privileges.
+            // Without it, `loopback_up()` fails with EPERM and the bridge
+            // cannot relay TCP connections into the sandbox.
+            let user_flag = if cfg.network_proxy_socket.is_some() {
+                "--map-root-user"
+            } else {
+                "--map-current-user"
+            };
+            c.args(["--user", "--net", user_flag, "--"]);
             c.arg(&actual_cmd);
             c.args(&actual_args);
             if let Some(ref ctx) = audit_ctx {
