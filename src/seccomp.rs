@@ -524,7 +524,7 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
 
     // Stacked filter: block clone with namespace flags.
     // Default action = Allow (non-clone syscalls pass through).
-    // Match action = KillProcess (clone with ns flags is killed).
+    // Match action = Errno(EPERM) (clone with ns flags is denied).
     // We insert clone with a condition that matches when ANY
     // CLONE_NEW* flag is set. MaskedEq(CLONE_NEW_FLAGS, 0) matches
     // when no ns flags → we want the inverse.
