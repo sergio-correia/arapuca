@@ -420,7 +420,7 @@ pub fn handle_notification(
             } else {
                 args[2] as u32
             };
-            let path = read_string(&mem, path_addr, 3900).unwrap_or_default();
+            let path = read_string(&mem, path_addr, 2000).unwrap_or_default();
             let is_write =
                 flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32 != 0;
             write_audit_line(
@@ -428,7 +428,7 @@ pub fn handle_notification(
                 dropped,
                 &format!(
                     "{{\"type\":\"file_access\",\"pid\":{pid},\"path\":\"{}\",\"flags\":{flags},\"is_write\":{is_write}}}",
-                    crate::wrapper::json_escape(&path),
+                    escape_for_audit(&path),
                 ),
             );
             respond_continue(listener_fd, notif)
@@ -438,7 +438,7 @@ pub fn handle_notification(
             // open(pathname, flags, mode) — x86_64 only
             let path_addr = args[0];
             let flags = args[1] as u32;
-            let path = read_string(&mem, path_addr, 3900).unwrap_or_default();
+            let path = read_string(&mem, path_addr, 2000).unwrap_or_default();
             let is_write =
                 flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32 != 0;
             write_audit_line(
@@ -446,7 +446,7 @@ pub fn handle_notification(
                 dropped,
                 &format!(
                     "{{\"type\":\"file_access\",\"pid\":{pid},\"path\":\"{}\",\"flags\":{flags},\"is_write\":{is_write}}}",
-                    crate::wrapper::json_escape(&path),
+                    escape_for_audit(&path),
                 ),
             );
             respond_continue(listener_fd, notif)
@@ -459,13 +459,13 @@ pub fn handle_notification(
             } else {
                 args[0]
             };
-            let binary = read_string(&mem, path_addr, 3900).unwrap_or_default();
+            let binary = read_string(&mem, path_addr, 2000).unwrap_or_default();
             write_audit_line(
                 audit_fd,
                 dropped,
                 &format!(
                     "{{\"type\":\"process_spawn\",\"pid\":{pid},\"binary\":\"{}\"}}",
-                    crate::wrapper::json_escape(&binary),
+                    escape_for_audit(&binary),
                 ),
             );
             respond_continue(listener_fd, notif)
@@ -544,7 +544,7 @@ pub fn handle_notification(
                                     dropped,
                                     &format!(
                                         "{{\"type\":\"network_blocked\",\"pid\":{pid},\"dest\":\"{}\",\"syscall\":\"sendmmsg\"}}",
-                                        crate::wrapper::json_escape(&info.destination),
+                                        escape_for_audit(&info.destination),
                                     ),
                                 );
                             }
@@ -597,7 +597,7 @@ fn handle_connect(
                     dropped,
                     &format!(
                         "{{\"type\":\"network_blocked\",\"pid\":{pid},\"dest\":\"{}\",\"syscall\":\"{syscall}\"}}",
-                        crate::wrapper::json_escape(&info.destination),
+                        escape_for_audit(&info.destination),
                     ),
                 );
                 if config.enforce_network {
@@ -755,6 +755,28 @@ fn respond_errno(listener_fd: RawFd, notif: &libc::seccomp_notif, errno: i32) ->
     notif_send(listener_fd, &resp).is_ok()
 }
 
+/// JSON-escape a string and cap it to fit in an audit line.
+///
+/// `json_escape` can expand input significantly: `\` → `\\` (2x),
+/// control chars → `\uXXXX` (6x). The escaped result is capped at
+/// `MAX_ESCAPED` chars to guarantee the formatted NDJSON line fits
+/// within PIPE_BUF.
+const MAX_ESCAPED: usize = 3900;
+
+fn escape_for_audit(s: &str) -> String {
+    let escaped = crate::wrapper::json_escape(s);
+    if escaped.len() <= MAX_ESCAPED {
+        return escaped;
+    }
+    let mut end = MAX_ESCAPED;
+    while end > 0 && !escaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = escaped[..end].to_string();
+    truncated.push_str("...");
+    truncated
+}
+
 /// Write an NDJSON audit line to the audit pipe.
 ///
 /// The audit pipe is O_NONBLOCK. On EAGAIN, increments the drop counter
@@ -768,25 +790,21 @@ fn write_audit_line(audit_fd: RawFd, dropped: &mut u64, line: &str) {
         if ret > 0 {
             *dropped = 0;
         }
-        // If this write also fails, keep accumulating.
     }
 
-    // Cap line length to fit within PIPE_BUF (4096) with the trailing
-    // newline. json_escape can expand paths significantly (each '\'
-    // doubles), so the formatted line may exceed PIPE_BUF. A partial
-    // write on O_NONBLOCK corrupts the NDJSON stream.
-    const MAX_LINE: usize = 4095; // 4096 - 1 for '\n'
-    let truncated = if line.len() > MAX_LINE {
-        let mut end = MAX_LINE;
-        while end > 0 && !line.is_char_boundary(end) {
-            end -= 1;
-        }
-        &line[..end]
-    } else {
-        line
-    };
+    // With escape_for_audit capping field values, the formatted line
+    // should always fit within PIPE_BUF (4096). Log a warning if it
+    // doesn't rather than writing broken JSON.
+    if line.len() > 4095 {
+        log::warn!(
+            "audit line exceeds PIPE_BUF ({} bytes), dropping",
+            line.len()
+        );
+        *dropped += 1;
+        return;
+    }
 
-    let data = format!("{truncated}\n");
+    let data = format!("{line}\n");
     let ret = unsafe { libc::write(audit_fd, data.as_ptr().cast(), data.len()) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
