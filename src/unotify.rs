@@ -755,6 +755,42 @@ fn respond_errno(listener_fd: RawFd, notif: &libc::seccomp_notif, errno: i32) ->
     notif_send(listener_fd, &resp).is_ok()
 }
 
+/// Read exactly `buf.len()` bytes, retrying on EINTR and short reads.
+fn read_exact_raw(fd: RawFd, buf: &mut [u8]) -> bool {
+    let mut offset = 0;
+    while offset < buf.len() {
+        let n = unsafe { libc::read(fd, buf[offset..].as_mut_ptr().cast(), buf.len() - offset) };
+        if n > 0 {
+            offset += n as usize;
+        } else if n == 0 {
+            return false;
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Write exactly `buf.len()` bytes, retrying on EINTR and short writes.
+pub fn write_all_raw(fd: RawFd, buf: &[u8]) -> bool {
+    let mut offset = 0;
+    while offset < buf.len() {
+        let n = unsafe { libc::write(fd, buf[offset..].as_ptr().cast(), buf.len() - offset) };
+        if n > 0 {
+            offset += n as usize;
+        } else if n == 0 {
+            return false;
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 /// JSON-escape a string and cap it to fit in an audit line.
 ///
 /// `json_escape` can expand input significantly: `\` → `\\` (2x),
@@ -1129,11 +1165,13 @@ pub fn fork_unotify_supervisor(
         // the socketpair. The PID may differ from parent_pid when
         // pidns is active (the wrapper forks after the supervisor).
         let mut msg = [0u8; 8];
-        let ret = unsafe { libc::read(sp_child, msg.as_mut_ptr().cast(), 8) };
-        unsafe { libc::close(sp_child) };
-        if ret != 8 {
-            unsafe { libc::_exit(1) };
+        if !read_exact_raw(sp_child, &mut msg) {
+            unsafe {
+                libc::close(sp_child);
+                libc::_exit(1);
+            }
         }
+        unsafe { libc::close(sp_child) };
         let wrapper_pid = i32::from_ne_bytes(msg[..4].try_into().unwrap());
         let remote_fd = i32::from_ne_bytes(msg[4..].try_into().unwrap());
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, wrapper_pid, 0i32) } as i32;

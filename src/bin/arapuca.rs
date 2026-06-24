@@ -428,10 +428,7 @@ fn main() {
                             let mut msg = [0u8; 8];
                             msg[..4].copy_from_slice(&host_pid.to_ne_bytes());
                             msg[4..].copy_from_slice(&listener_fd.to_ne_bytes());
-                            let ret = unsafe {
-                                libc::write(fds.socketpair_parent, msg.as_ptr().cast(), msg.len())
-                            };
-                            if ret != msg.len() as isize {
+                            if !arapuca::unotify::write_all_raw(fds.socketpair_parent, &msg) {
                                 eprintln!(
                                     "arapuca: send unotify fd: {}",
                                     std::io::Error::last_os_error()
