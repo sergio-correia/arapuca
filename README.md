@@ -15,8 +15,10 @@ be bypassed from userspace.
 
 ### Linux
 
-- **Landlock** filesystem restrictions (ABI v1-v6) — allowlist of
-  readable and writable paths
+- **Landlock** filesystem restrictions (ABI v1-v5) — allowlist of
+  readable and writable paths; optional `allow_exec` enforcement
+  strips Execute from all paths except the target binary and its
+  ELF interpreter
 - **Seccomp BPF** syscall filtering — three-tier deny list (KILL for
   escape-critical syscalls, EPERM for probed/filtered syscalls, ENOSYS
   for clone3 fallback). Two profiles: strict (untrusted code) and
@@ -27,7 +29,11 @@ be bypassed from userspace.
   blocks all direct network access; automatic **proxy bridge** relays
   HTTP traffic through a Unix domain socket so standard tools
   (curl, git, npm) work via HTTP_PROXY. `--deny-network` mode
-  captures DNS queries as audit events and responds with NXDOMAIN
+  captures DNS queries as audit events and responds with NXDOMAIN.
+  `--audit-files` and `--audit-network` enable syscall-level
+  auditing via seccomp user notification (`SECCOMP_RET_USER_NOTIF`),
+  emitting structured NDJSON events for file access, process spawn,
+  and network connections
 - **PID namespace** isolation — `CLONE_NEWPID` prevents the sandboxed
   process from seeing or signaling host processes. Automatic when
   network namespace is active; opt out with `--no-pid-ns`
@@ -196,6 +202,9 @@ arapuca run \
 | `--allow-host H:P` | Allow HTTPS to host:port or `*.domain:port` via CONNECT proxy (Linux) |
 | `--deny-network` | Block all network; capture DNS queries as audit events (Linux) |
 | `--seccomp MODE` | Seccomp profile: `strict` (default) or `baseline` |
+| `--audit-files` | Emit file access and process spawn audit events (Linux) |
+| `--audit-network` | Emit network connection audit events (Linux) |
+| `--seccomp-debug` | Log blocked syscalls to stderr instead of killing (diagnostic) |
 | `--no-pid-ns` | Disable PID namespace isolation |
 | `-t, --tty` | Allocate a PTY for interactive programs |
 
@@ -310,6 +319,7 @@ cargo build --features vm-agent --bin arapuca-agent
 | `ARAPUCA_RLIMIT_NPROC` | Max number of processes |
 | `ARAPUCA_RLIMIT_CPU` | Max CPU time in seconds |
 | `ARAPUCA_RLIMIT_FSIZE` | Max file size in bytes |
+| `ARAPUCA_RLIMIT_NOFILE` | Max open file descriptors |
 | `ARAPUCA_WRAPPER` | Internal sentinel (set by library, required for wrapper path) |
 
 All `ARAPUCA_*` variables are stripped from the environment before
@@ -329,7 +339,15 @@ let config = arapuca::Config {
         max_memory_mb: 2048,
         max_pids: 256,
         max_cpu_pct: 200, // 2 cores
+        max_file_size_mb: 512,
+        max_open_files: 1024,
         use_netns: true,
+        use_pidns: true,
+        allow_exec: true,
+        dns_capture: false,
+        audit_file_access: true,
+        audit_network: false,
+        seccomp_profile: arapuca::SeccompProfile::Strict,
         ..Default::default()
     },
     socket_dir: "/tmp/sockets".into(),
@@ -402,6 +420,9 @@ case.
 | Seccomp BPF | Syscall filter | ptrace, mount, namespace escape, kernel modules |
 | Network namespace | CLONE_NEWNET | All direct network access (AF_INET/AF_INET6) |
 | Proxy bridge | TCP-to-UDS relay | Enables HTTP_PROXY in netns via hardened child process |
+| PID namespace | CLONE_NEWPID | Sandboxed process seeing/signaling host processes |
+| Unotify audit | SECCOMP_RET_USER_NOTIF | File access, process spawn, and network audit trail |
+| DNS capture | UDP port 53 interception | DNS exfiltration, provides audit trail of queries |
 | Cgroups v2 | Resource limits | Memory exhaustion, fork bombs, CPU starvation |
 | Rlimits | POSIX limits | Large file creation, process proliferation |
 | Pdeathsig | PR_SET_PDEATHSIG | Orphan processes surviving parent crash |
@@ -438,28 +459,30 @@ case.
 
 Three tiers with different responses (strict profile):
 
-**Tier 1 — KILL_PROCESS** (49 syscalls, no legitimate use):
+**Tier 1 — KILL_PROCESS** (45 syscalls, no legitimate use):
 `ptrace`, `mount`, `umount2`, `chroot`, `pivot_root`, `unshare`,
-`setns`, `personality`, `memfd_create`, `memfd_secret`, `io_uring_*`,
+`setns`, `personality`, `memfd_create`, `memfd_secret`,
 `bpf`, `kexec_*`, `reboot`, kernel module syscalls, new mount API
 (`fsopen`, `fsmount`, `fspick`, `fsconfig`, `move_mount`, `open_tree`,
-`mount_setattr`), `pidfd_*`, `process_vm_readv/writev`,
-`process_madvise`, `userfaultfd`, `kcmp`, `landlock_*`, `swapon/off`,
-`acct`, `add_key/request_key/keyctl`, `quotactl*`, LSM self-attr.
+`mount_setattr`), `pidfd_getfd`, `pidfd_send_signal`,
+`process_vm_readv/writev`, `process_madvise`, `userfaultfd`, `kcmp`,
+`landlock_*`, `swapon`, `swapoff`, `acct`, `add_key/request_key/keyctl`,
+`quotactl*`, LSM self-attr.
 
-**Tier 2 — EPERM** (argument-filtered): `symlink`, `link`,
+**Tier 2 — EPERM** (argument-filtered): `symlinkat`, `linkat`,
 `socket(AF_INET|AF_INET6)`, `perf_event_open`,
 `prctl(PR_SET_PDEATHSIG)`, `prctl(PR_SET_DUMPABLE, non-zero)`,
-`execveat(AT_EMPTY_PATH)`, `ioctl(TIOCSTI)`, `kill(pid <= 0)`,
-`tkill`, `clone(CLONE_NEW*)`.
+`execveat(AT_EMPTY_PATH)`, `ioctl(TIOCSTI|TIOCLINUX)`,
+`kill(pid <= 0)`, `tkill`, `clone(CLONE_NEW*)`.
 
-**Tier 3 — ENOSYS** (force fallback): `clone3` returns ENOSYS so
-glibc/Go falls back to `clone(2)` where namespace flags can be
-inspected by BPF.
+**Tier 3 — ENOSYS** (force fallback): `clone3` and `io_uring_*`
+return ENOSYS so glibc/Go falls back to `clone(2)` (where namespace
+flags can be inspected by BPF) and libraries probe io_uring support
+and fall back to regular I/O.
 
-`socket(AF_UNIX)` is explicitly **allowed** — needed for IPC with
-the host (JSON-RPC, LLM proxy). The **baseline** profile blocks
-only escape-critical syscalls (Tier 1) and uses EPERM for
+`socket(AF_UNIX)` is not filtered — needed for IPC with the host
+(JSON-RPC, LLM proxy). The **baseline** profile blocks only
+escape-critical syscalls (Tier 1) and uses EPERM for
 argument-filtered rules, allowing network sockets, memfd, etc.
 
 ### Network Model
@@ -619,6 +642,9 @@ explicit security review:
    cleanup, even on error paths.
 10. **Kill-on-close (Windows)** — `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
     ensures all processes in the Job are killed if the parent crashes.
+11. **Unotify supervisor before Landlock** — the seccomp user
+    notification supervisor is forked before Landlock is applied, since
+    it needs `/proc/<pid>/mem` access that Landlock intentionally blocks.
 
 ### Environment Variable Convention
 
@@ -641,10 +667,18 @@ block has a `// SAFETY:` comment. Expected `unsafe` locations:
 | `ffi.rs` | FFI exports, pointer dereference (null-checked) |
 | `rlimit.rs` | `prlimit64` / `setrlimit` (raw syscall) |
 | `landlock.rs` | `libc::syscall` for ABI version probe |
+| `seccomp.rs` | SIGSYS handler, signal setup, fork in tests |
 | `cgroup.rs` | `libc::kill` for SIGKILL |
+| `pidns.rs` | `unshare`, `fork`, `pipe2`, `_exit`, `waitpid` |
+| `unotify.rs` | `ioctl` (seccomp notification), `fcntl`, `fork`, `pidfd_getfd` |
+| `selfexec.rs` | `#[unsafe(no_mangle)]`, raw pointer dereference, `_exit`, `execve` |
+| `wrapper.rs` | `libc::write`, `getrandom`, `prctl`, `execve` |
+| `terminal.rs` | `tcgetattr`, `cfmakeraw`, `tcsetattr` |
+| `process.rs` | `pidfd_send_signal`, `kill`, `waitpid`, `waitid` |
 | `platform/linux.rs` | `pre_exec()` for setsid + pdeathsig |
 | `platform/darwin/mod.rs` | `pre_exec()` for setsid, `kill()` for monitors |
 | `platform/windows.rs` | Win32 API calls: `CreateProcessW`, `CreateJobObjectW`, `CreateRestrictedToken`, `SetTokenInformation`, `DuplicateHandle`, DACL/ACL operations, `NtSetInformationProcess` |
+| `platform/fd.rs` | `fcntl`, `dup2`, `close` |
 | `bridge.rs` | Netlink socket/send/recv for loopback, `OwnedFd::from_raw_fd` |
 | `platform/microvm.rs` | `libc::fork`, krun_sys FFI calls, `libc::getrandom` |
 | `platform/microvm_net.rs` | `libc::fcntl` (CLOEXEC), `libc::close`, `into_raw_fd` |
@@ -709,6 +743,12 @@ src/
 ├── rlimit.rs           # POSIX resource limits
 ├── cgroup.rs           # Cgroups v2 manager (Linux)
 ├── netns.rs            # Network namespace probe (Linux)
+├── pidns.rs            # PID namespace isolation (Linux)
+├── unotify.rs          # Seccomp user notification audit (Linux)
+├── dns.rs              # DNS wire format parser for query capture
+├── selfexec.rs         # Library-embedded sandbox trampoline (Linux)
+├── wrapper.rs          # Shared wrapper utilities (PATH lookup, audit)
+├── terminal.rs         # Terminal/PTY handling (Unix)
 ├── audit.rs            # Structured audit events, sink trait, context
 ├── bridge.rs           # Netns proxy bridge: loopback, relay, seccomp
 ├── env.rs              # Minimal environment, temp dirs, path utils
@@ -736,6 +776,7 @@ src/
 │   │   ├── mod.rs      # macOS sandbox (sandbox-exec + monitors)
 │   │   └── darwin_profile.rs  # Seatbelt .sb profile generation
 │   ├── windows.rs      # Windows sandbox (AppContainer + Job Object)
+│   ├── fd.rs           # File descriptor management utilities
 │   └── other.rs        # Degraded fallback (other Unix)
 └── bin/
     └── arapuca.rs    # CLI binary (+ image/vm subcommands)
