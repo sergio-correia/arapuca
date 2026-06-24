@@ -234,6 +234,49 @@ pub unsafe extern "C" fn arapuca_profile_set_netns(profile: *mut ArapucaProfile,
     }
 }
 
+/// Set the seccomp profile for the sandboxed process.
+///
+/// `profile_str` must be a null-terminated string: `"strict"` (default)
+/// or `"baseline"`. Strict blocks AF_INET/AF_INET6, memfd_create,
+/// io_uring, and other advanced syscalls. Baseline blocks only
+/// sandbox-escape syscalls and is designed for trusted-but-isolated
+/// applications such as Claude Code that need full POSIX syscall
+/// access. Returns 0 on success, -1 if the profile string is invalid.
+///
+/// # Safety
+/// `profile` and `profile_str` must be valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_seccomp(
+    profile: *mut ArapucaProfile,
+    profile_str: *const c_char,
+) -> i32 {
+    clear_error();
+    let Some(profile) = (unsafe { profile.as_mut() }) else {
+        set_error("null profile pointer");
+        return -1;
+    };
+    let Some(inner) = profile.inner.as_mut() else {
+        set_error("profile already freed");
+        return -1;
+    };
+    let s = match unsafe { validate_cstr(profile_str) } {
+        Ok(s) => s,
+        Err(msg) => {
+            set_error(&msg);
+            return -1;
+        }
+    };
+    match s.as_str() {
+        "strict" => inner.seccomp_profile = crate::SeccompProfile::Strict,
+        "baseline" => inner.seccomp_profile = crate::SeccompProfile::Baseline,
+        _ => {
+            set_error("invalid seccomp profile: expected \"strict\" or \"baseline\"");
+            return -1;
+        }
+    }
+    0
+}
+
 /// Enable or disable PID namespace isolation.
 ///
 /// When enabled, the sandboxed process runs in an isolated PID

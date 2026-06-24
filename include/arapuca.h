@@ -208,11 +208,40 @@ void arapuca_profile_set_max_open_files(struct arapuca_ArapucaProfile *profile, 
 void arapuca_profile_set_netns(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
+ * Set the seccomp profile for the sandboxed process.
+ *
+ * `profile_str` must be a null-terminated string: `"strict"` (default)
+ * or `"baseline"`. Strict blocks AF_INET/AF_INET6, memfd_create,
+ * io_uring, and other advanced syscalls. Baseline blocks only
+ * sandbox-escape syscalls and is designed for trusted-but-isolated
+ * applications such as Claude Code that need full POSIX syscall
+ * access. Returns 0 on success, -1 if the profile string is invalid.
+ *
+ * # Safety
+ * `profile` and `profile_str` must be valid pointers.
+ */
+int32_t arapuca_profile_set_seccomp(struct arapuca_ArapucaProfile *profile,
+                                    const char *profile_str);
+
+/**
+ * Enable or disable PID namespace isolation.
+ *
+ * When enabled, the sandboxed process runs in an isolated PID
+ * namespace where it cannot see or signal host processes.
+ * Requires a user namespace (provided by netns or added
+ * automatically).
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_pidns(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
  * Enable DNS query capture inside the network namespace.
  *
  * When enabled alongside netns, the bridge child intercepts DNS
- * queries and emits NetworkBlocked audit events. Requires the
- * serde feature and the wrapper binary with filesystem paths.
+ * queries and emits `NetworkBlocked` audit events. Requires the
+ * `serde` feature and the wrapper binary with filesystem paths.
  *
  * # Safety
  * `profile` must be a valid pointer.
@@ -417,6 +446,19 @@ struct arapuca_ArapucaProcess *arapuca_launch(struct arapuca_ArapucaSandbox *sb,
  * `proc` must be a valid pointer.
  */
 uint32_t arapuca_process_pid(const struct arapuca_ArapucaProcess *proc);
+
+/**
+ * Send a signal to a sandboxed process.
+ *
+ * On Linux 5.3+, uses pidfd_send_signal for race-free delivery.
+ * Falls back to kill() on older kernels or non-Linux platforms.
+ *
+ * Returns 0 on success, -1 on error (check `arapuca_last_error()`).
+ *
+ * # Safety
+ * `proc` must be a valid pointer.
+ */
+int32_t arapuca_process_signal(const struct arapuca_ArapucaProcess *proc, int32_t signal);
 
 /**
  * Wait for a sandboxed process to exit.
