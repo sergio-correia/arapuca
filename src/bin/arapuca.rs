@@ -421,19 +421,19 @@ fn main() {
                     {
                         Ok(listener_fd) => {
                             // Send the FD number via write() instead of
-                            // sendmsg(SCM_RIGHTS) — sendmsg is intercepted
-                            // by the USER_NOTIF filter we just installed.
-                            let fd_bytes = listener_fd.to_ne_bytes();
+                            // Send host PID + listener FD number via
+                            // write() — sendmsg is intercepted by the
+                            // USER_NOTIF filter we just installed.
+                            let host_pid = arapuca::unotify::read_host_pid();
+                            let mut msg = [0u8; 8];
+                            msg[..4].copy_from_slice(&host_pid.to_ne_bytes());
+                            msg[4..].copy_from_slice(&listener_fd.to_ne_bytes());
                             let ret = unsafe {
-                                libc::write(
-                                    fds.socketpair_parent,
-                                    fd_bytes.as_ptr().cast(),
-                                    fd_bytes.len(),
-                                )
+                                libc::write(fds.socketpair_parent, msg.as_ptr().cast(), msg.len())
                             };
-                            if ret != fd_bytes.len() as isize {
+                            if ret != msg.len() as isize {
                                 eprintln!(
-                                    "arapuca: send unotify fd number: {}",
+                                    "arapuca: send unotify fd: {}",
                                     std::io::Error::last_os_error()
                                 );
                                 unsafe { libc::_exit(1) };

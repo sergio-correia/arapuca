@@ -1125,18 +1125,18 @@ pub fn fork_unotify_supervisor(
             libc::close(readiness_write);
         }
 
-        // Read the listener FD number from the socketpair, then
-        // duplicate it via pidfd_getfd. We use write/read instead of
-        // sendmsg/recvmsg (SCM_RIGHTS) because sendmsg is intercepted
-        // by the USER_NOTIF filter when audit_network is enabled.
-        let mut fd_bytes = [0u8; 4];
-        let ret = unsafe { libc::read(sp_child, fd_bytes.as_mut_ptr().cast(), 4) };
+        // Read the wrapper's host PID and listener FD number from
+        // the socketpair. The PID may differ from parent_pid when
+        // pidns is active (the wrapper forks after the supervisor).
+        let mut msg = [0u8; 8];
+        let ret = unsafe { libc::read(sp_child, msg.as_mut_ptr().cast(), 8) };
         unsafe { libc::close(sp_child) };
-        if ret != 4 {
+        if ret != 8 {
             unsafe { libc::_exit(1) };
         }
-        let remote_fd = i32::from_ne_bytes(fd_bytes);
-        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, parent_pid, 0i32) } as i32;
+        let wrapper_pid = i32::from_ne_bytes(msg[..4].try_into().unwrap());
+        let remote_fd = i32::from_ne_bytes(msg[4..].try_into().unwrap());
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, wrapper_pid, 0i32) } as i32;
         if pidfd < 0 {
             crate::wrapper::write_stderr("unotify supervisor: pidfd_open failed\n");
             unsafe { libc::_exit(1) };
@@ -1154,6 +1154,8 @@ pub fn fork_unotify_supervisor(
     }
 
     // ── Parent (wrapper) ─────────────────────────────────────
+    // (continues in the caller — install filter, write PID+FD,
+    // then proceed to exec)
     unsafe {
         libc::close(sp_child);
         libc::close(readiness_write);
@@ -1163,6 +1165,19 @@ pub fn fork_unotify_supervisor(
         socketpair_parent: sp_parent,
         readiness_read,
     })
+}
+
+/// Read the caller's host PID from `/proc/self/stat`.
+///
+/// Inside a PID namespace, `getpid()` returns the namespace-local
+/// PID (typically 1). This function reads the host PID from procfs,
+/// which always reflects the initial PID namespace where `/proc` is
+/// mounted.
+pub fn read_host_pid() -> i32 {
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse().ok())
+        .unwrap_or_else(|| unsafe { libc::getpid() })
 }
 
 /// Apply the supervisor's own seccomp filter.

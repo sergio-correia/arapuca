@@ -381,17 +381,16 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
                     crate::unotify::target_syscalls(config.audit_file_access, config.audit_network);
                 if let Ok(bpf) = crate::unotify::build_unotify_bpf(&syscalls) {
                     if let Ok(listener_fd) = crate::unotify::install_unotify_filter(&bpf) {
-                        let fd_bytes = listener_fd.to_ne_bytes();
+                        let host_pid = crate::unotify::read_host_pid();
+                        let mut msg = [0u8; 8];
+                        msg[..4].copy_from_slice(&host_pid.to_ne_bytes());
+                        msg[4..].copy_from_slice(&listener_fd.to_ne_bytes());
                         let ret = unsafe {
-                            libc::write(
-                                fds.socketpair_parent,
-                                fd_bytes.as_ptr().cast(),
-                                fd_bytes.len(),
-                            )
+                            libc::write(fds.socketpair_parent, msg.as_ptr().cast(), msg.len())
                         };
-                        if ret != fd_bytes.len() as isize {
+                        if ret != msg.len() as isize {
                             write_stderr(&format!(
-                                "arapuca: selfexec: send unotify fd number: {}\n",
+                                "arapuca: selfexec: send unotify fd: {}\n",
                                 std::io::Error::last_os_error()
                             ));
                             unsafe { libc::_exit(1) };
