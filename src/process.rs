@@ -80,6 +80,16 @@ pub struct Process {
     /// Saved DACLs for restoration during cleanup.
     #[cfg(windows)]
     pub(crate) saved_dacls: Vec<crate::platform::windows::SavedDacl>,
+    /// CONNECT proxy child PID (Linux only). Forked by the library
+    /// when `Config::allowed_hosts` is non-empty. Killed on drop.
+    #[cfg(target_os = "linux")]
+    pub(crate) connect_proxy_pid: Option<i32>,
+    /// pidfd for the CONNECT proxy child. Closed on drop.
+    #[cfg(target_os = "linux")]
+    pub(crate) connect_proxy_pidfd: Option<i32>,
+    /// Socket path for the CONNECT proxy (for cleanup).
+    #[cfg(target_os = "linux")]
+    pub(crate) connect_proxy_socket: Option<PathBuf>,
     /// Passt network proxy handle (micro-VM only). Kept alive for
     /// the VM's lifetime; killed on cleanup/drop.
     #[cfg(all(target_os = "linux", feature = "microvm"))]
@@ -929,6 +939,13 @@ impl Drop for Process {
         drop(self.unotify_audit_pipe.take());
 
         #[cfg(target_os = "linux")]
+        crate::bridge::cleanup_connect_proxy(
+            self.connect_proxy_pid,
+            self.connect_proxy_pidfd,
+            &self.connect_proxy_socket,
+        );
+
+        #[cfg(target_os = "linux")]
         if let (Some(mgr), Some(path)) = (&self.cgroup_mgr, &self.cgroup_path) {
             let _ = mgr.destroy(path);
         }
@@ -1015,6 +1032,12 @@ mod tests {
                 #[cfg(target_os = "linux")]
                 target_pid: None,
                 waited: false,
+                #[cfg(target_os = "linux")]
+                connect_proxy_pid: None,
+                #[cfg(target_os = "linux")]
+                connect_proxy_pidfd: None,
+                #[cfg(target_os = "linux")]
+                connect_proxy_socket: None,
                 #[cfg(target_os = "macos")]
                 launch_timestamp: None,
                 #[cfg(target_os = "macos")]
@@ -1187,6 +1210,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             target_pid: None,
             waited: false,
+            #[cfg(target_os = "linux")]
+            connect_proxy_pid: None,
+            #[cfg(target_os = "linux")]
+            connect_proxy_pidfd: None,
+            #[cfg(target_os = "linux")]
+            connect_proxy_socket: None,
             #[cfg(target_os = "macos")]
             launch_timestamp: None,
             #[cfg(target_os = "macos")]
@@ -1234,6 +1263,12 @@ mod tests {
             #[cfg(target_os = "linux")]
             target_pid: None,
             waited: false,
+            #[cfg(target_os = "linux")]
+            connect_proxy_pid: None,
+            #[cfg(target_os = "linux")]
+            connect_proxy_pidfd: None,
+            #[cfg(target_os = "linux")]
+            connect_proxy_socket: None,
             #[cfg(target_os = "macos")]
             launch_timestamp: None,
             #[cfg(target_os = "macos")]

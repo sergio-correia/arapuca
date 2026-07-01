@@ -278,6 +278,7 @@ pub enum SandboxLayer {
     DnsCapture,
     PidNamespace,
     UnotifySupervisor,
+    ConnectProxy,
 }
 
 /// Structured detail for a successfully applied layer.

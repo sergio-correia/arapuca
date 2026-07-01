@@ -46,6 +46,8 @@ fn base_config() -> Config {
         extra_fds: Vec::new(),
         tty: false,
         network_proxy_socket: None,
+        #[cfg(target_os = "linux")]
+        allowed_hosts: Vec::new(),
         env: Vec::new(),
         audit_sink: None,
         audit_verbosity: arapuca::audit::AuditVerbosity::Standard,

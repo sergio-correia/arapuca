@@ -384,6 +384,26 @@ int32_t arapuca_config_set_stderr_fd(struct arapuca_ArapucaConfig *cfg, int32_t 
 int32_t arapuca_config_set_network_proxy(struct arapuca_ArapucaConfig *cfg, const char *path);
 
 /**
+ * Add an allowed outbound host:port for the CONNECT proxy. Linux only.
+ *
+ * When at least one allowed host is configured, `arapuca_sandbox_launch()`
+ * automatically forks a CONNECT proxy (equivalent to `--allow-host` in the
+ * CLI) and enables network namespace isolation.
+ *
+ * `host` must be a valid ASCII hostname or domain suffix (leading `.` for
+ * wildcard suffix matching, e.g. `.googleapis.com`). `port` must be 1-65535.
+ *
+ * Returns 0 on success, -1 on error (call `arapuca_last_error()` for details).
+ *
+ * # Safety
+ * `cfg` must be a valid pointer from `arapuca_config_new()`. `host` must be
+ * a valid null-terminated UTF-8 C string.
+ */
+int32_t arapuca_config_add_allowed_host(struct arapuca_ArapucaConfig *cfg,
+                                        const char *host,
+                                        uint16_t port);
+
+/**
  * Add a caller-supplied environment variable to the config.
  *
  * Both key and value are validated (UTF-8, max 4096 bytes each).

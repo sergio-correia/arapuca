@@ -976,6 +976,8 @@ fn run_subcommand(args: &[String]) {
         #[cfg(unix)]
         tty,
         network_proxy_socket: connect_proxy_socket.clone(),
+        #[cfg(target_os = "linux")]
+        allowed_hosts: Vec::new(),
         env: user_env,
         audit_sink: None,
         audit_verbosity: arapuca::audit::AuditVerbosity::Standard,

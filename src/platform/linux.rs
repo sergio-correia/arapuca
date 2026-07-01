@@ -224,13 +224,36 @@ impl Sandbox for Linux {
             }
         }
 
+        // ── CONNECT proxy (allowed_hosts) ──────────────────────────
+        // If the caller supplied allowed_hosts, fork the CONNECT proxy
+        // now (before any netns decisions), then use the proxy socket
+        // as the effective network_proxy_socket.
+        let (connect_proxy_pid_local, connect_proxy_pidfd_local, connect_proxy_socket_local) =
+            if !cfg.allowed_hosts.is_empty() {
+                let (sock, pid, pidfd) =
+                    crate::bridge::fork_connect_proxy(&cfg.allowed_hosts, cfg.profile.seccomp_debug);
+                (Some(pid), Some(pidfd), Some(sock))
+            } else {
+                (None, None, None)
+            };
+
+        // Effective proxy socket: prefer the newly forked proxy; fall
+        // back to the caller-supplied `network_proxy_socket`.
+        let effective_proxy_socket: Option<&std::path::Path> = connect_proxy_socket_local
+            .as_deref()
+            .or(cfg.network_proxy_socket.as_deref());
+
+        // When allowed_hosts is set, network namespace isolation is
+        // implicitly enabled (the proxy only makes sense inside netns).
+        let effective_use_netns = cfg.profile.use_netns || connect_proxy_socket_local.is_some();
+
         // ── DNS capture eligibility ────────────────────────────────
         let mount_ns_ok =
-            cfg.profile.dns_capture && cfg.profile.use_netns && crate::netns::mount_ns_available();
+            cfg.profile.dns_capture && effective_use_netns && crate::netns::mount_ns_available();
         let dns_capture_active = mount_ns_ok;
 
         if cfg.profile.dns_capture && !dns_capture_active {
-            if !cfg.profile.use_netns {
+            if !effective_use_netns {
                 log::warn!("DNS capture requires use_netns");
             } else if !mount_ns_ok {
                 log::warn!(
@@ -241,7 +264,7 @@ impl Sandbox for Linux {
         }
 
         // ── Network namespace ──────────────────────────────────────
-        let mut command = if cfg.profile.use_netns {
+        let mut command = if effective_use_netns {
             let mut c = Command::new("unshare");
             if dns_capture_active && use_wrapper {
                 c.args(["--user", "--net", "--mount", "--map-root-user", "--"]);
@@ -306,11 +329,25 @@ impl Sandbox for Linux {
         }
 
         // Add network proxy socket (non-ARAPUCA prefix, not stripped).
-        if let Some(ref proxy) = cfg.network_proxy_socket {
+        if let Some(proxy) = effective_proxy_socket {
             env_vars.push((
                 "AGENT_NETWORK_PROXY".into(),
                 proxy.to_string_lossy().into_owned(),
             ));
+        }
+
+        // If allowed_hosts caused a connect proxy to be forked, emit
+        // an audit event for the ConnectProxy layer now that we have
+        // the effective socket path.
+        if connect_proxy_socket_local.is_some() {
+            if let Some(ref ctx) = audit_ctx {
+                ctx.emit(AuditEvent::LayerApplied {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::ConnectProxy,
+                    detail: None,
+                })?;
+            }
+            applied_layers.push(SandboxLayer::ConnectProxy);
         }
 
         // Configure the proxy bridge when netns + proxy socket are
@@ -319,7 +356,7 @@ impl Sandbox for Linux {
         // bridge fork and readiness confirmation happen inside the
         // wrapper binary. The binary emits its own audit event on
         // successful bridge startup.
-        match crate::env::bridge_env(cfg.profile.use_netns, cfg.network_proxy_socket.as_deref()) {
+        match crate::env::bridge_env(effective_use_netns, effective_proxy_socket) {
             Ok(Some(kv)) => {
                 env_vars.push(kv);
                 if let Some(ref ctx) = audit_ctx {
@@ -328,9 +365,7 @@ impl Sandbox for Linux {
                         layer: SandboxLayer::ProxyBridge,
                         detail: Some(LayerDetail::ProxyBridge {
                             port: crate::env::BRIDGE_PORT,
-                            uds_path: cfg
-                                .network_proxy_socket
-                                .as_ref()
+                            uds_path: effective_proxy_socket
                                 .map(|p| p.to_string_lossy().into_owned())
                                 .unwrap_or_default(),
                         }),
@@ -633,7 +668,7 @@ impl Sandbox for Linux {
             pids_max: cfg.profile.max_pids,
             cpu_max_pct: cfg.profile.max_cpu_pct,
             pids_overhead: (if cfg.profile.use_pidns { 1 } else { 0 })
-                + (if cfg.profile.use_netns { 1 } else { 0 }),
+                + (if effective_use_netns { 1 } else { 0 }),
         };
 
         let mut cgroup_path = None;
@@ -881,10 +916,8 @@ impl Sandbox for Linux {
 
             ctx.emit(AuditEvent::NetworkPolicy {
                 timestamp: ctx.timestamp(),
-                isolated: cfg.profile.use_netns,
-                proxy_socket: cfg
-                    .network_proxy_socket
-                    .as_ref()
+                isolated: effective_use_netns,
+                proxy_socket: effective_proxy_socket
                     .map(|p| sanitize_audit_string(&p.to_string_lossy())),
             })?;
 
@@ -1180,6 +1213,9 @@ impl Sandbox for Linux {
             pidfd,
             target_pid: stored_target_pid,
             waited: false,
+            connect_proxy_pid: connect_proxy_pid_local,
+            connect_proxy_pidfd: connect_proxy_pidfd_local,
+            connect_proxy_socket: connect_proxy_socket_local,
             #[cfg(feature = "microvm")]
             passt: None,
             pty_master: pty_master_fd.map(|fd| {

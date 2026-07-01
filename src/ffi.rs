@@ -488,6 +488,8 @@ pub extern "C" fn arapuca_config_new() -> *mut ArapucaConfig {
             #[cfg(unix)]
             tty: false,
             network_proxy_socket: None,
+            #[cfg(target_os = "linux")]
+            allowed_hosts: Vec::new(),
             env: Vec::new(),
             audit_sink: None,
             audit_verbosity: crate::audit::AuditVerbosity::Standard,
@@ -635,6 +637,53 @@ pub unsafe extern "C" fn arapuca_config_set_network_proxy(
             c.network_proxy_socket = Some(PathBuf::from(s));
         })
     }
+}
+
+/// Add an allowed outbound host:port for the CONNECT proxy. Linux only.
+///
+/// When at least one allowed host is configured, `arapuca_sandbox_launch()`
+/// automatically forks a CONNECT proxy (equivalent to `--allow-host` in the
+/// CLI) and enables network namespace isolation.
+///
+/// `host` must be a valid ASCII hostname or domain suffix (leading `.` for
+/// wildcard suffix matching, e.g. `.googleapis.com`). `port` must be 1-65535.
+///
+/// Returns 0 on success, -1 on error (call `arapuca_last_error()` for details).
+///
+/// # Safety
+/// `cfg` must be a valid pointer from `arapuca_config_new()`. `host` must be
+/// a valid null-terminated UTF-8 C string.
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_config_add_allowed_host(
+    cfg: *mut ArapucaConfig,
+    host: *const c_char,
+    port: u16,
+) -> i32 {
+    clear_error();
+    let Some(cfg) = (unsafe { cfg.as_mut() }) else {
+        set_error("null config pointer");
+        return -1;
+    };
+    let Some(inner) = cfg.inner.as_mut() else {
+        set_error("config already freed");
+        return -1;
+    };
+    let host_str = match unsafe { validate_cstr(host) } {
+        Ok(s) => s,
+        Err(msg) => {
+            set_error(&msg);
+            return -1;
+        }
+    };
+    if port == 0 {
+        set_error("allowed host port must be 1-65535");
+        return -1;
+    }
+    inner
+        .allowed_hosts
+        .push(crate::bridge::AllowedHost::new(host_str, port));
+    0
 }
 
 /// Add a caller-supplied environment variable to the config.

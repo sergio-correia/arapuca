@@ -60,6 +60,8 @@ fn basic_config(sink: Arc<dyn AuditSink>) -> Config {
         extra_fds: Vec::new(),
         tty: false,
         network_proxy_socket: None,
+        #[cfg(target_os = "linux")]
+        allowed_hosts: Vec::new(),
         env: Vec::new(),
         audit_sink: Some(sink),
         audit_verbosity: AuditVerbosity::Standard,
@@ -280,6 +282,8 @@ fn no_events_without_sink() {
         extra_fds: Vec::new(),
         tty: false,
         network_proxy_socket: None,
+        #[cfg(target_os = "linux")]
+        allowed_hosts: Vec::new(),
         env: Vec::new(),
         audit_sink: None,
         audit_verbosity: AuditVerbosity::Standard,
@@ -414,6 +418,8 @@ fn mandatory_sink_abort() {
         extra_fds: Vec::new(),
         tty: false,
         network_proxy_socket: None,
+        #[cfg(target_os = "linux")]
+        allowed_hosts: Vec::new(),
         env: Vec::new(),
         audit_sink: Some(sink),
         audit_verbosity: AuditVerbosity::Standard,

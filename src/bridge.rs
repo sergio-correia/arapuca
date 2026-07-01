@@ -1727,6 +1727,275 @@ fn build_connect_proxy_filters(
     Ok((clone3_prog, main_prog))
 }
 
+/// Fork a CONNECT proxy process that forwards connections to the given
+/// allowed hosts.
+///
+/// Creates a Unix domain socket in a temporary directory, forks a child
+/// process that runs the proxy, and waits up to 5 seconds for a readiness
+/// signal. Returns `(socket_path, child_pid, child_pidfd)`.
+///
+/// The caller is responsible for killing the child and cleaning up the
+/// socket directory when the parent process exits. Use
+/// [`cleanup_connect_proxy`] for this.
+///
+/// # Panics / Exits
+///
+/// Calls `process::exit(125)` if the socket cannot be created, the fork
+/// fails, or the child does not signal readiness within the timeout.
+#[cfg(target_os = "linux")]
+pub fn fork_connect_proxy(
+    allowed_hosts: &[AllowedHost],
+    seccomp_debug: bool,
+) -> (std::path::PathBuf, i32, i32) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+
+    let proxy_dir = tempfile::Builder::new()
+        .prefix("arapuca-connect-proxy-")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap_or_else(|e| {
+            eprintln!("arapuca: connect proxy: tmpdir: {e}");
+            std::process::exit(125);
+        });
+    let uds_path = proxy_dir.keep().join("connect.sock");
+
+    let listener = UnixListener::bind(&uds_path).unwrap_or_else(|e| {
+        eprintln!("arapuca: connect proxy: bind {}: {e}", uds_path.display());
+        std::process::exit(125);
+    });
+
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: pipe2 with valid array and O_CLOEXEC.
+    let ret = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if ret != 0 {
+        eprintln!(
+            "arapuca: connect proxy: pipe: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(125);
+    }
+    let pipe_read = pipe_fds[0];
+    let pipe_write = pipe_fds[1];
+
+    // SAFETY: getpid is always safe.
+    let parent_pid = unsafe { libc::getpid() };
+
+    let hosts = allowed_hosts.to_vec();
+    let listener_fd = listener.as_raw_fd();
+
+    // SAFETY: single-threaded at this point (must be called before sandbox.launch).
+    let child_pid = unsafe { libc::fork() };
+
+    if child_pid < 0 {
+        eprintln!(
+            "arapuca: connect proxy: fork: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(125);
+    }
+
+    if child_pid == 0 {
+        // ── CONNECT proxy child ──────────────────────────────
+
+        // SAFETY: pipe_read is a valid fd from pipe2.
+        unsafe { libc::close(pipe_read) };
+
+        // Close all FDs >= 3 except pipe_write and listener_fd.
+        // SAFETY: fds are valid.
+        unsafe { close_fds_except(&[pipe_write, listener_fd]) };
+
+        // Ignore SIGPIPE so that writing to a broken UDS connection
+        // returns EPIPE instead of killing the proxy process.
+        // SAFETY: SIGPIPE + SIG_IGN is always safe.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+
+        // setsid clears PR_SET_PDEATHSIG, so it must be re-set after.
+        // The getppid race check below covers the window between setsid
+        // and prctl.
+        // SAFETY: setsid is always safe. Tolerate EPERM (already session leader).
+        let ret = unsafe { libc::setsid() };
+        if ret == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EPERM) {
+                eprintln!("arapuca: connect proxy: setsid: {err}");
+                // SAFETY: _exit is always safe.
+                unsafe { libc::_exit(1) };
+            }
+        }
+
+        // SAFETY: prctl with PR_SET_PDEATHSIG.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+
+        // Race check: if parent already exited, bail.
+        // SAFETY: getppid is always safe.
+        if unsafe { libc::getppid() } != parent_pid {
+            unsafe { libc::_exit(1) };
+        }
+
+        // SAFETY: prctl with PR_SET_NO_NEW_PRIVS.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+
+        // SAFETY: prctl with PR_SET_DUMPABLE.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+
+        // Apply Landlock with minimal NSS paths. The proxy needs to
+        // read resolver config and load NSS modules, but should not
+        // have access to the broader filesystem.
+        {
+            let proxy_read_paths: Vec<std::path::PathBuf> = [
+                "/etc/hosts",
+                "/etc/nsswitch.conf",
+                "/etc/resolv.conf",
+                "/etc/gai.conf",
+                "/etc/ld.so.cache",
+                "/etc/ld.so.conf",
+                "/etc/ld.so.conf.d",
+                "/etc/services",
+                "/etc/ssl",
+                "/etc/pki",
+                "/etc/ca-certificates",
+                "/run/systemd/resolve",
+                "/run/nscd",
+                "/lib",
+                "/lib64",
+                "/usr/lib",
+                "/usr/lib64",
+            ]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+            .collect();
+
+            if !proxy_read_paths.is_empty() {
+                let proxy_profile = crate::Profile {
+                    read_paths: proxy_read_paths,
+                    ..Default::default()
+                };
+                if let Err(e) = crate::landlock::apply(&proxy_profile, None) {
+                    eprintln!("arapuca: connect proxy: landlock: {e}");
+                    unsafe { libc::_exit(1) };
+                }
+            } else {
+                eprintln!("arapuca: connect proxy: no system paths found for Landlock");
+                unsafe { libc::_exit(1) };
+            }
+        }
+
+        // Pre-initialize NSS before seccomp — forces dlopen of all
+        // NSS modules. Using an unresolvable FQDN traverses the
+        // entire nsswitch hosts chain. Must happen before seccomp
+        // because mprotect(PROT_EXEC) for dlopen is denied after.
+        use std::net::ToSocketAddrs;
+        let _ = ("_arapuca-nss-init.invalid.", 0u16).to_socket_addrs();
+
+        #[cfg(seccomp_supported)]
+        if let Err(e) = apply_connect_proxy_seccomp(seccomp_debug) {
+            eprintln!("arapuca: connect proxy: seccomp: {e}");
+            unsafe { libc::_exit(1) };
+        }
+
+        if let Err(e) = connect_proxy_listen(listener, &hosts, pipe_write) {
+            eprintln!("arapuca: connect proxy: {e}");
+        }
+        // SAFETY: _exit is always safe.
+        unsafe { libc::_exit(0) };
+    }
+
+    // ── Parent ────────────────────────────────────────────────
+
+    drop(listener);
+    // SAFETY: pipe_write is no longer needed in parent.
+    unsafe { libc::close(pipe_write) };
+
+    // Open pidfd immediately — child PID is guaranteed valid.
+    // SAFETY: pidfd_open with valid pid and flags=0.
+    let proxy_pidfd =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) } as i32;
+
+    // Wait for readiness signal (5s timeout).
+    let mut pfd = libc::pollfd {
+        fd: pipe_read,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let poll_ret = loop {
+        // SAFETY: pfd is valid, timeout in ms.
+        let ret = unsafe { libc::poll(&mut pfd, 1, 5000) };
+        if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break ret;
+        }
+    };
+
+    let fail_proxy = |msg: &str| -> ! {
+        eprintln!("arapuca: connect proxy: {msg}");
+        // SAFETY: child_pid is valid.
+        unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        let _ = std::fs::remove_dir_all(uds_path.parent().unwrap());
+        std::process::exit(125);
+    };
+
+    if poll_ret == 0 {
+        fail_proxy("readiness timeout (5s)");
+    }
+    if poll_ret < 0 {
+        fail_proxy(&format!("poll: {}", std::io::Error::last_os_error()));
+    }
+
+    let mut buf = [0u8; 1];
+    let n = loop {
+        // SAFETY: pipe_read is valid.
+        let ret =
+            unsafe { libc::read(pipe_read, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break ret;
+        }
+    };
+    // SAFETY: done with pipe_read.
+    unsafe { libc::close(pipe_read) };
+
+    if n != 1 {
+        fail_proxy("readiness signal failed");
+    }
+
+    (uds_path, child_pid, proxy_pidfd)
+}
+
+/// Kill a CONNECT proxy child and remove its socket directory.
+///
+/// Safe to call with `None` values (no-op). Intended to be called on
+/// parent exit / error paths alongside the socket directory cleanup.
+#[cfg(target_os = "linux")]
+pub fn cleanup_connect_proxy(
+    pid: Option<i32>,
+    pidfd: Option<i32>,
+    socket: &Option<std::path::PathBuf>,
+) {
+    if let Some(pid) = pid {
+        // SAFETY: pid is a valid child PID.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    if let Some(fd) = pidfd {
+        // SAFETY: fd is a valid pidfd.
+        unsafe { libc::close(fd) };
+        // Reap the zombie.
+        if let Some(pid) = pid {
+            // SAFETY: waitpid with valid pid and WNOHANG.
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        }
+    }
+    if let Some(path) = socket {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -204,6 +204,13 @@ pub struct Config {
     /// receives an env var pointing to this socket. Uses a non-ARAPUCA
     /// prefix so it is not stripped by the binary.
     pub network_proxy_socket: Option<PathBuf>,
+    /// Allowed outbound host:port pairs for the CONNECT proxy.
+    /// When non-empty, `Launch()` forks a CONNECT proxy (like `--allow-host`
+    /// in the CLI), sets `network_proxy_socket` to the proxy socket path,
+    /// and enables network namespace isolation automatically.
+    /// Linux only.
+    #[cfg(target_os = "linux")]
+    pub allowed_hosts: Vec<crate::bridge::AllowedHost>,
     /// Caller-supplied environment variables for the subprocess.
     /// Filtered by the platform launcher before use: ARAPUCA_*,
     /// LD_*, DYLD_*, and other dangerous names are silently dropped.
@@ -236,8 +243,13 @@ impl std::fmt::Debug for Config {
                 .field("extra_fds", &self.extra_fds)
                 .field("tty", &self.tty);
         }
-        s.field("network_proxy_socket", &self.network_proxy_socket)
-            .field("env", &format!("[{} vars]", self.env.len()))
+        s.field("network_proxy_socket", &self.network_proxy_socket);
+        #[cfg(target_os = "linux")]
+        s.field(
+            "allowed_hosts",
+            &format!("[{} hosts]", self.allowed_hosts.len()),
+        );
+        s.field("env", &format!("[{} vars]", self.env.len()))
             .field(
                 "audit_sink",
                 if self.audit_sink.is_some() {

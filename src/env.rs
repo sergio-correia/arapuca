@@ -556,6 +556,82 @@ pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
 /// Uses the `tempfile` crate which calls `mkdtemp` on Unix (mode 0700,
 /// created atomically) and secure temp-dir creation on Windows.
 /// `keep()` prevents auto-deletion — the caller owns cleanup.
+/// Build the `ARAPUCA_CONNECT_PROXY` env var for the wrapper binary.
+///
+/// Returns `Some((key, value))` when `allowed_hosts` is non-empty.
+/// The value is a comma-separated list of `host:port` pairs.
+/// Returns `None` when there are no allowed hosts to configure.
+///
+/// # Errors
+///
+/// Returns an error if any host string contains a comma or colon
+/// (which would break parsing).
+#[cfg(target_os = "linux")]
+pub fn connect_proxy_env(
+    allowed_hosts: &[crate::bridge::AllowedHost],
+) -> crate::Result<Option<(String, String)>> {
+    if allowed_hosts.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = Vec::with_capacity(allowed_hosts.len());
+    for h in allowed_hosts {
+        if h.host.contains(',') || h.host.contains(':') {
+            return Err(crate::Error::Validation(format!(
+                "allowed host must not contain ',' or ':': {}",
+                h.host
+            )));
+        }
+        parts.push(format!("{}:{}", h.host, h.port));
+    }
+    Ok(Some(("ARAPUCA_CONNECT_PROXY".into(), parts.join(","))))
+}
+
+/// Parse the `ARAPUCA_CONNECT_PROXY` environment variable.
+///
+/// Returns the list of allowed host:port pairs encoded by
+/// [`connect_proxy_env`], or `None` if the variable is not set.
+#[cfg(target_os = "linux")]
+pub fn parse_connect_proxy_env() -> crate::Result<Option<Vec<crate::bridge::AllowedHost>>> {
+    let val = match std::env::var("ARAPUCA_CONNECT_PROXY") {
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(crate::Error::Validation(
+                "ARAPUCA_CONNECT_PROXY is not valid UTF-8".into(),
+            ));
+        }
+    };
+    let mut hosts = Vec::new();
+    for pair in val.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let Some(colon) = pair.rfind(':') else {
+            return Err(crate::Error::Validation(format!(
+                "invalid ARAPUCA_CONNECT_PROXY entry (expected host:port): {pair}"
+            )));
+        };
+        let host = pair[..colon].to_string();
+        let port_str = &pair[colon + 1..];
+        let port = port_str.parse::<u16>().map_err(|_| {
+            crate::Error::Validation(format!(
+                "invalid port in ARAPUCA_CONNECT_PROXY entry: {pair}"
+            ))
+        })?;
+        if port == 0 {
+            return Err(crate::Error::Validation(format!(
+                "port must be 1-65535 in ARAPUCA_CONNECT_PROXY entry: {pair}"
+            )));
+        }
+        hosts.push(crate::bridge::AllowedHost::new(host, port));
+    }
+    if hosts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(hosts))
+}
+
 fn make_temp_dir(prefix: &str) -> crate::Result<PathBuf> {
     let dir = tempfile::Builder::new()
         .prefix(prefix)

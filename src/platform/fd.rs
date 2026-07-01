@@ -123,6 +123,8 @@ mod tests {
             extra_fds: vec![],
             tty: false,
             network_proxy_socket: None,
+            #[cfg(target_os = "linux")]
+            allowed_hosts: Vec::new(),
             env: vec![],
             audit_sink: None,
             audit_verbosity: crate::audit::AuditVerbosity::default(),
