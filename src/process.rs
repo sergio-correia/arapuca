@@ -878,6 +878,7 @@ impl Drop for Process {
         // occupied, and a live process would run unsupervised after
         // its containment is removed.
         #[cfg(not(windows))]
+        #[allow(clippy::collapsible_match)]
         match &mut self.child {
             ChildHandle::Managed(c) => {
                 if !self.waited {

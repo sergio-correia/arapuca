@@ -1915,8 +1915,7 @@ pub fn fork_connect_proxy(
 
     // Open pidfd immediately — child PID is guaranteed valid.
     // SAFETY: pidfd_open with valid pid and flags=0.
-    let proxy_pidfd =
-        unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) } as i32;
+    let proxy_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) } as i32;
 
     // Wait for readiness signal (5s timeout).
     let mut pfd = libc::pollfd {

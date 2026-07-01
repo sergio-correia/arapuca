@@ -335,7 +335,8 @@ mod linux {
         let pipe_read = pipe_fds[0];
         let pipe_write = pipe_fds[1];
 
-        let port = arapuca::bridge::fork_bridge(0, Some(&uds_path), Some(pipe_write), false).unwrap();
+        let port =
+            arapuca::bridge::fork_bridge(0, Some(&uds_path), Some(pipe_write), false).unwrap();
         assert!(port > 0, "relay mode should return a valid port");
 
         unsafe { libc::close(pipe_write) };

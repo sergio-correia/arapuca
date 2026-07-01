@@ -230,8 +230,10 @@ impl Sandbox for Linux {
         // as the effective network_proxy_socket.
         let (connect_proxy_pid_local, connect_proxy_pidfd_local, connect_proxy_socket_local) =
             if !cfg.allowed_hosts.is_empty() {
-                let (sock, pid, pidfd) =
-                    crate::bridge::fork_connect_proxy(&cfg.allowed_hosts, cfg.profile.seccomp_debug);
+                let (sock, pid, pidfd) = crate::bridge::fork_connect_proxy(
+                    &cfg.allowed_hosts,
+                    cfg.profile.seccomp_debug,
+                );
                 (Some(pid), Some(pidfd), Some(sock))
             } else {
                 (None, None, None)
