@@ -1,4 +1,4 @@
-.PHONY: build release build-microvm release-microvm agent agent-release test test-unit test-integration lint fmt fmt-check clippy check ci ci-full audit header man clean static package install uninstall
+.PHONY: all build release build-microvm release-microvm agent agent-release test test-unit test-integration lint fmt fmt-check clippy check ci ci-full audit header man clean static package install uninstall
 
 FEATURES ?=
 PREFIX  ?= /usr/local
@@ -7,6 +7,8 @@ LIBDIR  ?= $(PREFIX)/lib
 MANDIR  ?= $(PREFIX)/share/man
 DESTDIR ?=
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+all: release package man
 
 build:
 	cargo build $(if $(FEATURES),--features $(FEATURES))
