@@ -680,9 +680,10 @@ pub unsafe extern "C" fn arapuca_config_add_allowed_host(
         set_error("allowed host port must be 1-65535");
         return -1;
     }
-    inner
-        .allowed_hosts
-        .push(crate::bridge::AllowedHost::new(host_str, port));
+    inner.allowed_hosts.push(crate::bridge::AllowedHost::new(
+        host_str.to_ascii_lowercase(),
+        port,
+    ));
     0
 }
 

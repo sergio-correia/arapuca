@@ -228,16 +228,47 @@ impl Sandbox for Linux {
         // If the caller supplied allowed_hosts, fork the CONNECT proxy
         // now (before any netns decisions), then use the proxy socket
         // as the effective network_proxy_socket.
-        let (connect_proxy_pid_local, connect_proxy_pidfd_local, connect_proxy_socket_local) =
-            if !cfg.allowed_hosts.is_empty() {
-                let (sock, pid, pidfd) = crate::bridge::fork_connect_proxy(
-                    &cfg.allowed_hosts,
-                    cfg.profile.seccomp_debug,
-                );
-                (Some(pid), Some(pidfd), Some(sock))
-            } else {
-                (None, None, None)
-            };
+        //
+        // The guard ensures cleanup (kill child, remove socket dir) if
+        // any subsequent operation in launch() fails before the proxy
+        // state is moved into Process.
+        struct ConnectProxyGuard {
+            pid: Option<i32>,
+            pidfd: Option<i32>,
+            socket: Option<std::path::PathBuf>,
+        }
+        impl ConnectProxyGuard {
+            fn defuse(&mut self) {
+                self.pid = None;
+                self.pidfd = None;
+                self.socket = None;
+            }
+        }
+        impl Drop for ConnectProxyGuard {
+            fn drop(&mut self) {
+                crate::bridge::cleanup_connect_proxy(self.pid, self.pidfd, &self.socket);
+            }
+        }
+
+        let mut connect_proxy_guard = if !cfg.allowed_hosts.is_empty() {
+            let (sock, pid, pidfd) =
+                crate::bridge::fork_connect_proxy(&cfg.allowed_hosts, cfg.profile.seccomp_debug)?;
+            ConnectProxyGuard {
+                pid: Some(pid),
+                pidfd: Some(pidfd),
+                socket: Some(sock),
+            }
+        } else {
+            ConnectProxyGuard {
+                pid: None,
+                pidfd: None,
+                socket: None,
+            }
+        };
+
+        let connect_proxy_pid_local = connect_proxy_guard.pid;
+        let connect_proxy_pidfd_local = connect_proxy_guard.pidfd;
+        let connect_proxy_socket_local = connect_proxy_guard.socket.clone();
 
         // Effective proxy socket: prefer the newly forked proxy; fall
         // back to the caller-supplied `network_proxy_socket`.
@@ -1204,6 +1235,10 @@ impl Sandbox for Linux {
                 pid: stored_target_pid.unwrap_or(child.id()),
             })?;
         }
+
+        // Defuse the connect proxy guard — ownership transfers to
+        // Process which handles cleanup in its Drop impl.
+        connect_proxy_guard.defuse();
 
         Ok(Process {
             child: crate::process::ChildHandle::Managed(child),

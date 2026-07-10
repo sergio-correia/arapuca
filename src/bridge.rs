@@ -1738,41 +1738,39 @@ fn build_connect_proxy_filters(
 /// socket directory when the parent process exits. Use
 /// [`cleanup_connect_proxy`] for this.
 ///
-/// # Panics / Exits
+/// # Errors
 ///
-/// Calls `process::exit(125)` if the socket cannot be created, the fork
-/// fails, or the child does not signal readiness within the timeout.
+/// Returns an error if the socket cannot be created, the fork fails, or
+/// the child does not signal readiness within the timeout. All resources
+/// (child process, socket directory) are cleaned up before returning the
+/// error.
 #[cfg(target_os = "linux")]
 pub fn fork_connect_proxy(
     allowed_hosts: &[AllowedHost],
     seccomp_debug: bool,
-) -> (std::path::PathBuf, i32, i32) {
+) -> crate::Result<(std::path::PathBuf, i32, i32)> {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
 
     let proxy_dir = tempfile::Builder::new()
         .prefix("arapuca-connect-proxy-")
         .tempdir_in(std::env::temp_dir())
-        .unwrap_or_else(|e| {
-            eprintln!("arapuca: connect proxy: tmpdir: {e}");
-            std::process::exit(125);
-        });
+        .map_err(|e| crate::Error::Process(format!("connect proxy: tmpdir: {e}")))?;
     let uds_path = proxy_dir.keep().join("connect.sock");
 
-    let listener = UnixListener::bind(&uds_path).unwrap_or_else(|e| {
-        eprintln!("arapuca: connect proxy: bind {}: {e}", uds_path.display());
-        std::process::exit(125);
-    });
+    let listener = UnixListener::bind(&uds_path).map_err(|e| {
+        let _ = std::fs::remove_dir_all(uds_path.parent().unwrap());
+        crate::Error::Process(format!("connect proxy: bind {}: {e}", uds_path.display()))
+    })?;
 
     let mut pipe_fds = [0i32; 2];
     // SAFETY: pipe2 with valid array and O_CLOEXEC.
     let ret = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
     if ret != 0 {
-        eprintln!(
-            "arapuca: connect proxy: pipe: {}",
-            std::io::Error::last_os_error()
-        );
-        std::process::exit(125);
+        let err = std::io::Error::last_os_error();
+        drop(listener);
+        let _ = std::fs::remove_dir_all(uds_path.parent().unwrap());
+        return Err(crate::Error::Process(format!("connect proxy: pipe: {err}")));
     }
     let pipe_read = pipe_fds[0];
     let pipe_write = pipe_fds[1];
@@ -1787,11 +1785,14 @@ pub fn fork_connect_proxy(
     let child_pid = unsafe { libc::fork() };
 
     if child_pid < 0 {
-        eprintln!(
-            "arapuca: connect proxy: fork: {}",
-            std::io::Error::last_os_error()
-        );
-        std::process::exit(125);
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+        drop(listener);
+        let _ = std::fs::remove_dir_all(uds_path.parent().unwrap());
+        return Err(crate::Error::Process(format!("connect proxy: fork: {err}")));
     }
 
     if child_pid == 0 {
@@ -1917,6 +1918,21 @@ pub fn fork_connect_proxy(
     // SAFETY: pidfd_open with valid pid and flags=0.
     let proxy_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) } as i32;
 
+    // Helper: clean up the child process and socket directory, then
+    // return an error. Used on all parent-side failure paths.
+    let fail_proxy = |msg: String| -> crate::Error {
+        // SAFETY: child_pid is valid.
+        unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        if proxy_pidfd >= 0 {
+            // SAFETY: proxy_pidfd is a valid pidfd.
+            unsafe { libc::close(proxy_pidfd) };
+            // SAFETY: waitpid with valid pid and WNOHANG.
+            unsafe { libc::waitpid(child_pid, std::ptr::null_mut(), libc::WNOHANG) };
+        }
+        let _ = std::fs::remove_dir_all(uds_path.parent().unwrap());
+        crate::Error::Process(format!("connect proxy: {msg}"))
+    };
+
     // Wait for readiness signal (5s timeout).
     let mut pfd = libc::pollfd {
         fd: pipe_read,
@@ -1931,19 +1947,18 @@ pub fn fork_connect_proxy(
         }
     };
 
-    let fail_proxy = |msg: &str| -> ! {
-        eprintln!("arapuca: connect proxy: {msg}");
-        // SAFETY: child_pid is valid.
-        unsafe { libc::kill(child_pid, libc::SIGKILL) };
-        let _ = std::fs::remove_dir_all(uds_path.parent().unwrap());
-        std::process::exit(125);
-    };
-
     if poll_ret == 0 {
-        fail_proxy("readiness timeout (5s)");
+        // SAFETY: done with pipe_read.
+        unsafe { libc::close(pipe_read) };
+        return Err(fail_proxy("readiness timeout (5s)".into()));
     }
     if poll_ret < 0 {
-        fail_proxy(&format!("poll: {}", std::io::Error::last_os_error()));
+        // SAFETY: done with pipe_read.
+        unsafe { libc::close(pipe_read) };
+        return Err(fail_proxy(format!(
+            "poll: {}",
+            std::io::Error::last_os_error()
+        )));
     }
 
     let mut buf = [0u8; 1];
@@ -1959,10 +1974,10 @@ pub fn fork_connect_proxy(
     unsafe { libc::close(pipe_read) };
 
     if n != 1 {
-        fail_proxy("readiness signal failed");
+        return Err(fail_proxy("readiness signal failed".into()));
     }
 
-    (uds_path, child_pid, proxy_pidfd)
+    Ok((uds_path, child_pid, proxy_pidfd))
 }
 
 /// Kill a CONNECT proxy child and remove its socket directory.
