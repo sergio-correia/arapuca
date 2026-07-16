@@ -59,6 +59,35 @@ pub fn validate_profile_path(path: &str) -> crate::Result<()> {
     Ok(())
 }
 
+/// Collect the ancestor directories of every user mount path.
+///
+/// Seatbelt resolves `realpath()` / `chdir()` (and Rust's
+/// `std::fs::canonicalize`) by walking the path from `/` downward, calling
+/// `lstat` on each component. Each `lstat` requires `file-read-metadata` on
+/// that component. Granting only `(subpath "<mount>")` covers the mount and
+/// its children but NOT its parents, so canonicalizing a mount nested below
+/// a non-system directory (e.g. `/Users/<user>/.c3/worktrees/<run>`) fails
+/// with EPERM at the first un-granted ancestor (`/Users/<user>`).
+///
+/// Returns each intermediate directory from just below root down to the
+/// parent of each mount (the mount itself is already covered by its
+/// `subpath` rule). Deduplicated and sorted for a deterministic profile.
+fn mount_ancestors(paths: &[String]) -> Vec<String> {
+    let mut set = std::collections::BTreeSet::new();
+    for p in paths {
+        // Build cumulative prefixes: "/a", "/a/b", ... excluding the full
+        // path itself (covered by its own subpath grant).
+        let mut prefix = String::new();
+        let comps: Vec<&str> = p.split('/').filter(|c| !c.is_empty()).collect();
+        for comp in comps.iter().take(comps.len().saturating_sub(1)) {
+            prefix.push('/');
+            prefix.push_str(comp);
+            set.insert(prefix.clone());
+        }
+    }
+    set.into_iter().collect()
+}
+
 /// Generate a Seatbelt `.sb` profile and write it to `dir/profile.sb`.
 ///
 /// Returns the path to the generated profile file.
@@ -168,6 +197,24 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
             writeln!(profile, "(allow file-write* (subpath \"{p}\"))").unwrap();
         }
         writeln!(profile).unwrap();
+    }
+
+    // Ancestor traversal for user mounts. A mount's `subpath` grant does not
+    // cover its parent directories; without metadata access to each ancestor,
+    // realpath()/chdir()/canonicalize on a deeply-nested mount fails with
+    // EPERM at the first un-granted parent. Grant metadata-only (not read*)
+    // so directory contents stay deny-by-default — only traversal is opened.
+    {
+        let mut user_paths = data.read_paths.clone();
+        user_paths.extend(data.write_paths.iter().cloned());
+        let ancestors = mount_ancestors(&user_paths);
+        if !ancestors.is_empty() {
+            writeln!(profile, "; Ancestor traversal for user mounts").unwrap();
+            for a in &ancestors {
+                writeln!(profile, "(allow file-read-metadata (literal \"{a}\"))").unwrap();
+            }
+            writeln!(profile).unwrap();
+        }
     }
 
     // /dev/null write access.
@@ -534,6 +581,58 @@ mod tests {
         }
 
         // Cleanup.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_mount_ancestors() {
+        // Deeply nested mount: every intermediate dir, excluding the mount
+        // itself, in sorted order.
+        let anc = mount_ancestors(&["/Users/bob/.c3/worktrees/run1".into()]);
+        assert_eq!(
+            anc,
+            vec![
+                "/Users".to_string(),
+                "/Users/bob".into(),
+                "/Users/bob/.c3".into(),
+                "/Users/bob/.c3/worktrees".into(),
+            ]
+        );
+        // Two mounts sharing a prefix are deduplicated.
+        let anc2 = mount_ancestors(&["/a/b/c".into(), "/a/b/d".into()]);
+        assert_eq!(anc2, vec!["/a".to_string(), "/a/b".into()]);
+        // A top-level mount has no ancestors below root.
+        assert!(mount_ancestors(&["/tmp".into()]).is_empty());
+    }
+
+    #[test]
+    fn test_generate_profile_grants_mount_ancestor_traversal() {
+        let dir = std::env::temp_dir().join("arapuca-test-ancestors");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let data = ProfileData {
+            read_paths: vec!["/Users/bob/project".into()],
+            write_paths: vec!["/Users/bob/.c3/worktrees/run1".into()],
+            exec_paths: vec![],
+            control_socket: None,
+            llm_socket: None,
+            allow_network: false,
+        };
+        let path = generate_profile(&dir, &data).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        // Intermediate ancestors of the nested worktree get metadata-only
+        // traversal grants, so canonicalize/chdir into it resolves.
+        assert!(content.contains("(allow file-read-metadata (literal \"/Users/bob\"))"));
+        assert!(content.contains("(allow file-read-metadata (literal \"/Users/bob/.c3\"))"));
+        assert!(
+            content.contains("(allow file-read-metadata (literal \"/Users/bob/.c3/worktrees\"))")
+        );
+        // The mount itself is covered by its subpath grant, not re-granted as
+        // a bare metadata literal here — and contents stay deny-by-default
+        // (no file-read* subpath for the un-mounted parents).
+        assert!(!content.contains("(allow file-read* (literal \"/Users/bob\"))"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
