@@ -103,10 +103,11 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
     // explicit access to parent directories for realpath() resolution.
     // /private and /private/var are needed because /var, /etc, and /tmp
     // are symlinks into /private on macOS.
-    // /etc is a symlink to /private/etc — it must be readable for
-    // processes that open /etc/hosts, /etc/resolv.conf, etc.
+    // /etc and /tmp are symlinks (/private/etc, /private/tmp) — their entries
+    // must be resolvable so processes that hardcode /etc/hosts or /tmp/<x>
+    // (e.g. tools that build a runtime dir under /tmp) can traverse the link.
     writeln!(profile, "; Ancestor directories for path traversal").unwrap();
-    for ancestor in &["/opt", "/etc", "/Users", "/private", "/private/var"] {
+    for ancestor in &["/opt", "/etc", "/tmp", "/Users", "/private", "/private/var"] {
         writeln!(profile, "(allow file-read* (literal \"{ancestor}\"))").unwrap();
     }
     writeln!(profile).unwrap();
@@ -479,6 +480,9 @@ mod tests {
         // Verify ancestor directories for path traversal.
         assert!(content.contains("(allow file-read* (literal \"/opt\"))"));
         assert!(content.contains("(allow file-read* (literal \"/etc\"))"));
+        // /tmp is a symlink to /private/tmp; its entry must be resolvable so
+        // tools that hardcode a /tmp/<x> runtime dir can traverse the link.
+        assert!(content.contains("(allow file-read* (literal \"/tmp\"))"));
         assert!(content.contains("(allow file-read* (literal \"/private\"))"));
         assert!(content.contains("(allow file-read* (literal \"/Users\"))"));
         assert!(content.contains("(allow file-read* (literal \"/private/var\"))"));
