@@ -421,6 +421,29 @@ impl Sandbox for Darwin {
         let filter_result = crate::env::filter_caller_env(&cfg.env);
         env_vars.extend(filter_result.passed);
 
+        // Forward HTTP(S) proxy vars from the launcher's own (trusted)
+        // environment, bypassing the caller-env filter. Opt-in via
+        // --allow-proxy-env for tools that must reach the network
+        // through a local proxy in baseline network mode.
+        if cfg.profile.allow_proxy_env {
+            for key in &[
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ] {
+                if let Ok(val) = std::env::var(key) {
+                    if !val.is_empty() {
+                        env_vars.push(((*key).to_string(), val));
+                    }
+                }
+            }
+        }
+
         if let Some(ref ctx) = audit_ctx {
             ctx.emit(AuditEvent::EnvPolicy {
                 timestamp: ctx.timestamp(),
