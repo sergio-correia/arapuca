@@ -44,6 +44,9 @@ pub fn validate_profile_path(path: &str) -> crate::Result<()> {
     if path.is_empty() {
         return Err(Error::Validation("empty path".into()));
     }
+    if !path.starts_with('/') {
+        return Err(Error::Validation(format!("path must be absolute: {path}")));
+    }
     if path.split('/').any(|c| c == "..") {
         return Err(Error::Validation(format!("path contains '..': {path}")));
     }
@@ -72,6 +75,11 @@ pub fn validate_profile_path(path: &str) -> crate::Result<()> {
 /// Returns each intermediate directory from just below root down to the
 /// parent of each mount (the mount itself is already covered by its
 /// `subpath` rule). Deduplicated and sorted for a deterministic profile.
+///
+/// Callers pass read/write paths only, not exec paths. Exec binaries are
+/// covered by the system `subpath` grants (`/usr`, `/bin`, `/opt/homebrew`),
+/// by exec paths that are also read paths, and by the hardcoded `/Users` and
+/// `/opt` ancestors.
 fn mount_ancestors(paths: &[String]) -> Vec<String> {
     let mut set = std::collections::BTreeSet::new();
     for p in paths {
@@ -498,6 +506,10 @@ mod tests {
         assert!(validate_profile_path("/tmp/foo|bar").is_err());
         // Ampersand.
         assert!(validate_profile_path("/tmp/foo&bar").is_err());
+        // Relative path (must be absolute — mount_ancestors() prepends '/').
+        assert!(validate_profile_path("foo/bar/baz").is_err());
+        assert!(validate_profile_path("tmp").is_err());
+        assert!(validate_profile_path("./foo").is_err());
     }
 
     #[test]
