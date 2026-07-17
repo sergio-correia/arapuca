@@ -590,6 +590,7 @@ fn run_subcommand(args: &[String]) {
     #[allow(unused_mut, unused_variables)]
     let mut seccomp_debug = false;
     let mut audit_network = false;
+    let mut allow_keychain = false;
 
     // Find -- separator.
     let sep_pos = args.iter().position(|a| a == "--");
@@ -620,6 +621,10 @@ fn run_subcommand(args: &[String]) {
             eprintln!("  --audit-network    emit network connection audit events");
             eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
             eprintln!("  --no-pid-ns        disable PID namespace isolation");
+            eprintln!(
+                "  --allow-keychain   allow macOS Keychain access; sets HOME to your \
+                 home dir (macOS only)"
+            );
             eprintln!("  -t, --tty          allocate a PTY for interactive programs");
             if sep_pos.is_none() && !args.is_empty() {
                 eprintln!();
@@ -810,6 +815,14 @@ fn run_subcommand(args: &[String]) {
             "--audit-files" => {
                 audit_files = true;
             }
+            "--allow-keychain" => {
+                allow_keychain = true;
+                #[cfg(not(target_os = "macos"))]
+                eprintln!(
+                    "arapuca run: --allow-keychain has no effect on this platform \
+                     (macOS Keychain only)"
+                );
+            }
             "--audit-network" => {
                 audit_network = true;
             }
@@ -933,6 +946,7 @@ fn run_subcommand(args: &[String]) {
         audit_file_access: audit_files,
         audit_network: audit_network || deny_network,
         seccomp_debug,
+        allow_keychain,
         ..Default::default()
     };
 

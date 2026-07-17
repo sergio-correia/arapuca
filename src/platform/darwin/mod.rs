@@ -300,6 +300,19 @@ impl Sandbox for Darwin {
             }
         }
 
+        // When Keychain access is requested, add the user's login
+        // Keychain directory to read paths. The file-based login
+        // keychain is read directly by Security.framework; the
+        // securityd/trustd Mach services are granted by the profile.
+        if cfg.profile.allow_keychain {
+            if let Some(home) = std::env::var_os("HOME") {
+                let kc = std::path::Path::new(&home).join("Library/Keychains");
+                if kc.exists() {
+                    read_paths.push(canon(&kc));
+                }
+            }
+        }
+
         // Canonicalize cmd early so exec_paths and actual_cmd use
         // the same resolved path. Seatbelt does NOT resolve symlinks
         // in the target binary path for process-exec checks.
@@ -341,6 +354,7 @@ impl Sandbox for Darwin {
             control_socket,
             llm_socket,
             allow_network,
+            allow_keychain: cfg.profile.allow_keychain,
         };
 
         // Generate the Seatbelt profile.
@@ -393,6 +407,24 @@ impl Sandbox for Darwin {
                 entry.1 = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:\
                             /usr/local/sbin:/usr/sbin:/sbin"
                     .into();
+            }
+        }
+
+        // When Keychain access is enabled, point HOME at the caller's real
+        // home directory instead of the sandbox temp dir. The macOS
+        // Keychain search list is derived from HOME; with the default temp
+        // HOME the login keychain is absent from the search list and
+        // Keychain items cannot be found (reads fail as "item not found").
+        // Confinement is unaffected: access is bounded by the mount profile,
+        // not by $HOME, so an un-mounted home still yields EPERM.
+        if cfg.profile.allow_keychain {
+            if let Some(home) = std::env::var_os("HOME") {
+                let home = home.to_string_lossy().into_owned();
+                if let Some(entry) = env_vars.iter_mut().find(|(k, _)| k == "HOME") {
+                    entry.1 = home;
+                } else {
+                    env_vars.push(("HOME".into(), home));
+                }
             }
         }
 

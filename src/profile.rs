@@ -168,6 +168,28 @@ pub struct Profile {
     /// blocked syscall names to stderr. Does NOT affect the main
     /// sandbox filter protecting the untrusted process.
     pub seccomp_debug: bool,
+    /// Grant the sandboxed process access to the macOS Keychain
+    /// (macOS only; ignored on other platforms).
+    ///
+    /// The deny-default Seatbelt profile blocks the Mach services and
+    /// files that `Security.framework` needs to read Keychain items,
+    /// so tools that authenticate via the login Keychain (e.g. Claude
+    /// Code's subscription OAuth token stored under
+    /// `Claude Code-credentials`) report "not logged in" inside the
+    /// sandbox. When true, the profile additionally allows the
+    /// `securityd`/`trustd` Mach lookups and read access to the
+    /// Keychain database files so native Keychain authentication works.
+    ///
+    /// On macOS this also points `HOME` at the launching user's real home
+    /// directory (the Keychain search list is derived from `HOME`; the
+    /// sandbox's default temp `HOME` omits the login keychain, so items
+    /// cannot be found otherwise). Confinement is unaffected — the mount
+    /// profile, not `$HOME`, bounds what is accessible.
+    ///
+    /// This widens the sandbox: the process can read any Keychain item
+    /// the invoking user can. Enable only for trusted tools that need
+    /// Keychain-backed credentials.
+    pub allow_keychain: bool,
 }
 
 /// Full configuration for launching a sandboxed process.
