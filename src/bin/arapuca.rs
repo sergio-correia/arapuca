@@ -590,6 +590,7 @@ fn run_subcommand(args: &[String]) {
     #[allow(unused_mut, unused_variables)]
     let mut seccomp_debug = false;
     let mut audit_network = false;
+    let mut allow_proxy_env = false;
 
     // Find -- separator.
     let sep_pos = args.iter().position(|a| a == "--");
@@ -618,6 +619,7 @@ fn run_subcommand(args: &[String]) {
             eprintln!("  --audit-files      emit file access and process spawn audit events");
             eprintln!("  --seccomp-debug    log blocked syscalls to stderr instead of killing");
             eprintln!("  --audit-network    emit network connection audit events");
+            eprintln!("  --allow-proxy-env  forward HTTP(S)_PROXY/NO_PROXY from the caller's env");
             eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
             eprintln!("  --no-pid-ns        disable PID namespace isolation");
             eprintln!("  -t, --tty          allocate a PTY for interactive programs");
@@ -810,6 +812,9 @@ fn run_subcommand(args: &[String]) {
             "--audit-files" => {
                 audit_files = true;
             }
+            "--allow-proxy-env" => {
+                allow_proxy_env = true;
+            }
             "--audit-network" => {
                 audit_network = true;
             }
@@ -933,6 +938,7 @@ fn run_subcommand(args: &[String]) {
         audit_file_access: audit_files,
         audit_network: audit_network || deny_network,
         seccomp_debug,
+        allow_proxy_env,
         ..Default::default()
     };
 

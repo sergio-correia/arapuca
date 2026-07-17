@@ -168,6 +168,20 @@ pub struct Profile {
     /// blocked syscall names to stderr. Does NOT affect the main
     /// sandbox filter protecting the untrusted process.
     pub seccomp_debug: bool,
+    /// Forward standard HTTP(S) proxy environment variables from the
+    /// launching process to the sandboxed process.
+    ///
+    /// The caller-env filter normally strips `HTTP_PROXY`/`HTTPS_PROXY`/
+    /// `NO_PROXY` (and lowercase/`ALL_PROXY` variants) because an
+    /// attacker-influenced proxy could redirect or MITM the sandboxed
+    /// process's traffic. When true, the launcher instead injects those
+    /// variables from its OWN environment (a trusted operator source),
+    /// bypassing the filter, so tools that must reach the network
+    /// through a local proxy work in baseline network mode.
+    ///
+    /// Only meaningful when outbound network is allowed (macOS baseline
+    /// seccomp mode). Ignored on other platforms.
+    pub allow_proxy_env: bool,
 }
 
 /// Full configuration for launching a sandboxed process.
