@@ -31,6 +31,15 @@ pub struct ProfileData {
     /// IPC services needed for DNS and TLS on macOS. There is no
     /// per-host filtering (unlike Linux's netns + CONNECT proxy).
     pub allow_network: bool,
+    /// Allow access to the macOS Keychain.
+    ///
+    /// When true, the profile grants the `securityd`/`trustd` Mach
+    /// lookups and read access to the Keychain database files so
+    /// `Security.framework` can read Keychain items (e.g. an app's
+    /// stored OAuth token). Without this, a deny-default profile makes
+    /// Keychain reads fail silently and Keychain-backed authentication
+    /// reports "not logged in".
+    pub allow_keychain: bool,
 }
 
 /// Validate that a path contains only safe characters for embedding in
@@ -434,6 +443,35 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
     }
     writeln!(profile).unwrap();
 
+    // Keychain access (opt-in via --allow-keychain).
+    //
+    // Reading a Keychain item goes through securityd over Mach IPC;
+    // trustd/ocspd back certificate trust evaluation. The file-based
+    // login keychain is also read directly by Security.framework, so
+    // grant read access to the system Keychain directory and the
+    // metadata store. The user's login keychain directory
+    // (~/Library/Keychains) is added to read_paths by the launcher.
+    if data.allow_keychain {
+        writeln!(profile, "; Keychain (--allow-keychain)").unwrap();
+        for service in &[
+            "com.apple.SecurityServer",
+            "com.apple.trustd",
+            "com.apple.trustd.agent",
+            "com.apple.ocspd",
+            "com.apple.CoreServices.coreservicesd",
+        ] {
+            writeln!(profile, "(allow mach-lookup (global-name \"{service}\"))").unwrap();
+        }
+        for path in &[
+            "/Library/Keychains",
+            "/System/Library/Keychains",
+            "/private/var/db/mds",
+        ] {
+            writeln!(profile, "(allow file-read* (subpath \"{path}\"))").unwrap();
+        }
+        writeln!(profile).unwrap();
+    }
+
     // POSIX shared memory (read-only).
     writeln!(profile, "; POSIX shm").unwrap();
     writeln!(profile, "(allow ipc-posix-shm-read-data)").unwrap();
@@ -525,6 +563,7 @@ mod tests {
             control_socket: Some("/tmp/sock/control.sock".into()),
             llm_socket: Some("/tmp/sock/llm.sock".into()),
             allow_network: false,
+            allow_keychain: false,
         };
 
         let path = generate_profile(&dir, &data).unwrap();
@@ -633,6 +672,7 @@ mod tests {
             control_socket: None,
             llm_socket: None,
             allow_network: false,
+            allow_keychain: false,
         };
         let path = generate_profile(&dir, &data).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
@@ -665,6 +705,7 @@ mod tests {
             control_socket: None,
             llm_socket: None,
             allow_network: false,
+            allow_keychain: false,
         };
 
         let result = generate_profile(&dir, &data);
@@ -686,6 +727,7 @@ mod tests {
             control_socket: None,
             llm_socket: None,
             allow_network: true,
+            allow_keychain: false,
         };
 
         let path = generate_profile(&dir, &data).unwrap();
@@ -744,6 +786,47 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_profile_keychain() {
+        let dir_off = std::env::temp_dir().join("arapuca-test-profile-keychain-off");
+        let dir_on = std::env::temp_dir().join("arapuca-test-profile-keychain-on");
+        let _ = std::fs::create_dir_all(&dir_off);
+        let _ = std::fs::create_dir_all(&dir_on);
+
+        // Keychain disabled: no securityd Mach lookup, no keychain files.
+        let off = ProfileData {
+            read_paths: vec!["/home/user/src".into()],
+            write_paths: vec![],
+            exec_paths: vec![],
+            control_socket: None,
+            llm_socket: None,
+            allow_network: false,
+            allow_keychain: false,
+        };
+        let content_off =
+            std::fs::read_to_string(generate_profile(&dir_off, &off).unwrap()).unwrap();
+        assert!(!content_off.contains("com.apple.SecurityServer"));
+        assert!(!content_off.contains("(allow file-read* (subpath \"/Library/Keychains\"))"));
+
+        // Keychain enabled: securityd/ocspd Mach lookups + keychain files.
+        let on = ProfileData {
+            allow_keychain: true,
+            ..off
+        };
+        let content_on = std::fs::read_to_string(generate_profile(&dir_on, &on).unwrap()).unwrap();
+        assert!(
+            content_on.contains("(allow mach-lookup (global-name \"com.apple.SecurityServer\"))")
+        );
+        assert!(content_on.contains("com.apple.ocspd"));
+        assert!(content_on.contains("(allow file-read* (subpath \"/Library/Keychains\"))"));
+        assert!(content_on.contains("(allow file-read* (subpath \"/private/var/db/mds\"))"));
+        // deny-default is preserved.
+        assert!(content_on.contains("(deny default)"));
+
+        let _ = std::fs::remove_dir_all(&dir_off);
+        let _ = std::fs::remove_dir_all(&dir_on);
+    }
+
+    #[test]
     fn test_generate_profile_proxy_only() {
         let dir = std::env::temp_dir().join("arapuca-test-profile-proxy");
         let _ = std::fs::create_dir_all(&dir);
@@ -755,6 +838,7 @@ mod tests {
             control_socket: None,
             llm_socket: Some("/tmp/sock/proxy.sock".into()),
             allow_network: false,
+            allow_keychain: false,
         };
 
         let path = generate_profile(&dir, &data).unwrap();
