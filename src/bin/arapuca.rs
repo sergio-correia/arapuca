@@ -619,7 +619,11 @@ fn run_subcommand(args: &[String]) {
             eprintln!("  --audit-files      emit file access and process spawn audit events");
             eprintln!("  --seccomp-debug    log blocked syscalls to stderr instead of killing");
             eprintln!("  --audit-network    emit network connection audit events");
-            eprintln!("  --allow-proxy-env  forward HTTP(S)_PROXY/NO_PROXY from the caller's env");
+            eprintln!(
+                "  --allow-proxy-env  forward HTTP(S)_PROXY/ALL_PROXY/NO_PROXY from the caller's env"
+            );
+            eprintln!("                     (proxy routing only; TLS trust-anchor vars such as");
+            eprintln!("                     SSL_CERT_FILE/CURL_CA_BUNDLE are not forwarded)");
             eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
             eprintln!("  --no-pid-ns        disable PID namespace isolation");
             eprintln!("  -t, --tty          allocate a PTY for interactive programs");
@@ -814,6 +818,11 @@ fn run_subcommand(args: &[String]) {
             }
             "--allow-proxy-env" => {
                 allow_proxy_env = true;
+                #[cfg(not(target_os = "macos"))]
+                eprintln!(
+                    "arapuca run: --allow-proxy-env is macOS-only; \
+                     ignored on this platform"
+                );
             }
             "--audit-network" => {
                 audit_network = true;

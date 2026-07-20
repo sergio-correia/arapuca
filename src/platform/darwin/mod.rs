@@ -20,8 +20,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use crate::audit::{
-    AuditContext, AuditEvent, AuditVerbosity, SCHEMA_VERSION, SandboxLayer, SkipReason,
-    sanitize_audit_string,
+    AuditContext, AuditEvent, AuditVerbosity, InjectReason, InjectedEnvVar, SCHEMA_VERSION,
+    SandboxLayer, SkipReason, sanitize_audit_string,
 };
 use crate::platform::Sandbox;
 use crate::{Config, Error, process::Process};
@@ -425,7 +425,17 @@ impl Sandbox for Darwin {
         // environment, bypassing the caller-env filter. Opt-in via
         // --allow-proxy-env for tools that must reach the network
         // through a local proxy in baseline network mode.
-        if cfg.profile.allow_proxy_env {
+        //
+        // Gate on allow_network so proxy vars (which may carry
+        // credentials in the URL) are never injected when outbound
+        // network is blocked by Seatbelt; otherwise the untrusted
+        // process could read and exfiltrate them despite no egress.
+        //
+        // Injected keys are also recorded separately in the EnvPolicy
+        // audit event so an auditor can tell launcher-injected vars apart
+        // from caller-supplied vars that passed the filter.
+        let mut injected_keys = Vec::new();
+        if cfg.profile.allow_proxy_env && allow_network {
             for key in &[
                 "HTTP_PROXY",
                 "http_proxy",
@@ -439,6 +449,10 @@ impl Sandbox for Darwin {
                 if let Ok(val) = std::env::var(key) {
                     if !val.is_empty() {
                         env_vars.push(((*key).to_string(), val));
+                        injected_keys.push(InjectedEnvVar {
+                            key: (*key).to_string(),
+                            reason: InjectReason::ProxyEnv,
+                        });
                     }
                 }
             }
@@ -448,6 +462,7 @@ impl Sandbox for Darwin {
             ctx.emit(AuditEvent::EnvPolicy {
                 timestamp: ctx.timestamp(),
                 passed_keys: env_vars.iter().map(|(k, _)| k.clone()).collect(),
+                injected_keys,
                 dropped: filter_result.dropped,
             })?;
         }

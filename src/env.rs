@@ -722,6 +722,33 @@ mod tests {
         assert_eq!(result.dropped[0].reason, DropReason::DyldPrefix);
     }
 
+    /// Contract test: every proxy var forwarded by `--allow-proxy-env`
+    /// (see the darwin launcher) must be dropped by `filter_caller_env`,
+    /// so re-injecting from the trusted launcher env is safe and the two
+    /// lists cannot silently drift apart.
+    #[test]
+    fn filter_drops_all_proxy_vars_that_allow_proxy_env_forwards() {
+        let forwarded = [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
+        for key in &forwarded {
+            let env = vec![((*key).to_string(), "http://proxy".into())];
+            let result = filter_caller_env(&env);
+            assert!(
+                result.passed.is_empty(),
+                "filter must drop {key} so allow_proxy_env can safely re-inject it"
+            );
+            assert_eq!(result.dropped[0].reason, DropReason::RuntimeInjection);
+        }
+    }
+
     #[test]
     fn filter_drops_interpreter_injection() {
         let blocked = vec![

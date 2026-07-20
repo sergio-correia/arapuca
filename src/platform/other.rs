@@ -120,6 +120,7 @@ impl Sandbox for Other {
             ctx.emit(AuditEvent::EnvPolicy {
                 timestamp: ctx.timestamp(),
                 passed_keys: env_vars.iter().map(|(k, _)| k.clone()).collect(),
+                injected_keys: Vec::new(),
                 dropped: filter_result.dropped,
             })?;
         }

@@ -320,6 +320,7 @@ fn env_filtering_audited() {
     match env_event.unwrap() {
         AuditEvent::EnvPolicy {
             passed_keys,
+            injected_keys,
             dropped,
             ..
         } => {
@@ -327,6 +328,8 @@ fn env_filtering_audited() {
             assert!(!passed_keys.iter().any(|k| k == "LD_PRELOAD"));
             assert_eq!(dropped.len(), 1);
             assert_eq!(dropped[0].key, "LD_PRELOAD");
+            // Without --allow-proxy-env the launcher injects nothing.
+            assert!(injected_keys.is_empty());
         }
         _ => unreachable!(),
     }

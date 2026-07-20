@@ -75,10 +75,22 @@ pub enum AuditEvent {
     ///
     /// Key names are logged (the audit consumer already has full visibility
     /// into the environment). Values are NEVER logged.
+    ///
+    /// `passed_keys` is the full set of keys the sandboxed process receives
+    /// (base env, caller-supplied keys that survived filtering, and any
+    /// launcher-injected keys). `injected_keys` annotates the subset of
+    /// those keys that the trusted launcher injected on its own, bypassing
+    /// the caller-env filter (e.g. proxy vars under `--allow-proxy-env`);
+    /// each carries the [`InjectReason`] explaining why. `dropped` records
+    /// caller keys the filter rejected and is independent of the other two:
+    /// a key an untrusted caller tried to set can appear in `dropped` (their
+    /// value was refused) while the same key appears in `injected_keys` (the
+    /// launcher supplied its own trusted value).
     #[non_exhaustive]
     EnvPolicy {
         timestamp: AuditTimestamp,
         passed_keys: Vec<String>,
+        injected_keys: Vec<InjectedEnvVar>,
         dropped: Vec<DroppedEnvVar>,
     },
 
@@ -343,6 +355,27 @@ pub enum DropReason {
 pub struct DroppedEnvVar {
     pub key: String,
     pub reason: DropReason,
+}
+
+/// Why the trusted launcher injected an environment variable, bypassing
+/// the caller-env filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum InjectReason {
+    /// Proxy vars forwarded from the launcher's own environment under
+    /// `--allow-proxy-env` (only when outbound network is allowed).
+    ProxyEnv,
+}
+
+/// An environment variable the launcher injected on its own, bypassing
+/// the caller-env filter. Its value comes from the trusted launcher
+/// environment, not from the (untrusted) caller.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct InjectedEnvVar {
+    pub key: String,
+    pub reason: InjectReason,
 }
 
 /// Controls how much detail audit events include.

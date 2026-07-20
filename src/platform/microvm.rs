@@ -287,6 +287,7 @@ impl Sandbox for MicroVm {
                     .iter()
                     .map(|(k, _)| k.clone())
                     .collect(),
+                injected_keys: Vec::new(),
                 dropped: filter_result.dropped,
             })?;
         }
