@@ -453,13 +453,15 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
     // (~/Library/Keychains) is added to read_paths by the launcher.
     if data.allow_keychain {
         writeln!(profile, "; Keychain (--allow-keychain)").unwrap();
-        for service in &[
-            "com.apple.SecurityServer",
-            "com.apple.trustd",
-            "com.apple.trustd.agent",
-            "com.apple.ocspd",
-            "com.apple.CoreServices.coreservicesd",
-        ] {
+        let mut services = vec!["com.apple.SecurityServer", "com.apple.ocspd"];
+        // trustd/trustd.agent back certificate trust evaluation. When
+        // networking is enabled they are already granted in the network
+        // block above, so only emit them here to avoid a duplicate.
+        if !data.allow_network {
+            services.push("com.apple.trustd");
+            services.push("com.apple.trustd.agent");
+        }
+        for service in &services {
             writeln!(profile, "(allow mach-lookup (global-name \"{service}\"))").unwrap();
         }
         for path in &[
@@ -821,9 +823,38 @@ mod tests {
         assert!(content_on.contains("(allow file-read* (subpath \"/private/var/db/mds\"))"));
         // deny-default is preserved.
         assert!(content_on.contains("(deny default)"));
+        // With networking off, the keychain block supplies trustd itself.
+        assert!(content_on.contains("(allow mach-lookup (global-name \"com.apple.trustd\"))"));
+
+        // Keychain + network is a realistic production config. trustd is
+        // granted by the network block, so the keychain block must not
+        // emit it again (guards against duplicate Mach entries).
+        let dir_both = std::env::temp_dir().join("arapuca-test-profile-keychain-net");
+        let _ = std::fs::create_dir_all(&dir_both);
+        let both = ProfileData {
+            read_paths: vec!["/home/user/src".into()],
+            write_paths: vec![],
+            exec_paths: vec![],
+            control_socket: None,
+            llm_socket: None,
+            allow_network: true,
+            allow_keychain: true,
+        };
+        let content_both =
+            std::fs::read_to_string(generate_profile(&dir_both, &both).unwrap()).unwrap();
+        let trustd_count = content_both
+            .matches("(global-name \"com.apple.trustd\")")
+            .count();
+        assert_eq!(
+            trustd_count, 1,
+            "trustd must be granted exactly once when network and keychain are both on"
+        );
+        // Keychain files are still granted in the combined config.
+        assert!(content_both.contains("(allow file-read* (subpath \"/Library/Keychains\"))"));
 
         let _ = std::fs::remove_dir_all(&dir_off);
         let _ = std::fs::remove_dir_all(&dir_on);
+        let _ = std::fs::remove_dir_all(&dir_both);
     }
 
     #[test]

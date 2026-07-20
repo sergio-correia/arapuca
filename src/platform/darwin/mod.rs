@@ -218,17 +218,26 @@ impl Sandbox for Darwin {
                 })?;
             }
 
-            let seatbelt_detail = if allow_network {
+            let network_detail = if allow_network {
                 "network=allowed"
             } else if proxy_mode {
                 "network=proxy-only"
             } else {
                 "network=denied"
             };
+            // Record Keychain access too: --allow-keychain widens the
+            // sandbox (extra Mach services and Keychain file reads), so
+            // it must leave an audit trail alongside the network mode.
+            let keychain_detail = if cfg.profile.allow_keychain {
+                "keychain=allowed"
+            } else {
+                "keychain=denied"
+            };
+            let seatbelt_detail = format!("{network_detail},{keychain_detail}");
             ctx.emit(AuditEvent::LayerApplied {
                 timestamp: ctx.timestamp(),
                 layer: SandboxLayer::Seatbelt,
-                detail: Some(crate::audit::LayerDetail::Other(seatbelt_detail.into())),
+                detail: Some(crate::audit::LayerDetail::Other(seatbelt_detail)),
             })?;
             ctx.emit(AuditEvent::LayerApplied {
                 timestamp: ctx.timestamp(),
@@ -300,19 +309,6 @@ impl Sandbox for Darwin {
             }
         }
 
-        // When Keychain access is requested, add the user's login
-        // Keychain directory to read paths. The file-based login
-        // keychain is read directly by Security.framework; the
-        // securityd/trustd Mach services are granted by the profile.
-        if cfg.profile.allow_keychain {
-            if let Some(home) = std::env::var_os("HOME") {
-                let kc = std::path::Path::new(&home).join("Library/Keychains");
-                if kc.exists() {
-                    read_paths.push(canon(&kc));
-                }
-            }
-        }
-
         // Canonicalize cmd early so exec_paths and actual_cmd use
         // the same resolved path. Seatbelt does NOT resolve symlinks
         // in the target binary path for process-exec checks.
@@ -337,6 +333,30 @@ impl Sandbox for Darwin {
                 if !exec_paths.contains(p) {
                     exec_paths.push(p.clone());
                 }
+            }
+        }
+
+        // When Keychain access is requested, add the user's login
+        // Keychain directory to read paths. The file-based login
+        // keychain is read directly by Security.framework; the
+        // securityd/trustd Mach services are granted by the profile.
+        //
+        // This runs after the allow_exec block on purpose: the
+        // Keychains directory only holds `.keychain-db` files and must
+        // never be granted process-exec, so it must not be copied into
+        // exec_paths above.
+        if cfg.profile.allow_keychain {
+            if let Some(home) = std::env::var_os("HOME") {
+                let kc = std::path::Path::new(&home).join("Library/Keychains");
+                if kc.exists() {
+                    read_paths.push(canon(&kc));
+                }
+            } else {
+                log::warn!(
+                    "--allow-keychain: HOME is unset, so the login Keychain \
+                     directory cannot be located; Keychain reads will fail. \
+                     Set HOME to the real home directory."
+                );
             }
         }
 
