@@ -187,9 +187,8 @@ pub struct Profile {
     ///
     /// The deny-default Seatbelt profile blocks the Mach services and
     /// files that `Security.framework` needs to read Keychain items,
-    /// so tools that authenticate via the login Keychain (e.g. Claude
-    /// Code's subscription OAuth token stored under
-    /// `Claude Code-credentials`) report "not logged in" inside the
+    /// so tools that authenticate via the login Keychain (e.g. stored
+    /// OAuth tokens) report "not logged in" inside the
     /// sandbox. When true, the profile additionally allows the
     /// `securityd`/`trustd` Mach lookups and read access to the
     /// Keychain database files so native Keychain authentication works.
