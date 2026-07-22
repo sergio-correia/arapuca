@@ -202,6 +202,16 @@ impl Process {
         }
         let pid = self.pid();
 
+        // Capture the child's PID before wait() clears it. setsid()
+        // in pre_exec makes child PID = PGID, so we can kill the
+        // entire process group after the child exits to clean up
+        // orphaned descendants that may hold pipe FDs open.
+        #[cfg(target_os = "linux")]
+        let child_pgid: i32 = match &self.child {
+            ChildHandle::Managed(c) => c.id() as i32,
+            ChildHandle::Forked(p) => *p as i32,
+        };
+
         // macOS: wait for child to exit without reaping (WNOWAIT),
         // then cancel the memory monitor, join it, then reap.
         // This prevents PID recycling between reap and monitor stop.
@@ -255,6 +265,17 @@ impl Process {
             }
         };
         self.waited = true;
+
+        // Kill orphaned descendants in the child's process group.
+        // setsid() in pre_exec makes child PID = PGID. After the
+        // child exits, orphaned grandchildren (e.g., a tracee whose
+        // tracer was killed by SIGSYS) may hold inherited pipe FDs,
+        // preventing EOF on the caller's pipes. In pidns mode,
+        // namespace collapse handles this automatically.
+        #[cfg(target_os = "linux")]
+        if self.target_pid.is_none() && child_pgid > 1 {
+            unsafe { libc::kill(-child_pgid, libc::SIGKILL) };
+        }
 
         // Read blocked-network audit data before emitting
         // ProcessExited, so NetworkBlocked events appear before
@@ -873,6 +894,14 @@ impl Drop for Process {
             }
         }
 
+        // Capture the PGID before killing/reaping the child. setsid()
+        // in pre_exec makes child PID = PGID.
+        #[cfg(target_os = "linux")]
+        let child_pgid: i32 = match &self.child {
+            ChildHandle::Managed(c) => c.id() as i32,
+            ChildHandle::Forked(p) => *p as i32,
+        };
+
         // Kill the child process first to ensure resources can be
         // reclaimed. Without this, cgroups can't be destroyed while
         // occupied, and a live process would run unsupervised after
@@ -932,6 +961,14 @@ impl Drop for Process {
                 }
             }
             _ => {}
+        }
+
+        // Kill orphaned descendants (same rationale as in wait()).
+        // Only when wait() hasn't already done this — otherwise the
+        // PGID may have been recycled.
+        #[cfg(target_os = "linux")]
+        if !self.waited && self.target_pid.is_none() && child_pgid > 1 {
+            unsafe { libc::kill(-child_pgid, libc::SIGKILL) };
         }
 
         #[cfg(target_os = "linux")]
