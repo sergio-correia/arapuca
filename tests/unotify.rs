@@ -24,6 +24,15 @@ fn arapuca_bin() -> PathBuf {
     path
 }
 
+fn netns_available() -> bool {
+    Command::new("unshare")
+        .args(["--user", "--net", "--map-root-user", "--", "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 #[cfg(seccomp_supported)]
 fn unotify_supported() -> bool {
     arapuca::unotify::unotify_available()
@@ -143,6 +152,10 @@ fn audit_files_short_lived_process() {
 
 #[test]
 fn deny_network_implies_audit_network() {
+    if !netns_available() {
+        eprintln!("skipping: netns not available");
+        return;
+    }
     // --deny-network should implicitly enable network auditing.
     // This test just verifies no crash/hang when both are active.
     let output = Command::new(arapuca_bin())
@@ -159,6 +172,10 @@ fn deny_network_implies_audit_network() {
 
 #[test]
 fn audit_files_with_deny_network() {
+    if !netns_available() {
+        eprintln!("skipping: netns not available");
+        return;
+    }
     // Both features active simultaneously.
     let output = Command::new(arapuca_bin())
         .args(["run", "--audit-files", "--deny-network", "--", "/bin/true"])
