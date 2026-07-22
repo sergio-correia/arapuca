@@ -33,7 +33,7 @@ vm-agent = []
 microvm = ["dep:reqwest", "dep:krun-sys", "dep:openssl", "dep:gpt", "dep:nbd"]
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = ">= 0.2, < 0.2.188"
 nix = { version = "0.31", features = ["fs", "process", "sched", "signal", "user"] }
 
 [target.'cfg(windows)'.dependencies]

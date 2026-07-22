@@ -460,6 +460,7 @@ fn env_enforcement_end_to_end() {
     cfg.profile
         .write_paths
         .push(std::path::PathBuf::from("/tmp"));
+    cfg.profile.allow_exec = true;
     cfg.env = vec![
         ("SAFE_VAR".into(), "hello".into()),
         ("LD_PRELOAD".into(), "/evil.so".into()),
