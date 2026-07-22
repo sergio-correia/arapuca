@@ -870,6 +870,20 @@ fn rollback_appcontainer(
 
 fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = crate::env::filter_caller_env(&cfg.env).passed;
+    const OVERRIDDEN: &[&str] = &[
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "PATH",
+        "SystemRoot",
+        "LANG",
+    ];
+    env.retain(|(key, _)| {
+        !OVERRIDDEN
+            .iter()
+            .any(|managed| key.eq_ignore_ascii_case(managed))
+    });
 
     if let Some(ref proxy) = cfg.network_proxy_socket {
         env.push((
@@ -937,7 +951,12 @@ fn encode_work_dir(path: &Path) -> Vec<u16> {
     if wide.starts_with(&verbatim_unc) {
         wide.drain(..verbatim_unc.len());
         wide.splice(0..0, OsStr::new(r"\\").encode_wide());
-    } else if wide.starts_with(&verbatim) {
+    } else if wide.starts_with(&verbatim)
+        && wide.len() > verbatim.len() + 2
+        && (wide[verbatim.len()] >= b'A' as u16 && wide[verbatim.len()] <= b'Z' as u16
+            || wide[verbatim.len()] >= b'a' as u16 && wide[verbatim.len()] <= b'z' as u16)
+        && wide[verbatim.len() + 1] == b':' as u16
+    {
         wide.drain(..verbatim.len());
     }
     wide.push(0);
@@ -1450,6 +1469,14 @@ mod tests {
     }
 
     #[test]
+    fn work_dir_preserves_verbatim_volume_guid_path() {
+        let path = r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\work";
+        let encoded = encode_work_dir(Path::new(path));
+        let decoded = String::from_utf16(&encoded[..encoded.len() - 1]).unwrap();
+        assert_eq!(decoded, path);
+    }
+
+    #[test]
     fn work_dir_preserves_regular_path_and_terminates() {
         let encoded = encode_work_dir(Path::new(r"C:\work"));
         let decoded = String::from_utf16(&encoded[..encoded.len() - 1]).unwrap();
@@ -1478,6 +1505,69 @@ mod tests {
             env.iter()
                 .any(|(key, value)| { key == "LOCALAPPDATA" && value == &temp.to_string_lossy() })
         );
+    }
+
+    #[test]
+    fn caller_local_app_data_does_not_override_sandbox() {
+        let temp = Path::new(r"C:\sandbox-temp");
+        let config = Config {
+            profile: crate::Profile::default(),
+            socket_dir: PathBuf::new(),
+            task_id: "env-test".into(),
+            phase: "test".into(),
+            work_dir: None,
+            network_proxy_socket: None,
+            env: vec![("localappdata".into(), r"C:\Users\host\AppData\Local".into())],
+            audit_sink: None,
+            audit_verbosity: crate::audit::AuditVerbosity::Standard,
+            audit_principal: None,
+            audit_correlation_id: None,
+        };
+
+        let values: Vec<_> = build_env(&config, temp)
+            .into_iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("LOCALAPPDATA"))
+            .collect();
+        assert_eq!(
+            values,
+            vec![("LOCALAPPDATA".into(), temp.to_string_lossy().into_owned())]
+        );
+    }
+
+    #[test]
+    fn caller_path_and_user_profile_do_not_override_sandbox() {
+        let temp = Path::new(r"C:\sandbox-temp");
+        let config = Config {
+            profile: crate::Profile::default(),
+            socket_dir: PathBuf::new(),
+            task_id: "env-test".into(),
+            phase: "test".into(),
+            work_dir: None,
+            network_proxy_socket: None,
+            env: vec![
+                ("Path".into(), r"C:\host-bin".into()),
+                ("userprofile".into(), r"C:\Users\host".into()),
+            ],
+            audit_sink: None,
+            audit_verbosity: crate::audit::AuditVerbosity::Standard,
+            audit_principal: None,
+            audit_correlation_id: None,
+        };
+
+        let env = build_env(&config, temp);
+        let paths: Vec<_> = env
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+            .collect();
+        assert_eq!(paths.len(), 1);
+        assert!(!paths[0].1.contains("host-bin"));
+
+        let profiles: Vec<_> = env
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("USERPROFILE"))
+            .collect();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].1, temp.to_string_lossy());
     }
 
     #[test]

@@ -249,7 +249,10 @@ pub struct Config {
     /// Caller-supplied environment variables for the subprocess.
     /// Filtered by the platform launcher before use: ARAPUCA_*,
     /// LD_*, DYLD_*, and other dangerous names are silently dropped.
-    /// If the same key is added multiple times, the last value wins.
+    /// Callers should not provide duplicate keys. On Windows, entries are
+    /// sorted case-insensitively and process lookup uses the first matching
+    /// entry. Launcher-managed keys are removed and re-added so sandbox
+    /// values take precedence.
     pub env: Vec<(String, String)>,
     /// Optional audit event sink. When None, no events are emitted
     /// and zero audit overhead is incurred.
