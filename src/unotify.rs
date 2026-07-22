@@ -34,21 +34,21 @@ const IOC_WRITE: u32 = 1;
 const IOC_READ: u32 = 2;
 const IOC_TYPE: u32 = b'!' as u32;
 
-const fn ioc(dir: u32, nr: u32, size: u32) -> libc::c_ulong {
-    ((dir << 30) | (IOC_TYPE << 8) | nr | (size << 16)) as libc::c_ulong
+const fn ioc(dir: u32, nr: u32, size: u32) -> libc::Ioctl {
+    ((dir << 30) | (IOC_TYPE << 8) | nr | (size << 16)) as libc::Ioctl
 }
 
 /// `ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, &notif)` — receive a notification.
-const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = ioc(IOC_WRITE | IOC_READ, 0, 80);
+const SECCOMP_IOCTL_NOTIF_RECV: libc::Ioctl = ioc(IOC_WRITE | IOC_READ, 0, 80);
 
 /// `ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, &resp)` — send a response.
-const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = ioc(IOC_WRITE | IOC_READ, 1, 24);
+const SECCOMP_IOCTL_NOTIF_SEND: libc::Ioctl = ioc(IOC_WRITE | IOC_READ, 1, 24);
 
 /// `ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id)` — check if notification is still valid.
 /// Kernel 5.17+ uses `_IOW`; kernels 5.0–5.16 use `_IOR`. The 5.17+
 /// kernel accepts both, so we try the new one first and fall back.
-const SECCOMP_IOCTL_NOTIF_ID_VALID_NEW: libc::c_ulong = ioc(IOC_WRITE, 2, 8);
-const SECCOMP_IOCTL_NOTIF_ID_VALID_OLD: libc::c_ulong = ioc(IOC_READ, 2, 8);
+const SECCOMP_IOCTL_NOTIF_ID_VALID_NEW: libc::Ioctl = ioc(IOC_WRITE, 2, 8);
+const SECCOMP_IOCTL_NOTIF_ID_VALID_OLD: libc::Ioctl = ioc(IOC_READ, 2, 8);
 
 // ─── BPF construction ─────────────────────────────────────────────
 
