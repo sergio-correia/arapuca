@@ -100,12 +100,7 @@ impl Sandbox for Windows {
         let env_block = encode_env_block(&env_vars);
         let mut cmdline = quote_args(cmd, args);
 
-        let work_dir: Option<Vec<u16>> = cfg.work_dir.as_ref().map(|p| {
-            p.as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect()
-        });
+        let work_dir: Option<Vec<u16>> = cfg.work_dir.as_ref().map(|p| encode_work_dir(p));
 
         let stdio_handles = duplicate_stdio().inspect_err(cleanup_tmp)?;
         let mut handle_list: Vec<HANDLE> = stdio_handles
@@ -886,6 +881,10 @@ fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
 
     env.push(("USERPROFILE".into(), tmp_dir.to_string_lossy().into_owned()));
+    env.push((
+        "LOCALAPPDATA".into(),
+        tmp_dir.to_string_lossy().into_owned(),
+    ));
     env.push(("TEMP".into(), tmp_dir.to_string_lossy().into_owned()));
     env.push(("TMP".into(), tmp_dir.to_string_lossy().into_owned()));
     env.push((
@@ -921,6 +920,28 @@ pub(crate) fn quote_args(cmd: &str, args: &[&str]) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+/// Encode a working directory for `CreateProcessW`.
+///
+/// `Path::canonicalize` returns verbatim (`\\?\`) paths on Windows. Console
+/// programs such as `cmd.exe` interpret a verbatim drive path as a UNC path
+/// and silently fall back to the Windows directory. Convert the verbatim
+/// prefix back to its regular Win32 form before spawning the child.
+fn encode_work_dir(path: &Path) -> Vec<u16> {
+    use std::ffi::OsStr;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let verbatim = OsStr::new(r"\\?\").encode_wide().collect::<Vec<_>>();
+    let verbatim_unc = OsStr::new(r"\\?\UNC\").encode_wide().collect::<Vec<_>>();
+    if wide.starts_with(&verbatim_unc) {
+        wide.drain(..verbatim_unc.len());
+        wide.splice(0..0, OsStr::new(r"\\").encode_wide());
+    } else if wide.starts_with(&verbatim) {
+        wide.drain(..verbatim.len());
+    }
+    wide.push(0);
+    wide
 }
 
 fn quote_arg(arg: &str, out: &mut String) {
@@ -1412,6 +1433,51 @@ mod tests {
     fn quote_null_terminated() {
         let result = quote_args("cmd", &[]);
         assert_eq!(*result.last().unwrap(), 0u16);
+    }
+
+    #[test]
+    fn work_dir_removes_verbatim_disk_prefix() {
+        let encoded = encode_work_dir(Path::new(r"\\?\C:\work tree"));
+        let decoded = String::from_utf16(&encoded[..encoded.len() - 1]).unwrap();
+        assert_eq!(decoded, r"C:\work tree");
+    }
+
+    #[test]
+    fn work_dir_converts_verbatim_unc_prefix() {
+        let encoded = encode_work_dir(Path::new(r"\\?\UNC\server\share\work"));
+        let decoded = String::from_utf16(&encoded[..encoded.len() - 1]).unwrap();
+        assert_eq!(decoded, r"\\server\share\work");
+    }
+
+    #[test]
+    fn work_dir_preserves_regular_path_and_terminates() {
+        let encoded = encode_work_dir(Path::new(r"C:\work"));
+        let decoded = String::from_utf16(&encoded[..encoded.len() - 1]).unwrap();
+        assert_eq!(decoded, r"C:\work");
+        assert_eq!(encoded.last(), Some(&0));
+    }
+
+    #[test]
+    fn child_env_sets_local_app_data_to_sandbox_temp() {
+        let temp = Path::new(r"C:\sandbox-temp");
+        let config = Config {
+            profile: crate::Profile::default(),
+            socket_dir: PathBuf::new(),
+            task_id: "env-test".into(),
+            phase: "test".into(),
+            work_dir: None,
+            network_proxy_socket: None,
+            env: Vec::new(),
+            audit_sink: None,
+            audit_verbosity: crate::audit::AuditVerbosity::Standard,
+            audit_principal: None,
+            audit_correlation_id: None,
+        };
+        let env = build_env(&config, temp);
+        assert!(
+            env.iter()
+                .any(|(key, value)| { key == "LOCALAPPDATA" && value == &temp.to_string_lossy() })
+        );
     }
 
     #[test]
