@@ -483,16 +483,16 @@ impl Sandbox for Linux {
             // Copy parent's terminal size (fallback to 24x80).
             let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
             // SAFETY: TIOCGWINSZ on stdin.
-            if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0
+            if unsafe { libc::ioctl(0, libc::TIOCGWINSZ as libc::Ioctl, &mut ws) } == 0
                 && ws.ws_row > 0
                 && ws.ws_col > 0
             {
                 // SAFETY: TIOCSWINSZ on the PTY master.
-                unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
+                unsafe { libc::ioctl(master, libc::TIOCSWINSZ as libc::Ioctl, &ws) };
             } else {
                 ws.ws_row = 24;
                 ws.ws_col = 80;
-                unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
+                unsafe { libc::ioctl(master, libc::TIOCSWINSZ as libc::Ioctl, &ws) };
             }
 
             (Some(master), Some(slave))
@@ -899,7 +899,7 @@ impl Sandbox for Linux {
                     // SAFETY: TIOCSCTTY on the slave PTY. arg=0: do not
                     // steal from another session (the slave is always
                     // unowned after openpty + setsid).
-                    if libc::ioctl(sfd, libc::TIOCSCTTY as libc::c_ulong, 0i32) != 0 {
+                    if libc::ioctl(sfd, libc::TIOCSCTTY as libc::Ioctl, 0i32) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                     if libc::dup2(sfd, 0) == -1 {

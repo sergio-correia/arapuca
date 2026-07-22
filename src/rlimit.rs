@@ -35,16 +35,20 @@ use crate::{Error, Profile};
 /// Returns an error if any `prlimit64` call fails.
 #[must_use = "rlimit errors must be handled"]
 pub fn apply(profile: &Profile) -> crate::Result<()> {
-    set_rlimit(libc::RLIMIT_CORE, 0, "RLIMIT_CORE")?;
+    set_rlimit(libc::RLIMIT_CORE as _, 0, "RLIMIT_CORE")?;
     if profile.max_file_size_mb > 0 {
         let bytes = profile
             .max_file_size_mb
             .checked_mul(1024 * 1024)
             .ok_or_else(|| Error::Rlimit("max_file_size_mb overflow".into()))?;
-        set_rlimit(libc::RLIMIT_FSIZE, bytes, "RLIMIT_FSIZE")?;
+        set_rlimit(libc::RLIMIT_FSIZE as _, bytes, "RLIMIT_FSIZE")?;
     }
     if profile.max_open_files > 0 {
-        set_rlimit(libc::RLIMIT_NOFILE, profile.max_open_files, "RLIMIT_NOFILE")?;
+        set_rlimit(
+            libc::RLIMIT_NOFILE as _,
+            profile.max_open_files,
+            "RLIMIT_NOFILE",
+        )?;
     }
     Ok(())
 }
@@ -55,34 +59,34 @@ pub fn apply(profile: &Profile) -> crate::Result<()> {
 /// `ARAPUCA_RLIMIT_CPU`, `ARAPUCA_RLIMIT_FSIZE`, and `ARAPUCA_RLIMIT_NOFILE`
 /// from the environment.
 pub fn apply_from_env() -> crate::Result<()> {
-    set_rlimit(libc::RLIMIT_CORE, 0, "RLIMIT_CORE")?;
+    set_rlimit(libc::RLIMIT_CORE as _, 0, "RLIMIT_CORE")?;
     if let Some(v) = parse_env_u64("ARAPUCA_RLIMIT_AS")? {
-        set_rlimit(libc::RLIMIT_AS, v, "RLIMIT_AS")?;
+        set_rlimit(libc::RLIMIT_AS as _, v, "RLIMIT_AS")?;
     }
     if let Some(v) = parse_env_u64("ARAPUCA_RLIMIT_NPROC")? {
-        set_rlimit(libc::RLIMIT_NPROC, v, "RLIMIT_NPROC")?;
+        set_rlimit(libc::RLIMIT_NPROC as _, v, "RLIMIT_NPROC")?;
     }
     if let Some(v) = parse_env_u64("ARAPUCA_RLIMIT_CPU")? {
-        set_rlimit(libc::RLIMIT_CPU, v, "RLIMIT_CPU")?;
+        set_rlimit(libc::RLIMIT_CPU as _, v, "RLIMIT_CPU")?;
     }
     if let Some(v) = parse_env_u64("ARAPUCA_RLIMIT_FSIZE")? {
-        set_rlimit(libc::RLIMIT_FSIZE, v, "RLIMIT_FSIZE")?;
+        set_rlimit(libc::RLIMIT_FSIZE as _, v, "RLIMIT_FSIZE")?;
     }
     if let Some(v) = parse_env_u64("ARAPUCA_RLIMIT_NOFILE")? {
-        set_rlimit(libc::RLIMIT_NOFILE, v, "RLIMIT_NOFILE")?;
+        set_rlimit(libc::RLIMIT_NOFILE as _, v, "RLIMIT_NOFILE")?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64, name: &str) -> crate::Result<()> {
+fn set_rlimit(resource: u32, value: u64, name: &str) -> crate::Result<()> {
     let rlim = libc::rlimit64 {
         rlim_cur: value,
         rlim_max: value,
     };
     // SAFETY: prlimit64 with pid=0 targets the calling process.
     // The rlimit struct is valid and on the stack.
-    let ret = unsafe { libc::prlimit64(0, resource, &rlim, std::ptr::null_mut()) };
+    let ret = unsafe { libc::prlimit64(0, resource as _, &rlim, std::ptr::null_mut()) };
     if ret != 0 {
         return Err(Error::Rlimit(format!(
             "{name}: {}",
@@ -141,15 +145,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn apply_does_not_set_rlimit_as_or_nproc() {
-        let read_rlimit = |resource| {
+        let read_rlimit = |resource: libc::c_uint| {
             let mut rlim: libc::rlimit64 = unsafe { std::mem::zeroed() };
             // SAFETY: prlimit64 with pid=0 reads the current process limit.
-            unsafe { libc::prlimit64(0, resource, std::ptr::null(), &mut rlim) };
+            unsafe { libc::prlimit64(0, resource as _, std::ptr::null(), &mut rlim) };
             rlim.rlim_cur
         };
 
-        let as_before = read_rlimit(libc::RLIMIT_AS);
-        let nproc_before = read_rlimit(libc::RLIMIT_NPROC);
+        let as_before = read_rlimit(libc::RLIMIT_AS as _);
+        let nproc_before = read_rlimit(libc::RLIMIT_NPROC as _);
 
         let profile = Profile {
             max_memory_mb: 256,
@@ -158,8 +162,8 @@ mod tests {
         };
         apply(&profile).unwrap();
 
-        let as_after = read_rlimit(libc::RLIMIT_AS);
-        let nproc_after = read_rlimit(libc::RLIMIT_NPROC);
+        let as_after = read_rlimit(libc::RLIMIT_AS as _);
+        let nproc_after = read_rlimit(libc::RLIMIT_NPROC as _);
 
         assert_eq!(as_before, as_after, "apply() must not modify RLIMIT_AS");
         assert_eq!(
@@ -176,7 +180,7 @@ mod tests {
 
         let mut rlim: libc::rlimit64 = unsafe { std::mem::zeroed() };
         // SAFETY: prlimit64 with pid=0 reads the current process limit.
-        unsafe { libc::prlimit64(0, libc::RLIMIT_CORE, std::ptr::null(), &mut rlim) };
+        unsafe { libc::prlimit64(0, libc::RLIMIT_CORE as _, std::ptr::null(), &mut rlim) };
         assert_eq!(rlim.rlim_cur, 0, "apply() must set RLIMIT_CORE soft to 0");
         assert_eq!(rlim.rlim_max, 0, "apply() must set RLIMIT_CORE hard to 0");
     }
