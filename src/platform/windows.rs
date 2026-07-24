@@ -872,7 +872,11 @@ fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = crate::env::filter_caller_env(&cfg.env).passed;
     const OVERRIDDEN: &[&str] = &[
         "USERPROFILE",
+        "APPDATA",
         "LOCALAPPDATA",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERNAME",
         "TEMP",
         "TMP",
         "PATH",
@@ -893,12 +897,15 @@ fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
     }
 
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let profile = tmp_dir.to_string_lossy().into_owned();
+    let (home_drive, home_path) = split_windows_home(&profile);
 
-    env.push(("USERPROFILE".into(), tmp_dir.to_string_lossy().into_owned()));
-    env.push((
-        "LOCALAPPDATA".into(),
-        tmp_dir.to_string_lossy().into_owned(),
-    ));
+    env.push(("USERPROFILE".into(), profile.clone()));
+    env.push(("APPDATA".into(), profile.clone()));
+    env.push(("LOCALAPPDATA".into(), profile));
+    env.push(("HOMEDRIVE".into(), home_drive));
+    env.push(("HOMEPATH".into(), home_path));
+    env.push(("USERNAME".into(), "sandbox".into()));
     env.push(("TEMP".into(), tmp_dir.to_string_lossy().into_owned()));
     env.push(("TMP".into(), tmp_dir.to_string_lossy().into_owned()));
     env.push((
@@ -909,6 +916,25 @@ fn build_env(cfg: &Config, tmp_dir: &Path) -> Vec<(String, String)> {
     env.push(("LANG".into(), "C.UTF-8".into()));
 
     env
+}
+
+/// Split a Windows absolute path into `HOMEDRIVE` / `HOMEPATH` form.
+///
+/// Falls back to `C:` + the full path when no drive letter is present
+/// (for example a Volume GUID path used only in tests).
+fn split_windows_home(path: &str) -> (String, String) {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let drive = path[..2].to_ascii_uppercase();
+        let rest = &path[2..];
+        let home_path = if rest.is_empty() {
+            r"\".to_string()
+        } else {
+            rest.to_string()
+        };
+        return (drive, home_path);
+    }
+    ("C:".into(), path.to_string())
 }
 
 // ─── Utilities ─────────────────────────────────────────────────────
@@ -1568,6 +1594,60 @@ mod tests {
             .collect();
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].1, temp.to_string_lossy());
+    }
+
+    #[test]
+    fn caller_app_data_home_and_username_do_not_override_sandbox() {
+        let temp = Path::new(r"C:\sandbox-temp");
+        let config = Config {
+            profile: crate::Profile::default(),
+            socket_dir: PathBuf::new(),
+            task_id: "env-test".into(),
+            phase: "test".into(),
+            work_dir: None,
+            network_proxy_socket: None,
+            env: vec![
+                ("AppData".into(), r"C:\Users\host\AppData\Roaming".into()),
+                ("homedrive".into(), "D:".into()),
+                ("HomePath".into(), r"\Users\host".into()),
+                ("UserName".into(), "host-user".into()),
+            ],
+            audit_sink: None,
+            audit_verbosity: crate::audit::AuditVerbosity::Standard,
+            audit_principal: None,
+            audit_correlation_id: None,
+        };
+
+        let env = build_env(&config, temp);
+        let only = |name: &str| -> Vec<_> {
+            env.iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                .cloned()
+                .collect()
+        };
+
+        assert_eq!(
+            only("APPDATA"),
+            vec![("APPDATA".into(), temp.to_string_lossy().into_owned())]
+        );
+        assert_eq!(only("HOMEDRIVE"), vec![("HOMEDRIVE".into(), "C:".into())]);
+        assert_eq!(
+            only("HOMEPATH"),
+            vec![("HOMEPATH".into(), r"\sandbox-temp".into())]
+        );
+        assert_eq!(
+            only("USERNAME"),
+            vec![("USERNAME".into(), "sandbox".into())]
+        );
+    }
+
+    #[test]
+    fn split_windows_home_uses_drive_and_path() {
+        assert_eq!(
+            split_windows_home(r"C:\sandbox-temp"),
+            ("C:".into(), r"\sandbox-temp".into())
+        );
+        assert_eq!(split_windows_home(r"d:"), ("D:".into(), r"\".into()));
     }
 
     #[test]
