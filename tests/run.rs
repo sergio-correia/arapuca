@@ -916,18 +916,32 @@ fn cwd_file_not_directory_rejected() {
 }
 
 #[test]
-fn cwd_with_default_paths() {
+fn cwd_tmp_rejected_without_explicit_grant() {
+    // /tmp is intentionally NOT a default read path (host-shared temp
+    // dirs must not be visible unless explicitly granted via -v).
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--cwd", "/tmp", "--", "/bin/pwd"])
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "--cwd /tmp should be rejected without an explicit -v grant"
+    );
+}
+
+#[test]
+fn cwd_tmp_with_explicit_grant() {
     let expected = std::path::PathBuf::from("/tmp").canonicalize().unwrap();
     let expected_str = expected.to_str().unwrap();
 
     let output = Command::new(arapuca_bin())
-        .args(["run", "--cwd", "/tmp", "--", "/bin/pwd"])
+        .args(["run", "--cwd", "/tmp", "-v", "/tmp", "--", "/bin/pwd"])
         .output()
         .unwrap();
 
     assert!(
         output.status.success(),
-        "--cwd /tmp should work via default read paths"
+        "--cwd /tmp should work once /tmp is explicitly granted via -v"
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),

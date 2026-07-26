@@ -525,9 +525,10 @@ pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
         PathBuf::from("/dev/zero"),
         PathBuf::from("/dev/urandom"),
         PathBuf::from("/dev/random"),
-        // Temp directory (read-only — the private per-task temp dir
-        // is added as a write path by the launcher).
-        PathBuf::from("/tmp"),
+        // NOTE: /tmp is intentionally NOT granted by default — it is
+        // host-shared and would leak any secret placed there by other
+        // processes/users. Callers must opt in explicitly via
+        // `-v /tmp/some-subdir` (or similar) if they need it visible.
     ];
     let write = Vec::new();
     (read, write)
@@ -1076,8 +1077,16 @@ mod tests {
         assert!(read.iter().any(|p| p == Path::new("/usr")));
         assert!(read.iter().any(|p| p == Path::new("/bin")));
         assert!(read.iter().any(|p| p == Path::new("/dev/null")));
-        assert!(read.iter().any(|p| p == Path::new("/tmp")));
         assert!(write.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_sandbox_paths_linux_excludes_tmp() {
+        // /tmp is host-shared; it must not be granted by default or a
+        // sandboxed process can read secrets left there by others.
+        let (read, _write) = default_sandbox_paths();
+        assert!(!read.iter().any(|p| p == Path::new("/tmp")));
     }
 
     #[cfg(target_os = "linux")]
