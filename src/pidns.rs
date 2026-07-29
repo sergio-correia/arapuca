@@ -40,7 +40,7 @@ pub fn fork_into_pidns(
     dns_audit_fd: Option<i32>,
     unotify_audit_fd: Option<i32>,
     pid_report_fd: Option<i32>,
-) -> Option<i32> {
+) -> (Option<i32>, i32) {
     // Liveness pipe: parent holds write end, child reads it after
     // prctl(PR_SET_PDEATHSIG) to detect if the parent already died.
     // O_NONBLOCK so check_parent_liveness can read without fcntl.
@@ -48,6 +48,19 @@ pub fn fork_into_pidns(
     if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
         write_stderr(&format!(
             "arapuca: pidns liveness pipe: {}\n",
+            std::io::Error::last_os_error()
+        ));
+        unsafe { libc::_exit(1) };
+    }
+
+    // Host-PID pipe: parent writes the child's host PID so the child
+    // can discover it without reading /proc/self/stat (which Landlock
+    // may block in strict mode). Blocking (no O_NONBLOCK) — the child
+    // reads exactly 4 bytes before continuing.
+    let mut pid_pipe = [0i32; 2];
+    if unsafe { libc::pipe2(pid_pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        write_stderr(&format!(
+            "arapuca: pidns host-pid pipe: {}\n",
             std::io::Error::last_os_error()
         ));
         unsafe { libc::_exit(1) };
@@ -73,7 +86,21 @@ pub fn fork_into_pidns(
         // Close the liveness pipe write end — only the parent should
         // hold it. Without this, EOF never fires on the read end.
         unsafe { libc::close(pipe_fds[1]) };
-        return Some(pipe_fds[0]);
+
+        // Read host PID from parent relay. The child's getpid()
+        // returns 1 (namespace-local), but the unotify supervisor
+        // needs the host PID for pidfd_open().
+        unsafe { libc::close(pid_pipe[1]) };
+        let mut pid_buf = [0u8; 4];
+        let n = unsafe { libc::read(pid_pipe[0], pid_buf.as_mut_ptr().cast(), 4) };
+        unsafe { libc::close(pid_pipe[0]) };
+        let host_pid = if n == 4 {
+            i32::from_ne_bytes(pid_buf)
+        } else {
+            unsafe { libc::getpid() }
+        };
+
+        return (Some(pipe_fds[0]), host_pid);
     }
 
     // ── Parent: signal relay + waitpid ────────────────────────────
@@ -81,6 +108,18 @@ pub fn fork_into_pidns(
     unsafe { libc::close(pipe_fds[0]) };
     // Write end (pipe_fds[1]) is intentionally leaked — it closes
     // on _exit, causing EOF on the child's read end.
+
+    // Send host PID to child before entering the relay loop.
+    unsafe { libc::close(pid_pipe[0]) };
+    let pid_bytes = child_pid.to_ne_bytes();
+    let _ = unsafe {
+        libc::write(
+            pid_pipe[1],
+            pid_bytes.as_ptr().cast::<libc::c_void>(),
+            pid_bytes.len(),
+        )
+    };
+    unsafe { libc::close(pid_pipe[1]) };
 
     // This path never returns.
     parent_relay(

@@ -1030,8 +1030,9 @@ pub struct UnotifyFds {
 ///
 /// The supervisor is forked BEFORE any seccomp filters are installed
 /// to avoid inheriting the USER_NOTIF filter (which would deadlock
-/// on the supervisor's own openat calls). The listener FD is passed
-/// to the supervisor via SCM_RIGHTS after filter installation.
+/// on the supervisor's own openat calls). The listener FD number is
+/// sent to the supervisor via write() on a socketpair; the supervisor
+/// duplicates it via pidfd_getfd().
 ///
 /// Uses a **deferred readiness protocol**: the readiness pipe is
 /// returned to the caller, not polled internally. The caller must:
@@ -1050,7 +1051,7 @@ pub fn fork_unotify_supervisor(
     audit_write_fd: RawFd,
     seccomp_debug: bool,
 ) -> crate::Result<UnotifyFds> {
-    // Create Unix socketpair for SCM_RIGHTS FD passing.
+    // Create Unix socketpair for PID + FD number passing.
     let mut sv = [0i32; 2];
     if unsafe {
         libc::socketpair(
