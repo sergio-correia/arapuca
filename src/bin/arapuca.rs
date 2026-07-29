@@ -339,6 +339,8 @@ fn main() {
         // PID namespace: unshare + fork between bridge and seccomp.
         // The parent (in host PID ns) stays as a signal relay; the
         // child (PID 1 in new ns) continues to seccomp + exec.
+        #[cfg(seccomp_supported)]
+        let mut pidns_host_pid: Option<i32> = None;
         if std::env::var("ARAPUCA_PID_NS").as_deref() == Ok("1") {
             let pid_report_fd: Option<i32> = std::env::var("ARAPUCA_PID_REPORT_FD")
                 .ok()
@@ -360,12 +362,16 @@ fn main() {
             audit_layer(audit_fd, "PidNamespace", true, None);
 
             // Parent never returns; child continues to seccomp.
-            let liveness_fd = arapuca::pidns::fork_into_pidns(
+            let (liveness_fd, _host_pid) = arapuca::pidns::fork_into_pidns(
                 audit_fd,
                 dns_audit_fd,
                 unotify_audit_fd,
                 pid_report_fd,
             );
+            #[cfg(seccomp_supported)]
+            {
+                pidns_host_pid = Some(_host_pid);
+            }
 
             // Child: re-set pdeathsig (fork clears it). The
             // getppid() race check is skipped inside the PID
@@ -416,15 +422,18 @@ fn main() {
                         config.audit_file_access,
                         config.audit_network,
                     );
+                    // The host PID is needed by the supervisor for
+                    // pidfd_open(). In a PID namespace, getpid() returns
+                    // the namespace-local PID (1), so we use the host PID
+                    // piped from fork_into_pidns(). Outside a PID namespace,
+                    // read_host_pid() reads /proc/self/stat — must happen
+                    // BEFORE install_unotify_filter() because the filter
+                    // intercepts openat and would deadlock.
+                    let host_pid = pidns_host_pid.unwrap_or_else(arapuca::unotify::read_host_pid);
                     match arapuca::unotify::build_unotify_bpf(&syscalls)
                         .and_then(|bpf| arapuca::unotify::install_unotify_filter(&bpf))
                     {
                         Ok(listener_fd) => {
-                            // Send the FD number via write() instead of
-                            // Send host PID + listener FD number via
-                            // write() — sendmsg is intercepted by the
-                            // USER_NOTIF filter we just installed.
-                            let host_pid = arapuca::unotify::read_host_pid();
                             let mut msg = [0u8; 8];
                             msg[..4].copy_from_slice(&host_pid.to_ne_bytes());
                             msg[4..].copy_from_slice(&listener_fd.to_ne_bytes());

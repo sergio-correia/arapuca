@@ -219,8 +219,9 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
                             audit_layer(audit_fd, "UnotifySupervisor", true, None);
                             Some(fds)
                         }
-                        Err(_) => {
-                            audit_layer(audit_fd, "UnotifySupervisor", false, None);
+                        Err(e) => {
+                            audit_layer(audit_fd, "UnotifySupervisor", false, Some(&e.to_string()));
+                            write_stderr(&format!("arapuca: selfexec: unotify supervisor: {e}\n"));
                             None
                         }
                     }
@@ -316,6 +317,8 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
     }
 
     // ── PID namespace ────────────────────────────────────────────
+    #[cfg(seccomp_supported)]
+    let mut pidns_host_pid: Option<i32> = None;
     if std::env::var("ARAPUCA_PID_NS").as_deref() == Ok("1") {
         let pid_report_fd: Option<i32> = std::env::var("ARAPUCA_PID_REPORT_FD")
             .ok()
@@ -336,8 +339,12 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         }
         audit_layer(audit_fd, "PidNamespace", true, None);
 
-        let liveness_fd =
+        let (liveness_fd, _host_pid) =
             crate::pidns::fork_into_pidns(audit_fd, dns_audit_fd, unotify_audit_fd, pid_report_fd);
+        #[cfg(seccomp_supported)]
+        {
+            pidns_host_pid = Some(_host_pid);
+        }
 
         let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
         if ret != 0 {
@@ -379,9 +386,18 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
             if let Some(ref config) = unotify_config {
                 let syscalls =
                     crate::unotify::target_syscalls(config.audit_file_access, config.audit_network);
-                if let Ok(bpf) = crate::unotify::build_unotify_bpf(&syscalls) {
-                    if let Ok(listener_fd) = crate::unotify::install_unotify_filter(&bpf) {
-                        let host_pid = crate::unotify::read_host_pid();
+                // The host PID is needed by the supervisor for
+                // pidfd_open(). In a PID namespace, getpid() returns
+                // the namespace-local PID (1), so we use the host PID
+                // piped from fork_into_pidns(). Outside a PID namespace,
+                // read_host_pid() reads /proc/self/stat — must happen
+                // BEFORE install_unotify_filter() because the filter
+                // intercepts openat and would deadlock.
+                let host_pid = pidns_host_pid.unwrap_or_else(crate::unotify::read_host_pid);
+                match crate::unotify::build_unotify_bpf(&syscalls)
+                    .and_then(|bpf| crate::unotify::install_unotify_filter(&bpf))
+                {
+                    Ok(listener_fd) => {
                         let mut msg = [0u8; 8];
                         msg[..4].copy_from_slice(&host_pid.to_ne_bytes());
                         msg[4..].copy_from_slice(&listener_fd.to_ne_bytes());
@@ -395,16 +411,17 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
                         unsafe {
                             libc::close(fds.socketpair_parent);
                         }
-                    } else {
+                    }
+                    Err(e) => {
+                        write_stderr(&format!("arapuca: selfexec: unotify filter: {e}\n"));
                         unsafe { libc::close(fds.socketpair_parent) };
                     }
-                } else {
-                    unsafe { libc::close(fds.socketpair_parent) };
                 }
             } else {
                 unsafe { libc::close(fds.socketpair_parent) };
             }
         } else {
+            write_stderr("arapuca: selfexec: unotify supervisor readiness timeout\n");
             unsafe {
                 libc::close(fds.readiness_read);
                 libc::close(fds.socketpair_parent);
