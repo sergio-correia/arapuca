@@ -200,6 +200,25 @@ void arapuca_profile_set_max_file_size_mb(struct arapuca_ArapucaProfile *profile
 void arapuca_profile_set_max_open_files(struct arapuca_ArapucaProfile *profile, uint64_t n);
 
 /**
+ * Enable/disable exec permission for sandboxed processes.
+ *
+ * When enabled, read paths gain the Landlock Execute access right,
+ * allowing execve on any binary reachable through them. Write paths
+ * also gain Execute (they receive full access). When disabled (the
+ * default), only the target binary and the ELF interpreter are
+ * executable.
+ *
+ * Scripts that use a shebang (e.g. #!/usr/bin/env python3) require
+ * allow_exec = true because the kernel's script interpreter
+ * resolution needs Execute on the interpreter binary, not just the
+ * script itself.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_allow_exec(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
  * Enable/disable network namespace isolation.
  *
  * # Safety

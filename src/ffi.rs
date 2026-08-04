@@ -221,6 +221,33 @@ pub unsafe extern "C" fn arapuca_profile_set_max_open_files(profile: *mut Arapuc
     }
 }
 
+/// Enable/disable exec permission for sandboxed processes.
+///
+/// When enabled, read paths gain the Landlock `Execute` access right,
+/// allowing `execve` on any binary reachable through them. Write
+/// paths also gain Execute (they receive full access). When disabled
+/// (the default), only the target binary and the ELF interpreter are
+/// executable.
+///
+/// Scripts that use a shebang (e.g. `#!/usr/bin/env python3`) require
+/// `allow_exec = true` because the kernel's script interpreter
+/// resolution needs Execute on the interpreter binary, not just the
+/// script itself.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_allow_exec(
+    profile: *mut ArapucaProfile,
+    enabled: bool,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.allow_exec = enabled;
+        }
+    }
+}
+
 /// Enable/disable network namespace isolation.
 ///
 /// # Safety
