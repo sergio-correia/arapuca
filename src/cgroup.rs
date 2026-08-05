@@ -26,8 +26,23 @@ const CPU_PERIOD: i64 = 100_000; // microseconds
 /// Result of creating a cgroup directory.
 #[derive(Debug)]
 pub struct CgroupCreateResult {
-    pub path: PathBuf,
+    /// Cgroup directory path. `None` if no controllers were applied.
+    pub path: Option<PathBuf>,
     pub swap_disabled: bool,
+    pub memory_applied: bool,
+    pub pids_applied: bool,
+    pub cpu_applied: bool,
+    /// Controller names that were requested but not delegated.
+    pub degraded: Vec<String>,
+}
+
+/// Internal status from write_controller_files.
+struct ControllerWriteStatus {
+    swap_disabled: bool,
+    memory_applied: bool,
+    pids_applied: bool,
+    cpu_applied: bool,
+    degraded: Vec<String>,
 }
 
 /// Resource limits for a cgroup.
@@ -133,8 +148,9 @@ impl CgroupManager {
 
     /// Create a cgroup for the given task with the specified limits.
     ///
-    /// Returns the cgroup directory path and whether swap was disabled.
-    /// On failure, any partially created directory is cleaned up.
+    /// Returns per-controller status indicating which limits were
+    /// applied and which controllers were unavailable. On hard I/O
+    /// failure, the directory is cleaned up.
     pub fn create(
         &self,
         task_id: &str,
@@ -149,10 +165,24 @@ impl CgroupManager {
             .map_err(|e| Error::Cgroup(format!("mkdir {}: {e}", cg_path.display())))?;
 
         match self.write_controller_files(&cg_path, limits) {
-            Ok(swap_disabled) => Ok(CgroupCreateResult {
-                path: cg_path,
-                swap_disabled,
-            }),
+            Ok(status) => {
+                let any_applied =
+                    status.memory_applied || status.pids_applied || status.cpu_applied;
+                let path = if any_applied {
+                    Some(cg_path)
+                } else {
+                    let _ = fs::remove_dir(&cg_path);
+                    None
+                };
+                Ok(CgroupCreateResult {
+                    path,
+                    swap_disabled: status.swap_disabled,
+                    memory_applied: status.memory_applied,
+                    pids_applied: status.pids_applied,
+                    cpu_applied: status.cpu_applied,
+                    degraded: status.degraded,
+                })
+            }
             Err(e) => {
                 let _ = fs::remove_dir(&cg_path);
                 Err(e)
@@ -258,10 +288,24 @@ impl CgroupManager {
         usage
     }
 
-    /// Returns `Ok(true)` if all writes succeeded (swap disabled),
-    /// `Ok(false)` if swap.max write failed (memory limits still applied).
-    fn write_controller_files(&self, cg_path: &Path, limits: &CgroupLimits) -> crate::Result<bool> {
-        let mut swap_disabled = true;
+    /// Attempt to write each requested controller's limits.
+    ///
+    /// Continues past missing controllers (recording them in `degraded`)
+    /// so that available controllers are still applied. Hard I/O errors
+    /// (writing to a controller that IS available fails) still propagate.
+    fn write_controller_files(
+        &self,
+        cg_path: &Path,
+        limits: &CgroupLimits,
+    ) -> crate::Result<ControllerWriteStatus> {
+        let mut status = ControllerWriteStatus {
+            swap_disabled: true,
+            memory_applied: false,
+            pids_applied: false,
+            cpu_applied: false,
+            degraded: Vec::new(),
+        };
+
         if limits.memory_max_mb > 0 {
             if self.has_controller("memory") {
                 let mem_max = limits
@@ -273,12 +317,11 @@ impl CgroupManager {
                 write_cgroup_file(cg_path, "memory.high", &mem_high.to_string())?;
                 if let Err(e) = write_cgroup_file(cg_path, "memory.swap.max", "0") {
                     log::warn!("cgroup: memory.swap.max: {e} (continuing)");
-                    swap_disabled = false;
+                    status.swap_disabled = false;
                 }
+                status.memory_applied = true;
             } else {
-                return Err(Error::CgroupDegraded(
-                    "memory controller not delegated".into(),
-                ));
+                status.degraded.push("memory".into());
             }
         }
 
@@ -286,10 +329,9 @@ impl CgroupManager {
             if self.has_controller("pids") {
                 let effective_pids = limits.pids_max.saturating_add(limits.pids_overhead);
                 write_cgroup_file(cg_path, "pids.max", &effective_pids.to_string())?;
+                status.pids_applied = true;
             } else {
-                return Err(Error::CgroupDegraded(
-                    "pids controller not delegated".into(),
-                ));
+                status.degraded.push("pids".into());
             }
         }
 
@@ -298,12 +340,13 @@ impl CgroupManager {
                 let quota = i64::from(limits.cpu_max_pct) * CPU_PERIOD / 100;
                 let val = format!("{quota} {CPU_PERIOD}");
                 write_cgroup_file(cg_path, "cpu.max", &val)?;
+                status.cpu_applied = true;
             } else {
-                return Err(Error::CgroupDegraded("cpu controller not delegated".into()));
+                status.degraded.push("cpu".into());
             }
         }
 
-        Ok(swap_disabled)
+        Ok(status)
     }
 
     /// Clean up leftover cgroup directories from previous sessions.

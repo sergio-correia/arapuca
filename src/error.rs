@@ -21,11 +21,6 @@ pub enum Error {
     #[error("cgroup: {0}")]
     Cgroup(String),
 
-    /// Cgroup controller not delegated (soft failure — caller decides
-    /// degradation policy).
-    #[error("cgroup controller not delegated: {0}")]
-    CgroupDegraded(String),
-
     /// Micro-VM operation failed.
     #[error("microvm: {0}")]
     MicroVm(String),

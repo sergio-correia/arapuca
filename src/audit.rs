@@ -109,6 +109,7 @@ pub enum AuditEvent {
         memory_mb: u64,
         cpu_pct: u32,
         max_pids: u32,
+        cpu_timeout_secs: u64,
         max_file_size_mb: u64,
         max_open_files: u64,
         allow_exec: bool,
@@ -305,6 +306,7 @@ pub enum LayerDetail {
     Cgroup {
         path: String,
         swap_disabled: bool,
+        degraded: Vec<String>,
     },
     ProxyBridge {
         port: u16,
