@@ -49,7 +49,7 @@ pub use process::Process;
 pub use audit::sanitize_audit_string;
 pub use error::Error;
 pub use profile::{
-    Config, GuestFile, ImageSource, Isolation, MicroVmConfig, Profile, ResourceUsage,
+    CgroupPolicy, Config, GuestFile, ImageSource, Isolation, MicroVmConfig, Profile, ResourceUsage,
     SeccompProfile,
 };
 #[cfg(unix)]

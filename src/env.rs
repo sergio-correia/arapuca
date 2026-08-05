@@ -356,6 +356,12 @@ pub fn wrapper_env(profile: &crate::Profile) -> crate::Result<Vec<(String, Strin
             profile.max_open_files.to_string(),
         ));
     }
+    if profile.cpu_timeout_secs > 0 {
+        env.push((
+            "ARAPUCA_RLIMIT_CPU".into(),
+            profile.cpu_timeout_secs.to_string(),
+        ));
+    }
     // Always emit — never rely on absence encoding a default.
     // Linux::launch() calls env_clear() so ambient vars don't leak,
     // but defense-in-depth: explicit is better than implicit.

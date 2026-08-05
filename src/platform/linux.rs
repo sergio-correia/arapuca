@@ -25,7 +25,13 @@ use crate::audit::{
 };
 use crate::cgroup::{CgroupLimits, CgroupManager};
 use crate::platform::Sandbox;
-use crate::{Config, Error, process::Process};
+use crate::{CgroupPolicy, Config, Error, process::Process};
+
+const CGROUP_DELEGATE_HINT: &str = "\
+sudo mkdir -p /etc/systemd/system/user@.service.d && \
+sudo sh -c 'printf \"[Service]\\nDelegate=cpu cpuset memory pids\\n\" \
+> /etc/systemd/system/user@.service.d/delegate.conf' && \
+sudo systemctl daemon-reload";
 
 /// Linux sandbox implementation.
 pub struct Linux {
@@ -710,49 +716,91 @@ impl Sandbox for Linux {
             if limits.has_limits() {
                 match mgr.create(&cfg.task_id, &limits) {
                     Ok(result) => {
-                        if !result.swap_disabled {
-                            log::warn!("cgroup: memory.swap.max could not be set");
+                        if !result.degraded.is_empty() {
+                            match cfg.profile.cgroup_policy {
+                                CgroupPolicy::Required => {
+                                    if let Some(ref p) = result.path {
+                                        let _ = mgr.destroy(p);
+                                    }
+                                    return Err(Error::Cgroup(format!(
+                                        "resource limits requested but controllers \
+                                         not delegated: {} — fix with: {CGROUP_DELEGATE_HINT}",
+                                        result.degraded.join(", ")
+                                    )));
+                                }
+                                CgroupPolicy::BestEffort => {
+                                    let msg = if result.path.is_some() {
+                                        "enforcement is partial"
+                                    } else {
+                                        "no controllers available — enforcement is not active"
+                                    };
+                                    log::warn!(
+                                        "cgroup: controllers not delegated: {} — {msg}",
+                                        result.degraded.join(", ")
+                                    );
+                                }
+                            }
                         }
-                        if let Some(ref ctx) = audit_ctx {
-                            ctx.emit(AuditEvent::LayerApplied {
-                                timestamp: ctx.timestamp(),
-                                layer: SandboxLayer::Cgroup,
-                                detail: Some(LayerDetail::Cgroup {
-                                    path: sanitize_audit_string(&result.path.to_string_lossy()),
-                                    swap_disabled: result.swap_disabled,
-                                }),
-                            })?;
+                        if let Some(p) = result.path {
+                            if !result.swap_disabled {
+                                log::warn!("cgroup: memory.swap.max could not be set");
+                            }
+                            if let Some(ref ctx) = audit_ctx {
+                                ctx.emit(AuditEvent::LayerApplied {
+                                    timestamp: ctx.timestamp(),
+                                    layer: SandboxLayer::Cgroup,
+                                    detail: Some(LayerDetail::Cgroup {
+                                        path: sanitize_audit_string(&p.to_string_lossy()),
+                                        swap_disabled: result.swap_disabled,
+                                        degraded: result.degraded.clone(),
+                                    }),
+                                })?;
+                            }
+                            applied_layers.push(SandboxLayer::Cgroup);
+                            cgroup_path = Some(p);
+                        } else {
+                            if let Some(ref ctx) = audit_ctx {
+                                ctx.emit(AuditEvent::LayerSkipped {
+                                    timestamp: ctx.timestamp(),
+                                    layer: SandboxLayer::Cgroup,
+                                    reason: SkipReason::NotAvailable,
+                                })?;
+                            }
+                            skipped_layers.push(SandboxLayer::Cgroup);
                         }
-                        applied_layers.push(SandboxLayer::Cgroup);
-                        cgroup_path = Some(result.path);
                     }
                     Err(e) => {
-                        if limits.has_limits() {
-                            return Err(Error::Cgroup(format!(
-                                "resource limits requested but cgroup creation failed: {e}"
-                            )));
-                        }
-                        log::warn!(
-                            "cgroup creation failed: {e} (no limits configured, continuing)"
-                        );
-                        if let Some(ref ctx) = audit_ctx {
-                            ctx.emit(AuditEvent::LayerSkipped {
-                                timestamp: ctx.timestamp(),
-                                layer: SandboxLayer::Cgroup,
-                                reason: SkipReason::PartialFailure(sanitize_audit_string(
-                                    &format!("{e}"),
-                                )),
-                            })?;
-                        }
-                        skipped_layers.push(SandboxLayer::Cgroup);
+                        return Err(Error::Cgroup(format!("cgroup creation failed: {e}")));
                     }
                 }
             }
         } else if limits.has_limits() {
-            return Err(Error::Cgroup(format!(
-                "resource limits requested (memory={}MB, pids={}) but cgroups unavailable",
-                cfg.profile.max_memory_mb, cfg.profile.max_pids
-            )));
+            match cfg.profile.cgroup_policy {
+                CgroupPolicy::Required => {
+                    return Err(Error::Cgroup(format!(
+                        "resource limits requested (memory={}MB, cpu={}%, pids={}) \
+                         but cgroups unavailable — fix with: {CGROUP_DELEGATE_HINT}",
+                        cfg.profile.max_memory_mb, cfg.profile.max_cpu_pct, cfg.profile.max_pids
+                    )));
+                }
+                CgroupPolicy::BestEffort => {
+                    log::warn!(
+                        "cgroup: resource limits requested (memory={}MB, cpu={}%, pids={}) \
+                         but cgroups unavailable — limits will not be enforced",
+                        cfg.profile.max_memory_mb,
+                        cfg.profile.max_cpu_pct,
+                        cfg.profile.max_pids
+                    );
+                    if let Some(ref ctx) = audit_ctx {
+                        ctx.emit(AuditEvent::LayerSkipped {
+                            timestamp: ctx.timestamp(),
+                            layer: SandboxLayer::Cgroup,
+                            reason: SkipReason::NotAvailable,
+                        })?;
+                    }
+                    skipped_layers.push(SandboxLayer::Cgroup);
+                }
+            }
         }
 
         // ── Cgroup sync pipe ──────────────────────────────────────
@@ -943,6 +991,7 @@ impl Sandbox for Linux {
                 memory_mb: cfg.profile.max_memory_mb,
                 cpu_pct: cfg.profile.max_cpu_pct,
                 max_pids: cfg.profile.max_pids,
+                cpu_timeout_secs: cfg.profile.cpu_timeout_secs,
                 max_file_size_mb: cfg.profile.max_file_size_mb,
                 max_open_files: cfg.profile.max_open_files,
                 allow_exec: cfg.profile.allow_exec,

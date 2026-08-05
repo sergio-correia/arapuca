@@ -248,6 +248,50 @@ pub unsafe extern "C" fn arapuca_profile_set_allow_exec(
     }
 }
 
+/// Set cgroup enforcement policy.
+///
+/// When `best_effort` is true, the sandbox uses whatever cgroup
+/// controllers are delegated and skips the rest with a warning.
+/// When false (default), missing cgroup controllers cause a hard failure.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_cgroup_best_effort(
+    profile: *mut ArapucaProfile,
+    best_effort: bool,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.cgroup_policy = if best_effort {
+                crate::CgroupPolicy::BestEffort
+            } else {
+                crate::CgroupPolicy::Required
+            };
+        }
+    }
+}
+
+/// Set a hard CPU-time cap in seconds via RLIMIT_CPU.
+///
+/// Kills the process with SIGXCPU after `seconds` of cumulative CPU
+/// time. Independent of `max_cpu_pct` (proportional scheduling).
+/// Set to 0 to disable (default).
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_cpu_timeout(
+    profile: *mut ArapucaProfile,
+    seconds: u64,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.cpu_timeout_secs = seconds;
+        }
+    }
+}
+
 /// Enable/disable network namespace isolation.
 ///
 /// # Safety

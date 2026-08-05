@@ -202,14 +202,14 @@ void arapuca_profile_set_max_open_files(struct arapuca_ArapucaProfile *profile, 
 /**
  * Enable/disable exec permission for sandboxed processes.
  *
- * When enabled, read paths gain the Landlock Execute access right,
- * allowing execve on any binary reachable through them. Write paths
- * also gain Execute (they receive full access). When disabled (the
- * default), only the target binary and the ELF interpreter are
+ * When enabled, read paths gain the Landlock `Execute` access right,
+ * allowing `execve` on any binary reachable through them. Write
+ * paths also gain Execute (they receive full access). When disabled
+ * (the default), only the target binary and the ELF interpreter are
  * executable.
  *
- * Scripts that use a shebang (e.g. #!/usr/bin/env python3) require
- * allow_exec = true because the kernel's script interpreter
+ * Scripts that use a shebang (e.g. `#!/usr/bin/env python3`) require
+ * `allow_exec = true` because the kernel's script interpreter
  * resolution needs Execute on the interpreter binary, not just the
  * script itself.
  *
@@ -217,6 +217,31 @@ void arapuca_profile_set_max_open_files(struct arapuca_ArapucaProfile *profile, 
  * `profile` must be a valid pointer.
  */
 void arapuca_profile_set_allow_exec(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
+ * Set cgroup enforcement policy.
+ *
+ * When `best_effort` is true, the sandbox uses whatever cgroup
+ * controllers are delegated and skips the rest with a warning.
+ * When false (default), missing cgroup controllers cause a hard failure.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_cgroup_best_effort(struct arapuca_ArapucaProfile *profile,
+                                            bool best_effort);
+
+/**
+ * Set a hard CPU-time cap in seconds via RLIMIT_CPU.
+ *
+ * Kills the process with SIGXCPU after `seconds` of cumulative CPU
+ * time. Independent of `max_cpu_pct` (proportional scheduling).
+ * Set to 0 to disable (default).
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_cpu_timeout(struct arapuca_ArapucaProfile *profile, uint64_t seconds);
 
 /**
  * Enable/disable network namespace isolation.
