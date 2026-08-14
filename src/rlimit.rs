@@ -16,6 +16,8 @@
 
 use crate::{Error, Profile};
 
+const MAX_CPU_TIMEOUT_SECS: u64 = 30 * 24 * 3600;
+
 /// Apply resource limits from the profile to the current process.
 ///
 /// Sets RLIMIT_CORE=0 unconditionally (prevents core dumps from
@@ -36,6 +38,19 @@ use crate::{Error, Profile};
 #[must_use = "rlimit errors must be handled"]
 pub fn apply(profile: &Profile) -> crate::Result<()> {
     set_rlimit(libc::RLIMIT_CORE as _, 0, "RLIMIT_CORE")?;
+    if profile.cpu_timeout_secs > 0 {
+        if profile.cpu_timeout_secs > MAX_CPU_TIMEOUT_SECS {
+            return Err(Error::Rlimit(format!(
+                "cpu_timeout_secs {} exceeds maximum ({MAX_CPU_TIMEOUT_SECS})",
+                profile.cpu_timeout_secs
+            )));
+        }
+        set_rlimit(
+            libc::RLIMIT_CPU as _,
+            profile.cpu_timeout_secs,
+            "RLIMIT_CPU",
+        )?;
+    }
     if profile.max_file_size_mb > 0 {
         let bytes = profile
             .max_file_size_mb
@@ -67,6 +82,11 @@ pub fn apply_from_env() -> crate::Result<()> {
         set_rlimit(libc::RLIMIT_NPROC as _, v, "RLIMIT_NPROC")?;
     }
     if let Some(v) = parse_env_u64("ARAPUCA_RLIMIT_CPU")? {
+        if v > MAX_CPU_TIMEOUT_SECS {
+            return Err(Error::Rlimit(format!(
+                "ARAPUCA_RLIMIT_CPU {v} exceeds maximum ({MAX_CPU_TIMEOUT_SECS})"
+            )));
+        }
         set_rlimit(libc::RLIMIT_CPU as _, v, "RLIMIT_CPU")?;
     }
     if let Some(v) = parse_env_u64("ARAPUCA_RLIMIT_FSIZE")? {
@@ -135,6 +155,16 @@ mod tests {
     fn zero_limits_are_skipped() {
         let profile = Profile::default();
         assert!(apply(&profile).is_ok());
+    }
+
+    #[test]
+    fn cpu_timeout_above_max_rejected() {
+        let profile = Profile {
+            cpu_timeout_secs: MAX_CPU_TIMEOUT_SECS + 1,
+            ..Default::default()
+        };
+        let err = apply(&profile).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
     }
 
     #[test]

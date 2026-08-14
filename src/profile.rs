@@ -93,6 +93,21 @@ impl SeccompProfile {
     }
 }
 
+/// Policy for cgroup resource limits when controllers aren't delegated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CgroupPolicy {
+    /// Hard-fail if cgroups are unavailable and resource limits are
+    /// requested. The sandbox refuses to launch.
+    #[default]
+    Required,
+    /// Log a warning and continue with whatever cgroup controllers
+    /// are delegated. Controllers that are unavailable are skipped.
+    /// Landlock, seccomp, and namespace isolation still apply.
+    /// Memory and PID limits require their respective cgroup
+    /// controllers and cannot be enforced without them.
+    BestEffort,
+}
+
 /// Filesystem and resource restrictions for a sandboxed process.
 #[derive(Debug, Clone, Default)]
 pub struct Profile {
@@ -111,6 +126,13 @@ pub struct Profile {
     /// Maximum number of processes (0 = no limit). Enforced via
     /// cgroups v2 `pids.max` on Linux.
     pub max_pids: u32,
+    /// Cgroup enforcement policy. Defaults to Required.
+    pub cgroup_policy: CgroupPolicy,
+    /// Hard CPU-time cap in seconds via RLIMIT_CPU (0 = no limit).
+    /// Kills the process with SIGXCPU after this many seconds of
+    /// cumulative CPU time (user + system). Independent of
+    /// `max_cpu_pct` (proportional scheduling via cgroup `cpu.max`).
+    pub cpu_timeout_secs: u64,
     /// Maximum file size in MB via RLIMIT_FSIZE (0 = no limit).
     pub max_file_size_mb: u64,
     /// Maximum open file descriptors via RLIMIT_NOFILE (0 = no limit).
