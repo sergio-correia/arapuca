@@ -59,6 +59,15 @@ const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000D;
 const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
 const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY: usize = 0x0002_0007;
 const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = 0x0002_0009;
+const PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY: usize = 0x0002_000F;
+
+// PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: opt the child out
+// of the implicit "ALL APPLICATION PACKAGES" SID so it runs as a Less
+// Privileged AppContainer (LPAC). Without this, every AppContainer
+// process retains broad read/execute access to System32, Program
+// Files, and other locations the "ALL APPLICATION PACKAGES" group is
+// granted, defeating much of the intended confinement.
+const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 0x1;
 
 // QWORD 1 of PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY.
 // ACG (1 << 36, prohibit dynamic code) is deliberately omitted: it
@@ -109,8 +118,13 @@ impl Sandbox for Windows {
             .collect();
         let inherit_handles = if handle_list.is_empty() { 0 } else { TRUE };
 
-        let use_appcontainer =
-            !cfg.profile.read_paths.is_empty() || !cfg.profile.write_paths.is_empty();
+        // Always engage AppContainer confinement, even with zero
+        // explicitly granted paths. AppContainer denies filesystem
+        // access by default; gating it on a non-empty grant list
+        // meant the common zero-path case silently fell through to
+        // the restricted-token-only fallback below, which provides
+        // NO filesystem read confinement at all.
+        let use_appcontainer = true;
 
         // ── AppContainer path: filesystem + network isolation ──
         let mut container_name_owned: Option<String> = None;
@@ -217,7 +231,17 @@ impl Sandbox for Windows {
         }
 
         // ── Build attribute list ──
-        let attr_count = if use_appcontainer { 4 } else { 3 };
+        // LPAC is opt-in (cfg.profile.lpac): AppContainer alone already
+        // denies filesystem access by default; LPAC additionally strips
+        // the "ALL APPLICATION PACKAGES" SID, which most non-Microsoft-
+        // signed binaries depend on for registry/DLL access.
+        let use_lpac = use_appcontainer && cfg.profile.lpac;
+        let attr_count = if use_appcontainer {
+            if use_lpac { 5 } else { 4 }
+        } else {
+            3
+        };
+        let mut lpac_policy: u32 = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
         let job_raw = job_handle.as_raw_handle() as HANDLE;
         let policy_qword2 = if !cfg.profile.allow_exec {
             1u64 << 44 // PROCESS_CREATION_CHILD_PROCESS_RESTRICTED (ALWAYS_ON)
@@ -245,6 +269,11 @@ impl Sandbox for Windows {
             attr_list
                 .add_security_capabilities(&mut sec_caps)
                 .inspect_err(cleanup_full)?;
+            if use_lpac {
+                attr_list
+                    .add_all_app_packages_policy(&mut lpac_policy)
+                    .inspect_err(cleanup_full)?;
+            }
         }
 
         // ── Build STARTUPINFOEXW ──
@@ -701,6 +730,29 @@ impl AttributeList {
         if ret == 0 {
             return Err(Error::Process(format!(
                 "UpdateProcThreadAttribute(SECURITY_CAPABILITIES): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Opt the child out of "ALL APPLICATION PACKAGES" (LPAC).
+    fn add_all_app_packages_policy(&mut self, policy: &mut u32) -> crate::Result<()> {
+        // SAFETY: policy is a valid u32 that outlives the attribute list.
+        let ret = unsafe {
+            UpdateProcThreadAttribute(
+                self.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+                (policy as *mut u32).cast(),
+                std::mem::size_of::<u32>(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ret == 0 {
+            return Err(Error::Process(format!(
+                "UpdateProcThreadAttribute(ALL_APPLICATION_PACKAGES_POLICY): {}",
                 std::io::Error::last_os_error()
             )));
         }

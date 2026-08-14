@@ -138,6 +138,18 @@ pub struct Profile {
     /// (`unshare --mount`). The `serde` Cargo feature is required for
     /// NDJSON parsing of audit events.
     pub dns_capture: bool,
+    /// Opt the child out of the implicit "ALL APPLICATION PACKAGES" SID
+    /// (Windows LPAC). Off by default: most non-Microsoft-signed binaries
+    /// (and even some Microsoft ones, e.g. certutil.exe/whoami.exe) depend
+    /// on registry keys/DLLs that were never ACL'd for the
+    /// "ALL RESTRICTED APPLICATION PACKAGES" SID and fail to launch at all
+    /// under LPAC (STATUS_DLL_INIT_FAILED/ACCESS_DENIED). AppContainer
+    /// alone (without this) already denies filesystem access by default,
+    /// which is the property that matters; LPAC only tightens read access
+    /// to System32/Program Files (Microsoft-signed, non-attacker-controlled)
+    /// and should stay opt-in until target binaries are verified compatible.
+    /// No effect on non-Windows platforms.
+    pub lpac: bool,
     /// Seccomp filter profile. Defaults to Strict.
     pub seccomp_profile: SeccompProfile,
     /// Audit file access via seccomp user notification.
