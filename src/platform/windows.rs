@@ -25,10 +25,7 @@ use windows_sys::Win32::Security::Authorization::{
     SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE, SECURITY_CAPABILITIES,
-    SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT,
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel,
-    WinCapabilityInternetClientSid,
+    CreateWellKnownSid, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, WinCapabilityInternetClientSid,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -44,12 +41,10 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
     JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    InitializeProcThreadAttributeList, OpenProcessToken, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
 };
 
 use crate::platform::Sandbox;
@@ -118,23 +113,26 @@ impl Sandbox for Windows {
             .collect();
         let inherit_handles = if handle_list.is_empty() { 0 } else { TRUE };
 
-        // Always engage AppContainer confinement, even with zero
-        // explicitly granted paths. AppContainer denies filesystem
-        // access by default; gating it on a non-empty grant list
-        // meant the common zero-path case silently fell through to
-        // the restricted-token-only fallback below, which provides
-        // NO filesystem read confinement at all.
-        let use_appcontainer = true;
-
         // ── AppContainer path: filesystem + network isolation ──
-        let mut container_name_owned: Option<String> = None;
+        //
+        // AppContainer confinement is always engaged, even with zero
+        // explicitly granted paths: it denies filesystem access by
+        // default, which is the load-bearing property. An earlier
+        // version of this code only engaged it when read_paths or
+        // write_paths was non-empty, so the common zero-path case
+        // silently fell through to a restricted-token-only fallback
+        // that provided NO filesystem read confinement at all. That
+        // fallback path has been removed (see git history) along with
+        // this always-true condition, so a future change can't
+        // silently reintroduce the same gap.
+        let container_name_owned: Option<String>;
         let mut saved_dacls: Vec<SavedDacl> = Vec::new();
-        let mut app_container_sid: Option<AppContainerSid> = None;
+        let app_container_sid: AppContainerSid;
         let mut net_sid_buf = vec![0u8; 68]; // MAX_SID_SIZE
         let mut capabilities: Vec<SID_AND_ATTRIBUTES> = Vec::new();
         let mut sec_caps: SECURITY_CAPABILITIES = unsafe { std::mem::zeroed() };
 
-        if use_appcontainer {
+        {
             let name = container_name(&cfg.task_id);
             let ac_sid = create_app_container(&name).inspect_err(cleanup_tmp)?;
 
@@ -150,7 +148,9 @@ impl Sandbox for Windows {
                         log::warn!("rollback DACL restore: {e}");
                     }
                 }
-                let _ = delete_app_container(cname);
+                if let Err(e) = delete_app_container(cname) {
+                    log::warn!("rollback AppContainer delete: {e}");
+                }
                 let _ = std::fs::remove_dir_all(&tmp_dir);
             };
 
@@ -227,7 +227,7 @@ impl Sandbox for Windows {
             }
 
             container_name_owned = Some(name);
-            app_container_sid = Some(ac_sid);
+            app_container_sid = ac_sid;
         }
 
         // ── Build attribute list ──
@@ -235,12 +235,8 @@ impl Sandbox for Windows {
         // denies filesystem access by default; LPAC additionally strips
         // the "ALL APPLICATION PACKAGES" SID, which most non-Microsoft-
         // signed binaries depend on for registry/DLL access.
-        let use_lpac = use_appcontainer && cfg.profile.lpac;
-        let attr_count = if use_appcontainer {
-            if use_lpac { 5 } else { 4 }
-        } else {
-            3
-        };
+        let use_lpac = cfg.profile.lpac;
+        let attr_count = if use_lpac { 5 } else { 4 };
         let mut lpac_policy: u32 = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
         let job_raw = job_handle.as_raw_handle() as HANDLE;
         let policy_qword2 = if !cfg.profile.allow_exec {
@@ -265,15 +261,13 @@ impl Sandbox for Windows {
             .add_mitigation_policy(&mut policy)
             .inspect_err(cleanup_full)?;
 
-        if use_appcontainer {
+        attr_list
+            .add_security_capabilities(&mut sec_caps)
+            .inspect_err(cleanup_full)?;
+        if use_lpac {
             attr_list
-                .add_security_capabilities(&mut sec_caps)
+                .add_all_app_packages_policy(&mut lpac_policy)
                 .inspect_err(cleanup_full)?;
-            if use_lpac {
-                attr_list
-                    .add_all_app_packages_policy(&mut lpac_policy)
-                    .inspect_err(cleanup_full)?;
-            }
         }
 
         // ── Build STARTUPINFOEXW ──
@@ -289,84 +283,30 @@ impl Sandbox for Windows {
 
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-        if use_appcontainer {
-            // AppContainer path: SECURITY_CAPABILITIES creates the lowbox
-            // token at spawn. No CREATE_SUSPENDED or token swap — swapping
-            // the token would destroy AppContainer isolation. Privilege
-            // stripping is not applied; AppContainer's deny-by-default
-            // access model renders most privileges inert.
-            let ret = unsafe {
-                CreateProcessW(
-                    std::ptr::null(),
-                    cmdline.as_mut_ptr(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    inherit_handles,
-                    CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                    env_block.as_ptr().cast(),
-                    work_dir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
-                    &raw mut si.StartupInfo,
-                    &mut pi,
-                )
-            };
-            drop(attr_list);
-            if ret == 0 {
-                let err = std::io::Error::last_os_error();
-                rollback_appcontainer(&saved_dacls, &container_name_owned, &tmp_dir);
-                return Err(Error::Process(format!("CreateProcessW: {err}")));
-            }
-        } else {
-            // Fallback path: CREATE_SUSPENDED + restricted token swap.
-            let restricted_token = create_restricted_token().inspect_err(cleanup_tmp)?;
-            let nt_set_info = resolve_nt_set_information_process().inspect_err(cleanup_tmp)?;
-
-            let ret = unsafe {
-                CreateProcessW(
-                    std::ptr::null(),
-                    cmdline.as_mut_ptr(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    inherit_handles,
-                    CREATE_NO_WINDOW
-                        | CREATE_SUSPENDED
-                        | EXTENDED_STARTUPINFO_PRESENT
-                        | CREATE_UNICODE_ENVIRONMENT,
-                    env_block.as_ptr().cast(),
-                    work_dir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
-                    &raw mut si.StartupInfo,
-                    &mut pi,
-                )
-            };
-            drop(attr_list);
-            if ret == 0 {
-                let err = std::io::Error::last_os_error();
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(Error::Process(format!("CreateProcessW: {err}")));
-            }
-
-            if let Err(e) =
-                apply_restricted_token(nt_set_info, pi.hProcess, pi.hThread, &restricted_token)
-            {
-                unsafe {
-                    TerminateProcess(pi.hProcess, 1);
-                    CloseHandle(pi.hThread);
-                    CloseHandle(pi.hProcess);
-                }
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(e);
-            }
-
-            let resume_ret = unsafe { ResumeThread(pi.hThread) };
-            if resume_ret == u32::MAX {
-                let err = std::io::Error::last_os_error();
-                unsafe {
-                    TerminateProcess(pi.hProcess, 1);
-                    CloseHandle(pi.hThread);
-                    CloseHandle(pi.hProcess);
-                }
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(Error::Process(format!("ResumeThread: {err}")));
-            }
+        // SECURITY_CAPABILITIES creates the lowbox token at spawn. No
+        // CREATE_SUSPENDED or token swap — swapping the token would
+        // destroy AppContainer isolation. Privilege stripping is not
+        // applied; AppContainer's deny-by-default access model renders
+        // most privileges inert.
+        let ret = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                cmdline.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                inherit_handles,
+                CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                env_block.as_ptr().cast(),
+                work_dir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                &raw mut si.StartupInfo,
+                &mut pi,
+            )
+        };
+        drop(attr_list);
+        if ret == 0 {
+            let err = std::io::Error::last_os_error();
+            rollback_appcontainer(&saved_dacls, &container_name_owned, &tmp_dir);
+            return Err(Error::Process(format!("CreateProcessW: {err}")));
         }
 
         unsafe { CloseHandle(pi.hThread) };
@@ -443,168 +383,6 @@ fn duplicate_as_inheritable(handle: HANDLE) -> crate::Result<OwnedHandle> {
     }
     // SAFETY: dup is a valid handle from successful DuplicateHandle.
     Ok(unsafe { OwnedHandle::from_raw_handle(dup) })
-}
-
-// ─── Restricted token ──────────────────────────────────────────────
-
-fn create_restricted_token() -> crate::Result<OwnedHandle> {
-    let mut token: HANDLE = std::ptr::null_mut();
-    // SAFETY: GetCurrentProcess is always valid. token is a valid out pointer.
-    let ret = unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            (TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY)
-                as TOKEN_ACCESS_MASK,
-            &mut token,
-        )
-    };
-    if ret == 0 {
-        return Err(Error::Process(format!(
-            "OpenProcessToken: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let token = unsafe { OwnedHandle::from_raw_handle(token) };
-
-    let mut restricted: HANDLE = std::ptr::null_mut();
-    // SAFETY: token is valid. DISABLE_MAX_PRIVILEGE strips all privileges.
-    // No deny-only SIDs or restricting SIDs for now — those require
-    // enumerating the token's groups which is complex. The privilege
-    // stripping + Low IL provide meaningful privilege reduction.
-    let ret = unsafe {
-        CreateRestrictedToken(
-            token.as_raw_handle() as HANDLE,
-            DISABLE_MAX_PRIVILEGE,
-            0,
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            &mut restricted,
-        )
-    };
-    if ret == 0 {
-        return Err(Error::Process(format!(
-            "CreateRestrictedToken: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
-
-    // Lower integrity to Low (S-1-16-4096).
-    set_token_integrity_low(&restricted)?;
-
-    Ok(restricted)
-}
-
-fn set_token_integrity_low(token: &OwnedHandle) -> crate::Result<()> {
-    // S-1-16-4096 (Low Mandatory Level)
-    #[repr(C)]
-    struct SidBuffer {
-        revision: u8,
-        sub_authority_count: u8,
-        identifier_authority: [u8; 6],
-        sub_authority: [u32; 1],
-    }
-
-    let low_sid = SidBuffer {
-        revision: 1,
-        sub_authority_count: 1,
-        identifier_authority: [0, 0, 0, 0, 0, 16], // SECURITY_MANDATORY_LABEL_AUTHORITY
-        sub_authority: [4096],                     // SECURITY_MANDATORY_LOW_RID
-    };
-
-    let label = TOKEN_MANDATORY_LABEL {
-        Label: windows_sys::Win32::Security::SID_AND_ATTRIBUTES {
-            Sid: (&raw const low_sid).cast::<std::ffi::c_void>() as *mut _,
-            Attributes: 0x00000020, // SE_GROUP_INTEGRITY
-        },
-    };
-
-    // SAFETY: token is valid, label is a valid TOKEN_MANDATORY_LABEL.
-    let ret = unsafe {
-        SetTokenInformation(
-            token.as_raw_handle() as HANDLE,
-            TokenIntegrityLevel,
-            (&raw const label).cast(),
-            std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32,
-        )
-    };
-    if ret == 0 {
-        return Err(Error::Process(format!(
-            "SetTokenInformation(IntegrityLevel): {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
-}
-
-type NtSetInformationProcessFn = unsafe extern "system" fn(
-    process_handle: HANDLE,
-    process_information_class: u32,
-    process_information: *const std::ffi::c_void,
-    process_information_length: u32,
-) -> i32;
-
-fn resolve_nt_set_information_process() -> crate::Result<NtSetInformationProcessFn> {
-    let ntdll: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
-    let func_name = b"NtSetInformationProcess\0";
-
-    // SAFETY: ntdll.dll is always loaded in every Windows process.
-    let module = unsafe { GetModuleHandleW(ntdll.as_ptr()) };
-    if module.is_null() {
-        return Err(Error::Process("GetModuleHandleW(ntdll.dll) failed".into()));
-    }
-    // SAFETY: module is valid, func_name is null-terminated.
-    let proc = unsafe { GetProcAddress(module, func_name.as_ptr().cast()) };
-    let Some(proc) = proc else {
-        return Err(Error::Process(
-            "NtSetInformationProcess not found in ntdll.dll".into(),
-        ));
-    };
-    // SAFETY: proc is a valid function pointer from GetProcAddress.
-    Ok(unsafe {
-        std::mem::transmute::<unsafe extern "system" fn() -> isize, NtSetInformationProcessFn>(proc)
-    })
-}
-
-fn apply_restricted_token(
-    nt_set_info: NtSetInformationProcessFn,
-    process: HANDLE,
-    thread: HANDLE,
-    token: &OwnedHandle,
-) -> crate::Result<()> {
-    // ProcessAccessToken = 9
-    const PROCESS_ACCESS_TOKEN: u32 = 9;
-
-    #[repr(C)]
-    struct ProcessAccessTokenInfo {
-        token: HANDLE,
-        thread: HANDLE,
-    }
-
-    let info = ProcessAccessTokenInfo {
-        token: token.as_raw_handle() as HANDLE,
-        thread,
-    };
-
-    // SAFETY: process is a valid suspended process handle. token and
-    // thread are valid handles. The process has zero started threads.
-    let status = unsafe {
-        nt_set_info(
-            process,
-            PROCESS_ACCESS_TOKEN,
-            (&raw const info).cast(),
-            std::mem::size_of::<ProcessAccessTokenInfo>() as u32,
-        )
-    };
-    if status != 0 {
-        return Err(Error::Process(format!(
-            "NtSetInformationProcess(ProcessAccessToken): NTSTATUS 0x{status:08X}"
-        )));
-    }
-    Ok(())
 }
 
 // ─── Attribute list RAII wrapper ───────────────────────────────────
@@ -915,7 +693,9 @@ fn rollback_appcontainer(
         }
     }
     if let Some(name) = container_name {
-        let _ = delete_app_container(name);
+        if let Err(e) = delete_app_container(name) {
+            log::warn!("rollback AppContainer delete: {e}");
+        }
     }
     let _ = std::fs::remove_dir_all(tmp_dir);
 }

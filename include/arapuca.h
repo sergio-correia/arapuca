@@ -281,6 +281,20 @@ int32_t arapuca_profile_set_seccomp(struct arapuca_ArapucaProfile *profile,
 void arapuca_profile_set_pidns(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
+ * Enable/disable Windows LPAC (Less Privileged AppContainer).
+ *
+ * Off by default. AppContainer confinement is always engaged on
+ * Windows regardless of this setting; LPAC additionally strips the
+ * implicit "ALL APPLICATION PACKAGES" SID, which most non-Microsoft-
+ * signed binaries depend on for registry/DLL access and will fail to
+ * launch without. No effect on non-Windows platforms.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_lpac(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
  * Enable DNS query capture inside the network namespace.
  *
  * When enabled alongside netns, the bridge child intercepts DNS
