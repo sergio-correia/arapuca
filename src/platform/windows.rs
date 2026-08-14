@@ -125,7 +125,7 @@ impl Sandbox for Windows {
         // fallback path has been removed (see git history) along with
         // this always-true condition, so a future change can't
         // silently reintroduce the same gap.
-        let container_name_owned: Option<String>;
+        let container_name_owned: String;
         let mut saved_dacls: Vec<SavedDacl> = Vec::new();
         let app_container_sid: AppContainerSid;
         let mut net_sid_buf = vec![0u8; 68]; // MAX_SID_SIZE
@@ -226,7 +226,7 @@ impl Sandbox for Windows {
                 sec_caps.CapabilityCount = capabilities.len() as u32;
             }
 
-            container_name_owned = Some(name);
+            container_name_owned = name;
             app_container_sid = ac_sid;
         }
 
@@ -322,7 +322,7 @@ impl Sandbox for Windows {
             tmp_dir,
             waited: false,
             job_handle: Some(job_handle),
-            container_name: container_name_owned,
+            container_name: Some(container_name_owned),
             saved_dacls,
             audit_ctx: None,
             final_stats: None,
@@ -682,20 +682,14 @@ fn set_job_ui_restrictions(handle: &OwnedHandle) -> crate::Result<()> {
 
 // ─── Environment ───────────────────────────────────────────────────
 
-fn rollback_appcontainer(
-    saved_dacls: &[SavedDacl],
-    container_name: &Option<String>,
-    tmp_dir: &Path,
-) {
+fn rollback_appcontainer(saved_dacls: &[SavedDacl], container_name: &str, tmp_dir: &Path) {
     for sd in saved_dacls {
         if let Err(e) = restore_dacl(sd) {
             log::warn!("rollback DACL restore: {e}");
         }
     }
-    if let Some(name) = container_name {
-        if let Err(e) = delete_app_container(name) {
-            log::warn!("rollback AppContainer delete: {e}");
-        }
+    if let Err(e) = delete_app_container(container_name) {
+        log::warn!("rollback AppContainer delete: {e}");
     }
     let _ = std::fs::remove_dir_all(tmp_dir);
 }
