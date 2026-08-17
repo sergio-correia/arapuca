@@ -206,6 +206,7 @@ arapuca run \
 | `--audit-network` | Emit network connection audit events (Linux) |
 | `--seccomp-debug` | Log blocked syscalls to stderr instead of killing (diagnostic) |
 | `--no-pid-ns` | Disable PID namespace isolation |
+| `--lpac` | Run as a Less Privileged AppContainer; may break binaries needing registry/DLL access outside the LPAC allowlist (Windows) |
 | `-t, --tty` | Allocate a PTY for interactive programs |
 
 ### Micro-VM (requires `microvm` feature)

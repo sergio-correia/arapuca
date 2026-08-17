@@ -601,6 +601,7 @@ fn run_subcommand(args: &[String]) {
     let mut audit_network = false;
     let mut allow_proxy_env = false;
     let mut allow_keychain = false;
+    let mut lpac = false;
 
     // Find -- separator.
     let sep_pos = args.iter().position(|a| a == "--");
@@ -636,6 +637,11 @@ fn run_subcommand(args: &[String]) {
             eprintln!("                     SSL_CERT_FILE/CURL_CA_BUNDLE are not forwarded)");
             eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
             eprintln!("  --no-pid-ns        disable PID namespace isolation");
+            eprintln!("  --lpac             run as a Less Privileged AppContainer (Windows only);");
+            eprintln!(
+                "                     may break binaries that need registry/DLL access outside"
+            );
+            eprintln!("                     the LPAC allowlist");
             eprintln!(
                 "  --allow-keychain   allow macOS Keychain access; sets HOME to your \
                  home dir (macOS only)"
@@ -827,6 +833,11 @@ fn run_subcommand(args: &[String]) {
             "--no-pid-ns" => {
                 no_pid_ns = true;
             }
+            "--lpac" => {
+                lpac = true;
+                #[cfg(not(windows))]
+                eprintln!("arapuca run: --lpac is Windows-only; ignored on this platform");
+            }
             "--audit-files" => {
                 audit_files = true;
             }
@@ -965,6 +976,7 @@ fn run_subcommand(args: &[String]) {
         use_netns,
         use_pidns: use_netns && !no_pid_ns,
         dns_capture: deny_network,
+        lpac,
         seccomp_profile,
         audit_file_access: audit_files,
         audit_network: audit_network || deny_network,
