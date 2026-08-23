@@ -40,6 +40,13 @@ pub struct ProfileData {
     /// Keychain reads fail silently and Keychain-backed authentication
     /// reports "not logged in".
     pub allow_keychain: bool,
+    /// Allow ioctl on PTY slave devices.
+    ///
+    /// When true, the profile grants `file-ioctl` scoped to `/dev/ttys*`
+    /// so the sandboxed process can call `tcsetattr`/`tcgetattr` (e.g.
+    /// `setRawMode` in Node.js). Only needed when the process has a PTY
+    /// slave as its controlling terminal.
+    pub tty: bool,
 }
 
 /// Validate that a path contains only safe characters for embedding in
@@ -179,6 +186,9 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
         writeln!(profile, "(allow file-read* (literal \"{dev}\"))").unwrap();
     }
     writeln!(profile, "(allow file-read* (subpath \"/dev/fd\"))").unwrap();
+    if data.tty {
+        writeln!(profile, "(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))").unwrap();
+    }
     writeln!(profile).unwrap();
 
     // Specific /etc files (not the whole directory).
@@ -566,6 +576,7 @@ mod tests {
             llm_socket: Some("/tmp/sock/llm.sock".into()),
             allow_network: false,
             allow_keychain: false,
+            tty: false,
         };
 
         let path = generate_profile(&dir, &data).unwrap();
@@ -597,6 +608,12 @@ mod tests {
         // Verify /System is a subpath (covers /System/Library and
         // /System/Cryptexes).
         assert!(content.contains("(allow file-read* (subpath \"/System\"))"));
+
+        // PTY ioctl must NOT be present when tty is false.
+        assert!(
+            !content.contains("file-ioctl"),
+            "file-ioctl must not be granted without tty mode"
+        );
 
         // Verify read paths.
         assert!(content.contains("(allow file-read* (subpath \"/home/user/src\"))"));
@@ -642,6 +659,30 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_profile_tty() {
+        let dir = std::env::temp_dir().join("arapuca-test-profile-tty");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let data = ProfileData {
+            read_paths: vec!["/home/user/src".into()],
+            write_paths: vec![],
+            exec_paths: vec![],
+            control_socket: None,
+            llm_socket: None,
+            allow_network: false,
+            allow_keychain: false,
+            tty: true,
+        };
+
+        let path = generate_profile(&dir, &data).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        assert!(content.contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_mount_ancestors() {
         // Deeply nested mount: every intermediate dir, excluding the mount
         // itself, in sorted order.
@@ -675,6 +716,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            tty: false,
         };
         let path = generate_profile(&dir, &data).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
@@ -708,6 +750,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            tty: false,
         };
 
         let result = generate_profile(&dir, &data);
@@ -730,6 +773,7 @@ mod tests {
             llm_socket: None,
             allow_network: true,
             allow_keychain: false,
+            tty: false,
         };
 
         let path = generate_profile(&dir, &data).unwrap();
@@ -803,6 +847,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            tty: false,
         };
         let content_off =
             std::fs::read_to_string(generate_profile(&dir_off, &off).unwrap()).unwrap();
@@ -839,6 +884,7 @@ mod tests {
             llm_socket: None,
             allow_network: true,
             allow_keychain: true,
+            tty: false,
         };
         let content_both =
             std::fs::read_to_string(generate_profile(&dir_both, &both).unwrap()).unwrap();
@@ -870,6 +916,7 @@ mod tests {
             llm_socket: Some("/tmp/sock/proxy.sock".into()),
             allow_network: false,
             allow_keychain: false,
+            tty: false,
         };
 
         let path = generate_profile(&dir, &data).unwrap();
