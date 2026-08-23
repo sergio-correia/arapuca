@@ -156,11 +156,19 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
     // explicit access to parent directories for realpath() resolution.
     // /private and /private/var are needed because /var, /etc, and /tmp
     // are symlinks into /private on macOS.
-    // /etc and /tmp are symlinks (/private/etc, /private/tmp) — their entries
-    // must be resolvable so processes that hardcode /etc/hosts or /tmp/<x>
-    // (e.g. tools that build a runtime dir under /tmp) can traverse the link.
+    // /etc, /tmp, and /var are symlinks into /private — their entries
+    // must be resolvable so processes that use non-canonical paths
+    // (e.g. /tmp/<x>, /var/select/developer_dir) can traverse the link.
     writeln!(profile, "; Ancestor directories for path traversal").unwrap();
-    for ancestor in &["/opt", "/etc", "/tmp", "/Users", "/private", "/private/var"] {
+    for ancestor in &[
+        "/opt",
+        "/etc",
+        "/tmp",
+        "/var",
+        "/Users",
+        "/private",
+        "/private/var",
+    ] {
         writeln!(profile, "(allow file-read* (literal \"{ancestor}\"))").unwrap();
     }
     writeln!(profile).unwrap();
@@ -591,9 +599,11 @@ mod tests {
         // Verify ancestor directories for path traversal.
         assert!(content.contains("(allow file-read* (literal \"/opt\"))"));
         assert!(content.contains("(allow file-read* (literal \"/etc\"))"));
-        // /tmp is a symlink to /private/tmp; its entry must be resolvable so
-        // tools that hardcode a /tmp/<x> runtime dir can traverse the link.
+        // /tmp and /var are symlinks to /private/tmp and /private/var;
+        // their entries must be resolvable so tools that use the
+        // non-canonical path (e.g. xcode-select via /var/select) work.
         assert!(content.contains("(allow file-read* (literal \"/tmp\"))"));
+        assert!(content.contains("(allow file-read* (literal \"/var\"))"));
         assert!(content.contains("(allow file-read* (literal \"/private\"))"));
         assert!(content.contains("(allow file-read* (literal \"/Users\"))"));
         assert!(content.contains("(allow file-read* (literal \"/private/var\"))"));
