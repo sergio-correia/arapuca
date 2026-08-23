@@ -375,6 +375,7 @@ impl Sandbox for Darwin {
             llm_socket,
             allow_network,
             allow_keychain: cfg.profile.allow_keychain,
+            tty: cfg.tty,
         };
 
         // Generate the Seatbelt profile.
